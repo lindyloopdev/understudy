@@ -40,4 +40,6 @@ handling / adaptive throttling, EWMA/proportional control. Internal precedent:
 Shares the synthesize-jittered-capped-reset idiom with
 [[understudy-adaptive-coordinated-backoff]] — this is its process-capacity analog and
 the inherently cross-session-coordinated signal (the FD budget is process-wide). The
-enforcement itself lives in [[understudy-limiter-ceiling-ratchet]].
+shed enforcement this backoff rides on is already in `chatCompletions`;
+[[understudy-limiter-ceiling-ratchet]] tracks the related deferred limiter/FD-budget
+refinements.

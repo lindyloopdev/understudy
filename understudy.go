@@ -142,10 +142,10 @@ type targetHealth struct {
 	downLogged   bool
 }
 
-// defaultMaxConcurrentPerUpstream caps concurrent in-flight requests per
-// upstream account so a burst can't exceed the upstream's own concurrency limit
-// and trip its concurrency-based rate limiting. It is a conservative ceiling —
-// high enough not to throttle a normal review swarm.
+// defaultMaxConcurrentPerUpstream is the per-account limiter's cold-start
+// allowance. It is a starting point, not a ceiling: grow() raises the cap toward
+// the upstream's real capacity on success (shrink()/throttle() pull it back on a
+// 429), with the process-wide FD budget as the hard backstop.
 const defaultMaxConcurrentPerUpstream = 20
 
 // maxRequestBodyBytes caps a buffered chat-completions request body — set well
@@ -229,14 +229,13 @@ type server struct {
 type upstreamLimiter struct {
 	mu       sync.Mutex
 	limit    int
-	ceiling  int
 	inflight int
 	seeded   bool
 	ready    chan struct{}
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
-	return &upstreamLimiter{limit: limit, ceiling: limit, ready: make(chan struct{})}
+	return &upstreamLimiter{limit: limit, ready: make(chan struct{})}
 }
 
 // acquire takes a slot, blocking until one is free or ctx is done. A free slot
@@ -318,13 +317,12 @@ func (l *upstreamLimiter) throttle() {
 	l.shrink()
 }
 
-// grow raises the cap by one, up to the ceiling (additive increase on success).
+// grow raises the cap by one (AIMD additive increase); no per-account ceiling —
+// the process-wide FD budget is the hard backstop.
 func (l *upstreamLimiter) grow() {
 	l.mu.Lock()
-	if l.limit < l.ceiling {
-		l.limit++
-		l.wake()
-	}
+	l.limit++
+	l.wake()
 	l.mu.Unlock()
 }
 
@@ -473,8 +471,8 @@ func healthKey(t Target, backends map[string]Backend) string {
 }
 
 // upstreamLimiter lazily creates and returns the concurrency limiter for the
-// given canonical upstream key, starting at maxConcurrentPerUpstream (the cap
-// ceiling).
+// given canonical upstream key, starting at maxConcurrentPerUpstream (the
+// cold-start allowance it then floats up from).
 func (s *server) upstreamLimiter(key string) *upstreamLimiter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1436,9 +1434,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// Hold an upstream slot for the whole request — through the response-body
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
-		// TODO(TODO.d/understudy-limiter-ceiling-ratchet.md): with the process-wide
-		// FD budget now enforced, let this per-account limiter float (drop its
-		// ceiling) so grow() can discover real capacity upward.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
 		if err := lim.acquire(ctx); err != nil {
 			cancel(nil)
