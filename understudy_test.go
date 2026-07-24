@@ -2623,6 +2623,53 @@ func TestChatCompletionsLimiterCancelNamesTheWaitPoint(t *testing.T) {
 	})
 }
 
+func TestChatCompletionsShedsWhenProcessBudgetExhausted(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+		// The upstream blocks so the holder keeps its process slot; with a budget of
+		// one, the next request must be shed rather than served.
+		backend := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		})
+		backends := map[string]Backend{
+			"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: backend}},
+		}
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}}}, nil
+		}}
+		// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
+		srv := New(validator, WithLogger(logger), withFDSoftLimit(66)).(*server)
+
+		req := func(ctx context.Context) *http.Request {
+			r, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Header.Set("Authorization", "Bearer user-token")
+			r.Header.Set("Content-Type", "application/json")
+			return r
+		}
+
+		// A holder takes the single process slot and blocks in the upstream.
+		go func() { srv.ServeHTTP(httptest.NewRecorder(), req(t.Context())) }()
+		synctest.Wait()
+
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req(t.Context()))
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+		if got := rec.Header().Get("Retry-After"); got != "5" {
+			t.Errorf("Retry-After = %q, want %q", got, "5")
+		}
+	})
+}
+
 func TestChatCompletionsRetryAfterDelaysReadmission(t *testing.T) {
 	t.Parallel()
 

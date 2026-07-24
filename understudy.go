@@ -168,6 +168,10 @@ const (
 	defaultFDSoftLimitFallback uint64 = 1024
 )
 
+// TODO(TODO.d/understudy-process-budget-shed.md): grow the backoff with sustained
+// saturation instead of a fixed value.
+const processBudgetRetryAfter = 5 * time.Second
+
 // fdSlotBudget converts an FD soft limit into a process-wide concurrent-request
 // budget, floored at 1 so an unusually small limit still admits work.
 func fdSlotBudget(soft uint64) int {
@@ -203,12 +207,9 @@ type server struct {
 	// fdLimitReader reports the FD soft limit the process-wide budget is sized
 	// from; an override lets tests drive both the read and the unavailable path.
 	fdLimitReader func() (uint64, bool)
-	// processLimiter holds the FD-derived concurrency budget that will bound
-	// in-flight requests across all upstreams — the safety backstop for the
-	// per-account limiters. Not yet enforced: it is constructed but not acquired
-	// from.
-	// TODO(TODO.d/understudy-limiter-ceiling-ratchet.md): acquire from this in
-	// chatCompletions so the budget bounds concurrency; built ahead of its caller.
+	// processLimiter bounds in-flight requests across all upstreams to the
+	// FD-derived budget — the safety backstop for the per-account limiters.
+	// chatCompletions sheds (503) when it is exhausted rather than queueing.
 	processLimiter *upstreamLimiter
 
 	interceptor ResponseInterceptor
@@ -258,6 +259,19 @@ func (l *upstreamLimiter) acquire(ctx context.Context) error {
 			return context.Cause(ctx)
 		}
 	}
+}
+
+// tryAcquire takes a slot if one is free and reports whether it did, never
+// blocking — the non-blocking counterpart to acquire, for callers that shed
+// rather than wait when the limiter is full.
+func (l *upstreamLimiter) tryAcquire() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.inflight < l.limit {
+		l.inflight++
+		return true
+	}
+	return false
 }
 
 func (l *upstreamLimiter) release() {
@@ -354,6 +368,14 @@ func WithResponseInterceptor(fn ResponseInterceptor) Option {
 func WithLogger(logger *slog.Logger) Option {
 	return func(s *server) {
 		s.logger = logger
+	}
+}
+
+// withFDSoftLimit makes the FD-limit read report soft, so tests can size the
+// process budget deterministically without reading the host RLIMIT_NOFILE.
+func withFDSoftLimit(soft uint64) Option {
+	return func(s *server) {
+		s.fdLimitReader = func() (uint64, bool) { return soft, true }
 	}
 }
 
@@ -1291,6 +1313,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		return yerrors.WithHTTPStatusf(statusClientClosedRequest, "reading request body: %v", err)
 	}
 
+	// Shed rather than queue: waiters at a hard FD ceiling would consume the very
+	// goroutines and buffered bodies the budget exists to protect, so backpressure
+	// goes to the client instead. Acquired once for the whole request, not per
+	// failover attempt, because a request holds at most one upstream connection.
+	if !s.processLimiter.tryAcquire() {
+		w.Header().Set("Retry-After", strconv.Itoa(int(processBudgetRetryAfter/time.Second)))
+		return yerrors.WithHTTPStatusf(http.StatusServiceUnavailable, "process FD budget exhausted (in-flight %d)", s.processLimiter.inFlight())
+	}
+	defer s.processLimiter.release()
+
 	var requestedModel, upstreamModel string
 	var parsedBackendName string
 	var chosen Target
@@ -1404,9 +1436,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// Hold an upstream slot for the whole request — through the response-body
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
-		// TODO(TODO.d/understudy-limiter-ceiling-ratchet.md): also draw a
-		// process-wide slot from s.processLimiter here so the FD budget caps total
-		// concurrency across upstreams; then let the per-account limiter float.
+		// TODO(TODO.d/understudy-limiter-ceiling-ratchet.md): with the process-wide
+		// FD budget now enforced, let this per-account limiter float (drop its
+		// ceiling) so grow() can discover real capacity upward.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
 		if err := lim.acquire(ctx); err != nil {
 			cancel(nil)

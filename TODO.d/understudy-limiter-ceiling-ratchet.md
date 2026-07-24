@@ -8,16 +8,13 @@
 
 `newUpstreamLimiter` sets the per-account `limit` and `ceiling` to one constant, so
 AIMD can only ratchet *down* from the cold-start guess — a too-low value is
-permanent and self-confirming. The fix drops the per-account ceiling and moves the
-hard backstop to a process-wide, FD-derived slot budget.
+permanent and self-confirming. The hard backstop now lives in the process-wide,
+FD-derived slot budget (`chatCompletions` sheds a `503` when it is exhausted), so
+the per-account ceiling no longer needs to be the safety bound.
 
-- **Enforce the process budget.** `chatCompletions` must draw a slot from
-  `s.processLimiter` (built at construction) as well as the per-account limiter, so
-  the FD budget actually caps total concurrency. See the `TODO(...)` at the acquire
-  site.
-- **Let the per-account limiter float.** Once the process backstop is enforced,
-  drop the per-account ceiling so `grow()` discovers real capacity upward instead of
-  only shrinking.
+- **Let the per-account limiter float.** Drop the per-account ceiling so `grow()`
+  discovers real capacity upward instead of only shrinking. See the `TODO(...)` at
+  the per-account acquire site.
 
 ## Deferred behind their own triggers
 
