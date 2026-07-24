@@ -3601,6 +3601,66 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 	})
 }
 
+func TestFDSlotBudget(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		soft uint64
+		want int
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should size the budget as the FD headroom over the reserve, divided by the per-slot cost", test{
+		soft: 1024,
+		want: 480,
+	})
+	tests.Add("should floor at one slot when the FD limit is at or below the reserve", test{
+		soft: 64,
+		want: 1,
+	})
+	tests.Add("should floor at one slot when the budget would round below one", test{
+		soft: 65,
+		want: 1,
+	})
+	tests.Add("should grow the budget on a host with more file descriptors", test{
+		soft: 65536,
+		want: 32736,
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		if got := fdSlotBudget(tt.soft); got != tt.want {
+			t.Errorf("fdSlotBudget(%d): got %d, want %d", tt.soft, got, tt.want)
+		}
+	})
+}
+
+func TestServerProcessSlotBudget(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		opt       Option
+		wantSlots int
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should size the process budget from the fallback when the FD limit is unavailable", test{
+		opt:       withoutFDSoftLimit(),
+		wantSlots: fdSlotBudget(defaultFDSoftLimitFallback),
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		s := newServer(&stubValidator{}, tt.opt)
+
+		if got := s.processLimiter.limit; got != tt.wantSlots {
+			t.Errorf("process slot budget: got %d, want %d", got, tt.wantSlots)
+		}
+	})
+}
+
 // retryAfterErr wraps an error with a fixed RetryAfter deadline, satisfying the
 // interface classifyLimit looks up via errors.AsType.
 type retryAfterErr struct {
