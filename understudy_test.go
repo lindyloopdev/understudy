@@ -3548,36 +3548,46 @@ func TestUpstreamLimiterAcquire(t *testing.T) {
 	}
 }
 
+// acquirable drains the limiter's free slots via tryAcquire and reports how many
+// it took — the observable capacity, without reading the private limit field.
+func acquirable(l *upstreamLimiter) int {
+	n := 0
+	for l.tryAcquire() {
+		n++
+	}
+	return n
+}
+
 func TestUpstreamLimiterShrink(t *testing.T) {
 	t.Parallel()
 
 	type test struct {
-		limit     int
-		wantLimit int
+		start     int
+		wantSlots int
 	}
 
 	tests := testy.NewTable[test]()
 
 	tests.Add("should halve the cap from four to two", test{
-		limit:     4,
-		wantLimit: 2,
+		start:     4,
+		wantSlots: 2,
 	})
 	tests.Add("should floor the cap at one when shrinking from two", test{
-		limit:     2,
-		wantLimit: 1,
+		start:     2,
+		wantSlots: 1,
 	})
 	tests.Add("should leave the cap at one as a no-op", test{
-		limit:     1,
-		wantLimit: 1,
+		start:     1,
+		wantSlots: 1,
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		l := newUpstreamLimiter(tt.limit)
+		l := newUpstreamLimiter(tt.start)
 		l.shrink()
 
-		if l.limit != tt.wantLimit {
-			t.Errorf("limit after shrink: got %d, want %d", l.limit, tt.wantLimit)
+		if got := acquirable(l); got != tt.wantSlots {
+			t.Errorf("acquirable slots after shrink: got %d, want %d", got, tt.wantSlots)
 		}
 	})
 }
@@ -3587,39 +3597,35 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 
 	type test struct {
 		newLimiter func() *upstreamLimiter
-		wantFirst  int
-		wantSecond int
+		wantSlots  int
 	}
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should not grow past the ceiling", test{
-		newLimiter: func() *upstreamLimiter { return newUpstreamLimiter(2) },
-		wantFirst:  2,
-		wantSecond: 2,
-	})
-	tests.Add("should resume growing after a shrink brought it under the ceiling", test{
+	tests.Add("should raise the cap past the starting allowance", test{
 		newLimiter: func() *upstreamLimiter {
 			l := newUpstreamLimiter(2)
-			l.shrink()
+			l.grow()
+			l.grow()
 			return l
 		},
-		wantFirst:  2,
-		wantSecond: 2,
+		wantSlots: 4,
+	})
+	tests.Add("should resume growing after a shrink", test{
+		newLimiter: func() *upstreamLimiter {
+			l := newUpstreamLimiter(2)
+			l.shrink() // -> 1
+			l.grow()
+			l.grow() // -> 3
+			return l
+		},
+		wantSlots: 3,
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		l := tt.newLimiter()
-
-		l.grow()
-		if l.limit != tt.wantFirst {
-			t.Errorf("limit after first grow: got %d, want %d", l.limit, tt.wantFirst)
-		}
-
-		l.grow()
-		if l.limit != tt.wantSecond {
-			t.Errorf("limit after second grow: got %d, want %d", l.limit, tt.wantSecond)
+		if got := acquirable(tt.newLimiter()); got != tt.wantSlots {
+			t.Errorf("acquirable slots: got %d, want %d", got, tt.wantSlots)
 		}
 	})
 }
@@ -3628,45 +3634,45 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 	t.Parallel()
 
 	type test struct {
-		ceiling   int
+		start     int
 		acquire   int
 		throttles int
-		wantLimit int
+		wantSlots int
 	}
 
 	tests := testy.NewTable[test]()
 
 	tests.Add("should seed the cap to the observed in-flight count on the first signal-less rate limit", test{
-		ceiling:   8,
+		start:     8,
 		acquire:   3,
 		throttles: 1,
-		wantLimit: 3,
+		wantSlots: 3,
 	})
 	tests.Add("should halve the cap on the second throttle once seeding has happened", test{
-		ceiling:   8,
+		start:     8,
 		acquire:   4,
 		throttles: 2,
-		wantLimit: 2,
+		wantSlots: 2,
 	})
 	tests.Add("should leave the cap unchanged when the first throttle arrives at full saturation", test{
-		ceiling:   4,
+		start:     4,
 		acquire:   4,
 		throttles: 1,
-		wantLimit: 4,
+		wantSlots: 4,
 	})
 	tests.Add("should halve after a saturated seed on the next throttle", test{
-		ceiling:   4,
+		start:     4,
 		acquire:   4,
 		throttles: 2,
-		wantLimit: 2,
+		wantSlots: 2,
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		l := newUpstreamLimiter(tt.ceiling)
+		l := newUpstreamLimiter(tt.start)
 		for range tt.acquire {
-			if err := l.acquire(t.Context()); err != nil {
-				t.Fatalf("acquire: %v", err)
+			if !l.tryAcquire() {
+				t.Fatal("could not fill the limiter for the throttle setup")
 			}
 		}
 
@@ -3674,8 +3680,14 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 			l.throttle()
 		}
 
-		if l.limit != tt.wantLimit {
-			t.Errorf("limit after throttle: got %d, want %d", l.limit, tt.wantLimit)
+		// Release the held slots so the drain observes the post-throttle cap, not
+		// what is left above the in-flight count.
+		for range tt.acquire {
+			l.release()
+		}
+
+		if got := acquirable(l); got != tt.wantSlots {
+			t.Errorf("acquirable slots after throttle: got %d, want %d", got, tt.wantSlots)
 		}
 	})
 }
@@ -3734,7 +3746,7 @@ func TestServerProcessSlotBudget(t *testing.T) {
 	tests.Run(t, func(t *testing.T, tt test) {
 		s := newServer(&stubValidator{}, tt.opt)
 
-		if got := s.processLimiter.limit; got != tt.wantSlots {
+		if got := acquirable(s.processLimiter); got != tt.wantSlots {
 			t.Errorf("process slot budget: got %d, want %d", got, tt.wantSlots)
 		}
 	})
