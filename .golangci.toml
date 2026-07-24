@@ -1,0 +1,227 @@
+version = '2'
+
+[output]
+[output.formats]
+[output.formats.text]
+path = 'stdout'
+
+[linters]
+enable = [
+  'errorlint',
+  'forbidigo',
+  'gocritic',
+  'gosec',
+  'intrange',
+  'misspell',
+  'nilerr',
+  'perfsprint',
+  'prealloc',
+  'reassign',
+  'revive',
+  'unconvert',
+  'unparam',
+  'usestdlibvars',
+]
+
+[linters.settings]
+[linters.settings.forbidigo]
+exclude-godoc-examples = false
+
+[[linters.settings.forbidigo.forbid]]
+pattern = '^slog\.Default\b.*$'
+msg = 'use slog.New(slog.NewTextHandler(...)) with an explicit output'
+
+[linters.settings.gocritic]
+disable-all = true
+enabled-checks = [
+  'commentedOutCode',
+  'commentedOutImport',
+  'unlabelStmt',
+  'assignOp',
+  'captLocal',
+  'codegenComment',
+  'defaultCaseOrder',
+  'deprecatedComment',
+  'docStub',
+  'dupImport',
+  'elseif',
+  'emptyDecl',
+  'emptyStringTest',
+  'exposedSyncMutex',
+  'hexLiteral',
+  'ifElseChain',
+  'preferFilepathJoin',
+  'ptrToRefParam',
+  'timeExprSimplify',
+  'typeAssertChain',
+  'typeDefFirst',
+  'whyNoLint',
+  'yodaStyleExpr',
+  'appendCombine',
+  'boolExprSimplify',
+  'deferUnlambda',
+  'sloppyTypeAssert',
+  'unnecessaryDefer',
+  'emptyFallthrough',
+  'methodExprCall',
+  'nestingReduce',
+  'newDeref',
+  'paramTypeCombine',
+  'preferFprint',
+  'redundantSprint',
+  'regexpSimplify',
+  'singleCaseSwitch',
+  'sloppyLen',
+  'stringConcatSimplify',
+  'stringsCompare',
+  'switchTrue',
+  'typeSwitchVar',
+  'typeUnparen',
+  'underef',
+  'unlambda',
+  'unnecessaryBlock',
+  'unslice',
+  'valSwap',
+  'wrapperFunc',
+  'argOrder',
+  'badCall',
+  'badCond',
+  'badLock',
+  'badRegexp',
+  'badSorting',
+  'caseOrder',
+  'deferInLoop',
+  'dupArg',
+  'dupBranchBody',
+  'dupCase',
+  'dupSubExpr',
+  'dynamicFmtString',
+  'evalOrder',
+  'exitAfterDefer',
+  'externalErrorReassign',
+  'flagDeref',
+  'flagName',
+  'initClause',
+  'mapKey',
+  'nilValReturn',
+  'offBy1',
+  'regexpMust',
+  'regexpPattern',
+  'returnAfterHttpError',
+  'sortSlice',
+  'truncateCmp',
+  'uncheckedInlineErr',
+  'weakCond',
+  'equalFold',
+  'indexAlloc',
+  'preferDecodeRune',
+  'preferStringWriter',
+  'preferWriteByte',
+  'rangeExprCopy',
+  'sliceClear',
+  'stringXbytes',
+]
+
+[linters.settings.gosec]
+excludes = ['G104', 'G117', 'G204', 'G307', 'G704', 'G705']
+
+[linters.settings.revive]
+max-open-files = 2048
+confidence = 0.1
+severity = 'error'
+enable-all-rules = true
+
+[[linters.settings.revive.rules]]
+name = 'enforce-switch-style'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'add-constant'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'line-length-limit'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'confusing-naming'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'unchecked-type-assertion'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'cyclomatic'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'cognitive-complexity'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'modifies-parameter'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'function-length'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'max-public-structs'
+disabled = true
+
+[[linters.settings.revive.rules]]
+name = 'error-strings'
+disabled = true
+
+[linters.exclusions]
+generated = 'lax'
+paths = ['third_party$', 'builtin$', 'examples$']
+
+[[linters.exclusions.rules]]
+linters = ['gosec']
+text = 'G(302|304|306|703):'
+path = '_test\.go$'
+
+[[linters.exclusions.rules]]
+linters = ['errcheck']
+source = 'defer .*\.(Close|Rollback)\(.*\)$'
+
+[[linters.exclusions.rules]]
+linters = ['errcheck']
+source = 't.Cleanup\(.*\.Close\(\)$'
+
+[[linters.exclusions.rules]]
+linters = ['revive']
+source = '^//go:generate'
+
+[[linters.exclusions.rules]]
+linters = ['revive']
+text = 'function-length:'
+source = 'func Test.*\(t \*testing\.T\) {'
+
+[[linters.exclusions.rules]]
+linters = ['revive']
+text = 'optimize-operands-order:'
+source = 'if errors.As'
+
+[[linters.exclusions.rules]]
+linters = ['revive']
+text = 'unhandled-error:'
+source = 'fmt\.(Print|Println|Printf)\('
+
+[formatters]
+enable = ['gci', 'gofumpt']
+
+[formatters.settings]
+[formatters.settings.gci]
+sections = ['standard', 'default', 'prefix(github.com/lindyloopdev/understudy)']
+custom-order = true
+
+[formatters.settings.gofumpt]
+extra-rules = true
+
+[formatters.exclusions]
+generated = 'lax'
+paths = ['third_party$', 'builtin$', 'examples$']
