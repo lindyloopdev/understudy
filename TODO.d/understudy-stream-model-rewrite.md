@@ -2,7 +2,7 @@
 
 **Tag:** understudy / quick
 
-**Design:** [UNDERSTUDY.md §understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §understudy](../DESIGN.md#understudy).
 
 `rewriteModel` (in `internal/understudy`) scans a chat request body to the
 top-level `model`, rewrites that value via an injected transform, and streams

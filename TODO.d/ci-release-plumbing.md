@@ -2,9 +2,8 @@
 
 - `golangci-lint run ./...` + test workflows.
 - Permissive-only dependency license scanner.
-- Apache-2.0 LICENSE + DCO signoff. Do not use the "Lindy" wordmark in the
-  repo name or primary branding — understudy is its own project that lindy
-  happens to consume.
+- Do not use the "Lindy" wordmark in the repo name or primary branding —
+  understudy is its own project that lindy happens to consume.
 - `goreleaser` (or equivalent) for single-binary releases — offer all of
   `go install`, binary download, and a Docker image; cover them in a README
   install section.

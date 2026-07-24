@@ -2,7 +2,7 @@
 
 **Tag:** understudy / quick
 
-**Design:** [UNDERSTUDY.md §understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §understudy](../DESIGN.md#understudy).
 
 Errors carry their OpenAI envelope `type` via an `ErrorType() string` method;
 the response seam reads it (`errorType(err)` via `errors.AsType`) and falls back

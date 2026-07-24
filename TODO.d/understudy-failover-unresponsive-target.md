@@ -2,7 +2,7 @@
 
 **Tag:** understudy / fallback / ha / bug
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 A target whose calls produce **no upstream response** within the client's
 budget — the beat times out and cancels, surfacing as a `499 Client Closed

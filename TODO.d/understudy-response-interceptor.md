@@ -2,8 +2,8 @@
 
 **Tag:** understudy
 
-**Design:** [UNDERSTUDY.md §Served-model provenance](../UNDERSTUDY.md#served-model-provenance)
-(the seam paragraph); [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Served-model provenance](../DESIGN.md#served-model-provenance)
+(the seam paragraph); [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 The enabling seam for [[understudy-provenance-reporting]] (and any future lindy-only
 response rewrite). understudy stays provenance-agnostic — it offers a generic

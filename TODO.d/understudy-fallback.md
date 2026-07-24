@@ -2,13 +2,13 @@
 
 **Tag:** understudy / fallback / ha
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 understudy's **availability execution** layer: given an orchestrator-composed
 ordered candidate list, decide each request's disposition and pin a target per
 session. The **selection** of the list (cost/quality) is the orchestrator's —
 [[understudy-model-groups]]. The disposition ladder and the affinity/admission
-frame are settled in [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy);
+frame are settled in [DESIGN.md §Understudy](../DESIGN.md#understudy);
 this item tracks the remaining build.
 
 Built today: `[understudy.models.<name>]` resolves to `LogicalModel{ Targets

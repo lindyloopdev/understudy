@@ -2,9 +2,9 @@
 
 **Tag:** understudy / ratelimit / bug
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy),
-[§Shared understudy daemon](../UNDERSTUDY.md#shared-daemon),
-[§Upstream-identity canonicalization](../UNDERSTUDY.md#upstream-identity-canonicalization).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy),
+[§Shared understudy daemon](../DESIGN.md#shared-daemon),
+[§Upstream-identity canonicalization](../DESIGN.md#upstream-identity-canonicalization).
 
 `newUpstreamLimiter` sets `limit` and `ceiling` to the same constant
 (`defaultMaxConcurrentPerUpstream`, 20), and `grow()` only raises `limit` while

@@ -1,11 +1,10 @@
 # Documentation
 
-- Port lindy's `UNDERSTUDY.md` to the library's primary doc. Keep the
-  availability-not-quality framing, the rate-limit ladder, and the
-  session-binding reasoning as library docs; move the lindy-specific framing
-  (container-as-security-boundary, per-scene token mint, provenance stream)
-  into a "How lindy uses understudy" section. This doc becomes the design
-  backref home for the other TODO items.
+- Restructure `DESIGN.md` (ported verbatim from lindy) to read as a library
+  doc: move the lindy-specific framing (container-as-security-boundary,
+  per-scene token mint, provenance stream) out of the main flow into a "How
+  lindy uses understudy" section, leaving the availability-not-quality framing,
+  the rate-limit ladder, and the session-binding reasoning as the library core.
 - README: positioning vs LiteLLM/one-api/OpenRouter (Go, single-binary,
   library-or-daemon, opinionated availability layer, explicit
   availability/quality boundary); 2-line quickstart; "From the upcoming Lindy

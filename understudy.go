@@ -1199,6 +1199,24 @@ func callWithHeaderGate(ctx context.Context, cancel context.CancelCauseFunc, gat
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
+	// A panic mid-request (in the response interceptor or the streamed body) would
+	// otherwise unwind past the release and leak the slot, starving the upstream.
+	// One pointer suffices because the retry loop holds at most one slot at a time;
+	// re-panicking leaves rendering to recoverPanic.
+	var heldSlot *upstreamLimiter
+	releaseHeld := func() {
+		if heldSlot != nil {
+			heldSlot.release()
+			heldSlot = nil
+		}
+	}
+	defer func() {
+		if v := recover(); v != nil {
+			releaseHeld()
+			panic(v)
+		}
+	}()
+
 	// Buffer the whole request body so a failover can replay it to the next
 	// target: rewriteModel consumes the reader locating/rewriting the model, so
 	// each attempt needs a fresh reader over the same bytes. This is the correct
@@ -1332,6 +1350,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			cancel(nil)
 			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
 		}
+		heldSlot = lim
 
 		resp, err := callWithHeaderGate(ctx, cancel, s.headerStallGate, sel, body)
 		if errors.Is(err, errHeaderStall) {
@@ -1340,7 +1359,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// target rather than surfacing the stall; only when none remains does the
 			// client see the 504.
 			s.recordRateLimited(chosen, synthesizedStallBackoff, backend.Backends)
-			lim.release()
+			releaseHeld()
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
@@ -1388,12 +1407,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil && sig.condition == sustainedRate {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					lim.release()
+					releaseHeld()
 					cancel(nil)
 					continue
 				}
 			}
-			lim.release()
+			releaseHeld()
 			cancel(nil)
 			return err
 		}
@@ -1406,7 +1425,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if s.interceptor != nil {
 			if err := s.interceptor(r.Context(), RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}, resp); err != nil {
 				_ = resp.Body.Close()
-				lim.release()
+				releaseHeld()
 				cancel(nil)
 				return err
 			}
@@ -1417,7 +1436,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(resp.StatusCode)
 		_, err = io.Copy(w, &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel})
 		_ = resp.Body.Close()
-		lim.release()
+		releaseHeld()
 		cancel(nil)
 		return err
 	}

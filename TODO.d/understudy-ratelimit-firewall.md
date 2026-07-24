@@ -2,7 +2,7 @@
 
 **Tag:** understudy
 
-**Design:** [UNDERSTUDY.md §understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §understudy](../DESIGN.md#understudy).
 
 A keyed band can be rate-limited. opencode's internal LLM retry honors
 `Retry-After` essentially without bound, so a long 429 must be intercepted by

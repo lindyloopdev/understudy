@@ -375,6 +375,27 @@ func TestChatResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should carry the parsed error attrs of an array-wrapped upstream error envelope", func(t *testing.T) test {
+		body := `[{"error":{"code":"429","message":"quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaValue":"20"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}]`
+		srvURL, _ := newCapturingServer(t, http.StatusTooManyRequests, http.Header{"Content-Type": {"application/json"}}, body)
+		return test{
+			cfg:             providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr:         "quota exceeded",
+			wantErrExcludes: "type.googleapis.com",
+			wantStatus:      http.StatusTooManyRequests,
+			wantErrorType:   "rate_limit_error",
+			wantAttrs: map[string]any{
+				"upstream_status":            int64(http.StatusTooManyRequests),
+				"upstream_error_type":        "rate_limit_error",
+				"upstream_error_message":     "quota exceeded",
+				"upstream_error_code":        "429",
+				"upstream_quota_id":          "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+				"upstream_quota_value":       "20",
+				"upstream_quota_retry_delay": "42s",
+			},
+		}
+	})
+
 	tests.AddFunc("should cap the error message at 1 KiB", func(t *testing.T) test {
 		body := strings.Repeat("x", 1024) + "OVERFLOW_PAST_CAP"
 		srvURL, _ := newCapturingServer(t, http.StatusBadGateway, http.Header{"Content-Type": {"text/plain"}}, body)

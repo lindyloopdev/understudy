@@ -2,7 +2,7 @@
 
 **Tag:** understudy / fallback / cost
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy) — "Per-target
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Per-target
 request-body normalization." Reasoning/rejections:
 [notes/2026-07-05-understudy-per-target-body-normalization.md](../notes/2026-07-05-understudy-per-target-body-normalization.md).
 

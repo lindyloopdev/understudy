@@ -2,7 +2,7 @@
 
 **Tag:** understudy / fallback / performance
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 Within-request failover ([[understudy-fallback]]) currently reads the whole
 request body into memory (`io.ReadAll`) before forwarding, so a replay to the
