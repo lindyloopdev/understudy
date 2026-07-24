@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -152,6 +153,43 @@ const defaultMaxConcurrentPerUpstream = 20
 // abusive payloads.
 const maxRequestBodyBytes = 32 << 20
 
+// FD-budget sizing for the process-wide concurrency limiter. Each in-flight
+// upstream request costs roughly fdsPerSlot file descriptors (the upstream dial,
+// with headroom); fdSlotReserve holds back descriptors for the listener, log
+// files, and idle keep-alive connections. The budget is (soft RLIMIT_NOFILE −
+// reserve) / fdsPerSlot, so the process is bounded by the resource that actually
+// binds — descriptors, shared across all upstreams — rather than a per-account
+// guess.
+const (
+	fdSlotReserve uint64 = 64
+	fdsPerSlot    uint64 = 2
+	// defaultFDSoftLimitFallback sizes the budget when RLIMIT_NOFILE cannot be
+	// read (a non-Linux embedder or a sandbox), rather than failing construction.
+	defaultFDSoftLimitFallback uint64 = 1024
+)
+
+// TODO(TODO.d/understudy-process-budget-shed.md): grow the backoff with sustained
+// saturation instead of a fixed value.
+const processBudgetRetryAfter = 5 * time.Second
+
+// fdSlotBudget converts an FD soft limit into a process-wide concurrent-request
+// budget, floored at 1 so an unusually small limit still admits work.
+func fdSlotBudget(soft uint64) int {
+	if soft <= fdSlotReserve {
+		return 1
+	}
+	slots := (soft - fdSlotReserve) / fdsPerSlot
+	if slots < 1 {
+		return 1
+	}
+	// Unreachable in practice — a real RLIMIT_NOFILE never approaches 2^63 — but
+	// guards the int conversion so a garbage-large soft limit can't wrap negative.
+	if slots > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(slots)
+}
+
 type server struct {
 	logger *slog.Logger
 	h      http.Handler
@@ -165,6 +203,14 @@ type server struct {
 	headerStallGate   time.Duration
 
 	maxConcurrentPerUpstream int
+
+	// fdLimitReader reports the FD soft limit the process-wide budget is sized
+	// from; an override lets tests drive both the read and the unavailable path.
+	fdLimitReader func() (uint64, bool)
+	// processLimiter bounds in-flight requests across all upstreams to the
+	// FD-derived budget — the safety backstop for the per-account limiters.
+	// chatCompletions sheds (503) when it is exhausted rather than queueing.
+	processLimiter *upstreamLimiter
 
 	interceptor ResponseInterceptor
 
@@ -213,6 +259,19 @@ func (l *upstreamLimiter) acquire(ctx context.Context) error {
 			return context.Cause(ctx)
 		}
 	}
+}
+
+// tryAcquire takes a slot if one is free and reports whether it did, never
+// blocking — the non-blocking counterpart to acquire, for callers that shed
+// rather than wait when the limiter is full.
+func (l *upstreamLimiter) tryAcquire() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.inflight < l.limit {
+		l.inflight++
+		return true
+	}
+	return false
 }
 
 func (l *upstreamLimiter) release() {
@@ -312,6 +371,22 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// withFDSoftLimit makes the FD-limit read report soft, so tests can size the
+// process budget deterministically without reading the host RLIMIT_NOFILE.
+func withFDSoftLimit(soft uint64) Option {
+	return func(s *server) {
+		s.fdLimitReader = func() (uint64, bool) { return soft, true }
+	}
+}
+
+// withoutFDSoftLimit makes the FD-limit read report unavailable, so tests can
+// drive the fallback path without a host on which RLIMIT_NOFILE is unreadable.
+func withoutFDSoftLimit() Option {
+	return func(s *server) {
+		s.fdLimitReader = func() (uint64, bool) { return 0, false }
+	}
+}
+
 // WithProvider registers h to serve backends whose [Backend.ProviderType] is
 // name. A nil h panics, as does a second registration of the same name. A
 // single registration may override the OpenAI default.
@@ -336,10 +411,7 @@ func defaultProviders() map[string]providers.Handler {
 
 // New returns a new HTTP handler that uses v to validate bearer tokens.
 func New(v TokenValidator, opts ...Option) http.Handler {
-	s := newServer(v)
-	for _, opt := range opts {
-		opt(s)
-	}
+	s := newServer(v, opts...)
 	for name, h := range defaultProviders() {
 		if _, ok := s.providers[name]; !ok {
 			s.providers[name] = h
@@ -350,7 +422,7 @@ func New(v TokenValidator, opts ...Option) http.Handler {
 
 // newServer builds a fully-wired *server, which satisfies http.Handler via
 // ServeHTTP.
-func newServer(v TokenValidator) *server {
+func newServer(v TokenValidator, opts ...Option) *server {
 	s := &server{
 		logger:                   slog.Default(), //nolint:forbidigo // deliberate fallback when no WithLogger option is given; the rule targets implicit logging elsewhere
 		providers:                make(map[string]providers.Handler),
@@ -358,9 +430,18 @@ func newServer(v TokenValidator) *server {
 		recoveryInterval:         defaultRecoveryInterval,
 		headerStallGate:          defaultHeaderStallGate,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
+		fdLimitReader:            readFDSoftLimit,
 		health:                   make(map[string]targetHealth),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	soft, ok := s.fdLimitReader()
+	if !ok {
+		soft = defaultFDSoftLimitFallback
+	}
+	s.processLimiter = newUpstreamLimiter(fdSlotBudget(soft))
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", errToResponse(recoverPanic(s.chatCompletions)))
 	mux.HandleFunc("GET /v1/models", errToResponse(recoverPanic(s.models)))
@@ -1232,6 +1313,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		return yerrors.WithHTTPStatusf(statusClientClosedRequest, "reading request body: %v", err)
 	}
 
+	// Shed rather than queue: waiters at a hard FD ceiling would consume the very
+	// goroutines and buffered bodies the budget exists to protect, so backpressure
+	// goes to the client instead. Acquired once for the whole request, not per
+	// failover attempt, because a request holds at most one upstream connection.
+	if !s.processLimiter.tryAcquire() {
+		w.Header().Set("Retry-After", strconv.Itoa(int(processBudgetRetryAfter/time.Second)))
+		return yerrors.WithHTTPStatusf(http.StatusServiceUnavailable, "process FD budget exhausted (in-flight %d)", s.processLimiter.inFlight())
+	}
+	defer s.processLimiter.release()
+
 	var requestedModel, upstreamModel string
 	var parsedBackendName string
 	var chosen Target
@@ -1345,6 +1436,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// Hold an upstream slot for the whole request — through the response-body
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
+		// TODO(TODO.d/understudy-limiter-ceiling-ratchet.md): with the process-wide
+		// FD budget now enforced, let this per-account limiter float (drop its
+		// ceiling) so grow() can discover real capacity upward.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
 		if err := lim.acquire(ctx); err != nil {
 			cancel(nil)
