@@ -105,7 +105,7 @@ func (e retryAfterError) Unwrap() error { return e.error }
 // because the upstream, not us, is at fault; a 4xx is carried verbatim so
 // callers can act on it (429/Retry-After, 400, 404, ...). now is the reference
 // time for resolving a per-day quota exhaustion to its reset boundary (the next
-// midnight America/Los_Angeles).
+// Pacific midnight at a fixed −8 offset).
 func errorFromResponse(resp *http.Response, now time.Time) error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -197,11 +197,10 @@ func quotaViolationAttrs(apiErr openAIError) []any {
 	return attrs
 }
 
-// withPerDayQuotaRetryAfter attaches a RetryAfter() of the next midnight in
-// America/Los_Angeles after now when a quota violation names a per-day quota,
-// overriding the misleading short prose delay Google attaches to it. err is
-// returned unchanged when no per-day violation is present or the zone cannot
-// be loaded.
+// withPerDayQuotaRetryAfter attaches a RetryAfter() of the next Pacific midnight
+// after now when a quota violation names a per-day quota, overriding the
+// misleading short prose delay Google attaches to it. err is returned unchanged
+// when no per-day violation is present.
 func withPerDayQuotaRetryAfter(err error, apiErr openAIError, now time.Time) error {
 	perDay := false
 	for _, d := range apiErr.Details {
@@ -214,22 +213,20 @@ func withPerDayQuotaRetryAfter(err error, apiErr openAIError, now time.Time) err
 	if !perDay {
 		return err
 	}
-	local := now.In(pacificLocation)
-	next := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, pacificLocation)
+	local := now.In(pacificStandard)
+	next := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, pacificStandard)
 	return retryAfterError{error: err, retryAfter: next}
 }
 
-// pacificLocation is the IANA zone whose civil midnight bounds the Gemini
-// free-tier per-day quota reset; it is loaded once at startup. A missing tz
-// database is an unrecoverable environment fault, so loading panics rather than
-// silently degrading the per-day retry time.
-var pacificLocation = func() *time.Location {
-	l, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		panic(err)
-	}
-	return l
-}()
+// pacificStandard is US Pacific Standard Time (UTC−8), whose civil midnight
+// bounds the Gemini free-tier per-day quota reset. The reset is computed at this
+// fixed offset rather than the IANA zone so the package needs no tz database
+// (and no DST rules to maintain). The cost is a deliberate bias: during daylight
+// saving the reset is estimated an hour late (1am PDT). That direction is
+// chosen on purpose — an early estimate would retry before the reset, find it
+// still blocked, and roll forward to the *next* midnight, skipping a full day
+// and halving usage; a late estimate merely waits a little longer.
+var pacificStandard = time.FixedZone("PST", -8*60*60)
 
 // geminiRetryDelayRE extracts the retry delay Gemini reports as prose in a
 // RESOURCE_EXHAUSTED quota message ("Please retry in 22.509013813s."). The compat
