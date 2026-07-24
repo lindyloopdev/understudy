@@ -289,19 +289,20 @@ func TestChatCompletionsRequestBodyErrors(t *testing.T) {
 func TestChatCompletionsHandlesResponse(t *testing.T) {
 	t.Parallel()
 
+	defaultServer := func(t *testing.T, backend testy.HTTPResponder, interceptor ResponseInterceptor) *server {
+		client := testy.HTTPClient(backend)
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+		}}
+		return New(validator, WithLogger(testLogger(t)), WithResponseInterceptor(interceptor)).(*server)
+	}
+
 	type test struct {
 		// ctx overrides the request context (defaults to t.Context()); set it to
 		// exercise cancellation paths.
-		ctx context.Context
-		// validator overrides the default validator (which returns a populated
-		// openai backend pointed at the mocked client). Set on cases that
-		// exercise pre-backend-call paths (e.g. missing config).
-		validator TokenValidator
-		backend   testy.HTTPResponder
-		// interceptor, when set, is installed as the server's response interceptor
-		// (nil leaves the server without one).
-		interceptor         ResponseInterceptor
+		ctx                 context.Context
 		requestBody         string
+		server              *server
 		wantStatus          int
 		wantBody            string
 		wantResponseHeaders http.Header
@@ -309,209 +310,240 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should proxy 200 response body to client", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-123","choices":[]}`)),
-				Header:     http.Header{},
-			}, nil
-		},
-		wantStatus:          http.StatusOK,
-		wantBody:            `{"id":"chatcmpl-123","choices":[]}`,
-		wantResponseHeaders: http.Header{},
+	tests.AddFunc("should proxy 200 response body to client", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-123","choices":[]}`)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusOK,
+			wantBody:            `{"id":"chatcmpl-123","choices":[]}`,
+			wantResponseHeaders: http.Header{},
+		}
 	})
 
-	tests.Add("should forward response headers from backend to client", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header: http.Header{
-					"X-Custom-Header": []string{"custom-value"},
-					"X-Request-Id":    []string{"123"},
-				},
-			}, nil
-		},
-		wantStatus: http.StatusOK,
-		wantBody:   `{}`,
-		wantResponseHeaders: http.Header{
-			"X-Custom-Header": []string{"custom-value"},
-			"X-Request-Id":    []string{"123"},
-		},
+	tests.AddFunc("should forward response headers from backend to client", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+					Header: http.Header{
+						"X-Custom-Header": []string{"custom-value"},
+						"X-Request-Id":    []string{"123"},
+					},
+				}, nil
+			}, nil),
+			wantStatus: http.StatusOK,
+			wantBody:   `{}`,
+			wantResponseHeaders: http.Header{
+				"X-Custom-Header": []string{"custom-value"},
+				"X-Request-Id":    []string{"123"},
+			},
+		}
 	})
 
-	tests.Add("should strip Authorization header from proxied backend response", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header: http.Header{
-					"X-Custom-Header": []string{"custom-value"},
-					"Authorization":   []string{"Bearer backend-secret"},
-				},
-			}, nil
-		},
-		wantStatus: http.StatusOK,
-		wantBody:   `{}`,
-		wantResponseHeaders: http.Header{
-			"X-Custom-Header": []string{"custom-value"},
-		},
+	tests.AddFunc("should strip Authorization header from proxied backend response", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+					Header: http.Header{
+						"X-Custom-Header": []string{"custom-value"},
+						"Authorization":   []string{"Bearer backend-secret"},
+					},
+				}, nil
+			}, nil),
+			wantStatus: http.StatusOK,
+			wantBody:   `{}`,
+			wantResponseHeaders: http.Header{
+				"X-Custom-Header": []string{"custom-value"},
+			},
+		}
 	})
 
-	tests.Add("should strip Set-Cookie header from proxied backend response", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header: http.Header{
-					"X-Custom-Header": []string{"custom-value"},
-					"Set-Cookie":      []string{"session=abc123; HttpOnly"},
-				},
-			}, nil
-		},
-		wantStatus: http.StatusOK,
-		wantBody:   `{}`,
-		wantResponseHeaders: http.Header{
-			"X-Custom-Header": []string{"custom-value"},
-		},
+	tests.AddFunc("should strip Set-Cookie header from proxied backend response", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+					Header: http.Header{
+						"X-Custom-Header": []string{"custom-value"},
+						"Set-Cookie":      []string{"session=abc123; HttpOnly"},
+					},
+				}, nil
+			}, nil),
+			wantStatus: http.StatusOK,
+			wantBody:   `{}`,
+			wantResponseHeaders: http.Header{
+				"X-Custom-Header": []string{"custom-value"},
+			},
+		}
 	})
 
-	tests.Add("should map an upstream 5xx to 502 Bad Gateway", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusInternalServerError,
-				Body:       io.NopCloser(strings.NewReader(`{"error":"server error"}`)),
-				Header:     http.Header{},
-			}, nil
-		},
-		wantStatus:          http.StatusBadGateway,
-		wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should map an upstream 5xx to 502 Bad Gateway", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader(`{"error":"server error"}`)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should surface the upstream error type for a non-2xx with an OpenAI error envelope", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusConflict,
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
-				Header:     http.Header{},
-			}, nil
-		},
-		wantStatus:          http.StatusConflict,
-		wantBody:            `{"error":{"message":"upstream returned status 409: slow down","type":"rate_limit_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should surface the upstream error type for a non-2xx with an OpenAI error envelope", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusConflict,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusConflict,
+			wantBody:            `{"error":{"message":"upstream returned status 409: slow down","type":"rate_limit_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should convert a long-Retry-After 429 to a 400 upstream_rate_limited envelope", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
-				Header:     http.Header{"Retry-After": {"600"}},
-			}, nil
-		},
-		wantStatus:          http.StatusBadRequest,
-		wantBody:            `{"error":{"message":"upstream rate limited","type":"upstream_rate_limited"},"retry_after_ms":600000}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should convert a long-Retry-After 429 to a 400 upstream_rate_limited envelope", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"600"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"upstream rate limited","type":"upstream_rate_limited"},"retry_after_ms":600000}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should convert a long-Retry-After 503 to a 400 upstream_unavailable envelope", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"service unavailable"}}`)),
-				Header:     http.Header{"Retry-After": {"600"}},
-			}, nil
-		},
-		wantStatus:          http.StatusBadRequest,
-		wantBody:            `{"error":{"message":"upstream unavailable","type":"upstream_unavailable"},"retry_after_ms":600000}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should convert a long-Retry-After 503 to a 400 upstream_unavailable envelope", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"service unavailable"}}`)),
+					Header:     http.Header{"Retry-After": {"600"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"upstream unavailable","type":"upstream_unavailable"},"retry_after_ms":600000}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should pass through a long-Retry-After 404 instead of rejecting it", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusNotFound,
-				Header:     http.Header{"Retry-After": {"600"}},
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
-			}, nil
-		},
-		wantStatus:          http.StatusNotFound,
-		wantBody:            `{"error":{"message":"upstream returned status 404: not found","type":"invalid_request_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should pass through a long-Retry-After 404 instead of rejecting it", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     http.Header{"Retry-After": {"600"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusNotFound,
+			wantBody:            `{"error":{"message":"upstream returned status 404: not found","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should pass through a 429 whose Retry-After is within the threshold", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
-				Header:     http.Header{"Retry-After": {"90"}},
-			}, nil
-		},
-		wantStatus:          http.StatusTooManyRequests,
-		wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"90"}},
+	tests.AddFunc("should pass through a 429 whose Retry-After is within the threshold", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"90"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusTooManyRequests,
+			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"90"}},
+		}
 	})
 
-	tests.Add("should synthesize a Retry-After for a 429 that lacks one", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
-				Header:     http.Header{},
-			}, nil
-		},
-		wantStatus:          http.StatusTooManyRequests,
-		wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+	tests.AddFunc("should synthesize a Retry-After for a 429 that lacks one", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusTooManyRequests,
+			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+		}
 	})
 
-	tests.Add("should return 400 with invalid_request_error when the request omits the model field", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
-		},
-		requestBody:         `{"messages":[{"role":"user","content":"hi"}]}`,
-		wantStatus:          http.StatusBadRequest,
-		wantBody:            `{"error":{"message":"model is required","type":"invalid_request_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should return 400 with invalid_request_error when the request omits the model field", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+			}, nil),
+			requestBody:         `{"messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"model is required","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should return 400 with invalid_request_error when the request body is malformed", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
-		},
-		requestBody:         `{"model":"openai/gpt-4`,
-		wantStatus:          http.StatusBadRequest,
-		wantBody:            `{"error":{"message":"malformed request body: unexpected EOF","type":"invalid_request_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should return 400 with invalid_request_error when the request body is malformed", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+			}, nil),
+			requestBody:         `{"model":"openai/gpt-4`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"malformed request body: unexpected EOF","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should return StatusBadGateway when backend connection fails", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("connection refused")
-		},
-		wantStatus: http.StatusBadGateway,
-		wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+	tests.AddFunc("should return StatusBadGateway when backend connection fails", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("connection refused")
+			}, nil),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
+			},
+		}
 	})
 
-	tests.Add("should return 500 when a logical model has no targets", test{
-		validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+	tests.AddFunc("should return 500 when a logical model has no targets", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{
 				Backends: map[string]Backend{
 					"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a"}},
 				},
 				Models: map[string]LogicalModel{"empty": {Targets: []Target{}}},
 			}, nil
-		}},
-		requestBody:         `{"model":"empty","messages":[{"role":"user","content":"hi"}]}`,
-		wantStatus:          http.StatusInternalServerError,
-		wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"empty","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusInternalServerError,
+			wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
 	tests.AddFunc("should render 499 when the backend call is aborted by the client", func(t *testing.T) test {
@@ -519,9 +551,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		cancel()
 		return test{
 			ctx: ctx,
-			backend: func(r *http.Request) (*http.Response, error) {
+			server: defaultServer(t, func(r *http.Request) (*http.Response, error) {
 				return nil, context.Cause(r.Context())
-			},
+			}, nil),
 			wantStatus: statusClientClosedRequest,
 			wantBody:   `{"error":{"message":"Post \"http://backend/v1/chat/completions\": context canceled: upstream no_conn","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -537,9 +569,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		cancel(errors.New("lindyd: shutting down"))
 		return test{
 			ctx: ctx,
-			backend: func(r *http.Request) (*http.Response, error) {
+			server: defaultServer(t, func(r *http.Request) (*http.Response, error) {
 				return nil, context.Cause(r.Context())
-			},
+			}, nil),
 			wantStatus:          http.StatusInternalServerError,
 			wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
@@ -554,9 +586,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		cancel(yerrors.WithHTTPStatus(http.StatusServiceUnavailable, errors.New("lindyd: shutting down")))
 		return test{
 			ctx: ctx,
-			backend: func(r *http.Request) (*http.Response, error) {
+			server: defaultServer(t, func(r *http.Request) (*http.Response, error) {
 				return nil, context.Cause(r.Context())
-			},
+			}, nil),
 			wantStatus:          http.StatusServiceUnavailable,
 			wantBody:            `{"error":{"message":"Service Unavailable","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
@@ -568,9 +600,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		t.Cleanup(cancel)
 		return test{
 			ctx: ctx,
-			backend: func(r *http.Request) (*http.Response, error) {
+			server: defaultServer(t, func(r *http.Request) (*http.Response, error) {
 				return nil, context.Cause(r.Context())
-			},
+			}, nil),
 			wantStatus: http.StatusGatewayTimeout,
 			wantBody:   `{"error":{"message":"Gateway Timeout","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -579,123 +611,123 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.Add("should return 401 with JSON body when validator returns ErrInvalidToken", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return nil, ErrInvalidToken
+	tests.AddFunc("should return 401 with JSON body when validator returns ErrInvalidToken", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return nil, ErrInvalidToken
+		}}
+		return test{
+			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		wantStatus: http.StatusUnauthorized,
-		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
-	tests.Add("should return 500 when validator returns non-sentinel error", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return nil, errors.New("db down")
+	tests.AddFunc("should return 500 when validator returns non-sentinel error", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return nil, errors.New("db down")
+		}}
+		return test{
+			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
-	tests.Add("should return 503 when the validator error carries a 503 status", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return nil, yerrors.WithHTTPStatus(http.StatusServiceUnavailable, errors.New("db down"))
+	tests.AddFunc("should return 503 when the validator error carries a 503 status", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return nil, yerrors.WithHTTPStatus(http.StatusServiceUnavailable, errors.New("db down"))
+		}}
+		return test{
+			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":{"message":"Service Unavailable","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		wantStatus: http.StatusServiceUnavailable,
-		wantBody:   `{"error":{"message":"Service Unavailable","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
-	tests.Add("should return 500 when the model has no backend prefix and none is configured", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: nil}, nil
+	tests.AddFunc("should return 500 when the model has no backend prefix and none is configured", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: nil}, nil
+		}}
+		return test{
+			server:      New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:  http.StatusInternalServerError,
+			wantBody:    `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		wantStatus:  http.StatusInternalServerError,
-		wantBody:    `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
-	tests.Add("should return 404 with invalid_request_error when the model names an unconfigured backend", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
-		},
-		requestBody:         `{"model":"ghost/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		wantStatus:          http.StatusNotFound,
-		wantBody:            `{"error":{"message":"model references unknown backend \"ghost\"","type":"invalid_request_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should return 404 with invalid_request_error when the model names an unconfigured backend", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+			}, nil),
+			requestBody:         `{"model":"ghost/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusNotFound,
+			wantBody:            `{"error":{"message":"model references unknown backend \"ghost\"","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should return 500 when the only configured backend has a nil config", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: map[string]Backend{
-					"broken": {ProviderType: "openai"},
-				}}, nil
+	tests.AddFunc("should return 500 when the only configured backend has a nil config", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"broken": {ProviderType: "openai"},
+			}}, nil
+		}}
+		return test{
+			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
-	tests.Add("should render a panicking handler as a 500 server_error envelope", test{
-		backend: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"x","choices":[]}`)), Header: http.Header{}}, nil
-		},
-		interceptor: func(context.Context, RequestMetadata, *http.Response) error {
-			panic("boom: usage rewrite exploded")
-		},
-		wantStatus:          http.StatusInternalServerError,
-		wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+	tests.AddFunc("should render a panicking handler as a 500 server_error envelope", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"x","choices":[]}`)), Header: http.Header{}}, nil
+			}, func(context.Context, RequestMetadata, *http.Response) error {
+				panic("boom: usage rewrite exploded")
+			}),
+			wantStatus:          http.StatusInternalServerError,
+			wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
 	})
 
-	tests.Add("should return 500 when openai backend has nil base URL", test{
-		validator: &stubValidator{
-			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: map[string]Backend{
-					"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: nil, APIKey: "sk-test"}},
-				}}, nil
+	tests.AddFunc("should return 500 when openai backend has nil base URL", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: nil, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{
+				"Content-Type": {"application/json"},
 			},
-		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
-		wantResponseHeaders: http.Header{
-			"Content-Type": {"application/json"},
-		},
+		}
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		validator := tt.validator
-		if validator == nil {
-			client := testy.HTTPClient(tt.backend)
-			validator = &stubValidator{
-				ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-					return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-				},
-			}
-		}
-		srv := New(validator, WithLogger(testLogger(t)), WithResponseInterceptor(tt.interceptor))
+		srv := tt.server
 
 		ctx := tt.ctx
 		if ctx == nil {
