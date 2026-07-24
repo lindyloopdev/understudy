@@ -2,13 +2,13 @@
 
 **Tag:** understudy
 
-**Design:** [UNDERSTUDY.md §understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §understudy](../DESIGN.md#understudy).
 
 **Settled architecture** — the availability/quality dividing line, the model
 addressing grammar (logical model vs direct target), `default` resolution,
 rate-limit reject, credential brokering, the embeddable proxy — is in
-[UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy) and
-[§LLM API Keys via Understudy](../UNDERSTUDY.md#llm-api-keys-via-understudy). This
+[DESIGN.md §Understudy](../DESIGN.md#understudy) and
+[§LLM API Keys via Understudy](../DESIGN.md#llm-api-keys-via-understudy). This
 doc is the **unsettled** remainder: how a logical model's membership is composed
 (the quality half — [[understudy-model-groups]]), plus the open/phasing items.
 The rate-limit reject detail is [[understudy-ratelimit-firewall]].

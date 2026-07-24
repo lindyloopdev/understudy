@@ -2,7 +2,7 @@
 
 **Tag:** understudy / ratelimit
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 understudy's 429 handling grew up around z.ai — the *worst* case: a byte-identical
 429 body for both concurrency limiting and quota exhaustion, no `Retry-After`, no

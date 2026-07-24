@@ -2,12 +2,12 @@
 
 **Tag:** understudy / fallback / ha / bug
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 The **settled behavior** — understudy synthesizes an exponential, jittered,
 reset-on-success `Retry-After` for a retryable failure that carries none, capped
 at the rate-limit-reject threshold — is stated in
-[UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy). Sequenced **after** the stateless
+[DESIGN.md §Understudy](../DESIGN.md#understudy). Sequenced **after** the stateless
 rate-limit reject ([[understudy-ratelimit-firewall]]); part of the per-host
 availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 

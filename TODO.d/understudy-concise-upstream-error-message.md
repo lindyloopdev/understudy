@@ -2,7 +2,7 @@
 
 **Tag:** understudy / observability / bug
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 `errorFromResponse` (providers/openai) embeds the entire raw upstream response
 body in the error message whenever the body doesn't decode into

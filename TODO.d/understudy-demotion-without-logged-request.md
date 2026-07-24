@@ -2,7 +2,7 @@
 
 **Tag:** understudy / observability / bug
 
-**Design:** [UNDERSTUDY.md §Understudy](../UNDERSTUDY.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy).
 
 A `backend down` transition should always have a corresponding logged request
 that caused it. Observed anomaly at the start of a review run: google was

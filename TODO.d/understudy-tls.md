@@ -2,7 +2,7 @@
 
 **Tag:** understudy / security
 
-**Design:** [UNDERSTUDY.md §LLM API Keys via Understudy](../UNDERSTUDY.md#llm-api-keys-via-understudy)
+**Design:** [DESIGN.md §LLM API Keys via Understudy](../DESIGN.md#llm-api-keys-via-understudy)
 (transport encryption), [DESIGN.md §Host-Side Security Invariants](../DESIGN.md#host-side-security-invariants)
 (only the minimum crosses the wall — the understudy endpoint + token),
 [DESIGN.md §Container Lifecycle](../DESIGN.md#container-lifecycle)
