@@ -109,9 +109,8 @@ func (e retryAfterError) Unwrap() error { return e.error }
 func errorFromResponse(resp *http.Response, now time.Time) error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	var env openAIErrorEnvelope
-	_ = json.Unmarshal(bodyBytes, &env)
-	msg := env.Error.Message
+	apiErr := decodeErrorEnvelope(bodyBytes)
+	msg := apiErr.Message
 	if msg == "" {
 		msg = string(bodyBytes)
 	}
@@ -122,7 +121,7 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 	if resp.StatusCode >= 500 {
 		clientStatus = http.StatusBadGateway
 	}
-	errType := env.Error.Type
+	errType := apiErr.Type
 	if errType == "" {
 		errType = typeForStatus(resp.StatusCode)
 	}
@@ -131,15 +130,48 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 		slog.Int("upstream_status", resp.StatusCode),
 		slog.String("upstream_error_type", errType),
 	}
-	if env.Error.Message != "" {
-		attrs = append(attrs, slog.String("upstream_error_message", env.Error.Message))
+	if apiErr.Message != "" {
+		attrs = append(attrs, slog.String("upstream_error_message", apiErr.Message))
 	}
-	if env.Error.Code != "" {
-		attrs = append(attrs, slog.String("upstream_error_code", env.Error.Code))
+	if apiErr.Code != "" {
+		attrs = append(attrs, slog.String("upstream_error_code", apiErr.Code))
 	}
+	attrs = append(attrs, quotaViolationAttrs(apiErr)...)
+	err = yerrors.With(err, attrs...)
+	err = withPerDayQuotaRetryAfter(err, apiErr, now)
+	err = withRetryAfter(err, resp.Header.Get("Retry-After"))
+	err = withGeminiQuotaRetryAfter(err, msg)
+	err = errorTypeError{error: err, errorType: errType}
+	return err
+}
+
+// decodeErrorEnvelope decodes an upstream error body, tolerating both the
+// object envelope and the array-wrapped form Gemini uses for its quota 429s
+// (`[{"error":{…}}]`), which the object shape rejects outright. A decode error
+// is deliberately ignored rather than propagated: encoding/json populates the
+// fields it can before failing, so a field it rejects (Gemini's numeric `code`)
+// must not discard the message decoded beside it. An undecodable body yields
+// the zero value.
+func decodeErrorEnvelope(body []byte) openAIError {
+	var env openAIErrorEnvelope
+	if json.Unmarshal(body, &env) != nil {
+		var envs []openAIErrorEnvelope
+		_ = json.Unmarshal(body, &envs)
+		if len(envs) > 0 {
+			env = envs[0]
+		}
+	}
+	return env.Error
+}
+
+// quotaViolationAttrs returns the slog attrs describing apiErr's quota
+// violations: the comma-joined ids and values of every violation, and the first
+// retry delay any of them advertises. Each attr is omitted when the upstream
+// reported nothing for it.
+func quotaViolationAttrs(apiErr openAIError) []any {
 	var quotaIDs, quotaValues []string
 	var retryDelay string
-	for _, d := range env.Error.Details {
+	for _, d := range apiErr.Details {
 		for _, v := range d.Violations {
 			if v.QuotaID != "" {
 				quotaIDs = append(quotaIDs, v.QuotaID)
@@ -152,6 +184,7 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 			retryDelay = d.RetryDelay
 		}
 	}
+	var attrs []any
 	if len(quotaIDs) > 0 {
 		attrs = append(attrs, slog.String("upstream_quota_id", strings.Join(quotaIDs, ",")))
 	}
@@ -161,12 +194,7 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 	if retryDelay != "" {
 		attrs = append(attrs, slog.String("upstream_quota_retry_delay", retryDelay))
 	}
-	err = yerrors.With(err, attrs...)
-	err = withPerDayQuotaRetryAfter(err, env.Error, now)
-	err = withRetryAfter(err, resp.Header.Get("Retry-After"))
-	err = withGeminiQuotaRetryAfter(err, msg)
-	err = errorTypeError{error: err, errorType: errType}
-	return err
+	return attrs
 }
 
 // withPerDayQuotaRetryAfter attaches a RetryAfter() of the next midnight in
