@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -719,6 +720,67 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 		if d := gocmp.Diff(tt.wantResponseHeaders, rr.Header()); d != "" {
 			t.Errorf("unexpected response headers: %s", d)
+		}
+	})
+}
+
+func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"ok","choices":[]}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+
+		// panicNext makes only the first served response panic, so the follow-up
+		// request exercises the capacity the panicking one was holding.
+		var panicNext atomic.Bool
+		panicNext.Store(true)
+
+		srv := newServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+		}})
+		srv.providers = defaultProviders()
+		srv.logger = testLogger(t)
+		srv.maxConcurrentPerUpstream = 1
+		srv.interceptor = func(context.Context, RequestMetadata, *http.Response) error {
+			if panicNext.Swap(false) {
+				panic("boom: usage rewrite exploded")
+			}
+			return nil
+		}
+
+		post := func() *httptest.ResponseRecorder {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+			if err != nil {
+				t.Error(err)
+				return nil
+			}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			return rec
+		}
+
+		if got := post(); got != nil && got.Code != http.StatusInternalServerError {
+			t.Fatalf("panicking request: got %d, want %d", got.Code, http.StatusInternalServerError)
+		}
+
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- post() }()
+		synctest.Wait()
+
+		select {
+		case rec := <-done:
+			if rec != nil && rec.Code != http.StatusOK {
+				t.Errorf("request after a panicking one: got %d, want %d", rec.Code, http.StatusOK)
+			}
+		default:
+			t.Error("request after a panicking one is starved: it never reached the upstream")
 		}
 	})
 }
