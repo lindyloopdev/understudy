@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Supersede in-flight runs for the same ref, matching the GitLab pipeline's
+# `interruptible: true`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOPHERLINTVERSION: "v1.26.3"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race -shuffle=on ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy is up to date
+        run: |
+          go mod tidy
+          git diff --exit-code
+
+      # gopherlint is a bugfix-only fork of golangci-lint, pinned so the linter
+      # set never shifts under us. It can't be `go install`ed (its go.mod has
+      # replace directives), hence the install script.
+      - name: gopherlint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/flimzy/gopherlint/main/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" "$GOPHERLINTVERSION"
+          gopherlint run ./...
+
+      # deadcode exits 0 and prints nothing when clean, so both a non-zero exit
+      # and any output are failures.
+      - name: deadcode
+        run: |
+          output=$(go tool deadcode -test ./... 2>&1)
+          ec=$?
+          if [ $ec -ne 0 ]; then
+            echo "$output"
+            echo "deadcode exited with error code $ec"
+            exit 1
+          fi
+          if [ -n "$output" ]; then
+            echo "$output"
+            echo "Dead code detected (see output above)"
+            exit 1
+          fi
