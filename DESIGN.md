@@ -342,8 +342,27 @@ count. `prompt_tokens` is set to the same id, so opencode's derived input
 real token usage is destroyed in the relayed body on purpose and survives only in the
 provenance record below. The real `(backend, model)` and full usage ride a separate **provenance stream** —
 per-token-scoped JSONL, one record per served request — which lindy joins to each
-transcript step on the id. One request is one step, so the join is exact at line
-granularity, correct even across a failover.
+transcript step on the id.
+
+The correspondence is **step → record**, not request → step. Every step is one
+served request, so it has exactly one record; but the reverse does not hold —
+opencode also issues requests that never become steps (session title/summarize,
+retries), each producing its own record. The consumer skips those orphan records
+and matches each step to *its* record **by id**, so the join is exact at line
+granularity and correct even across a failover. Positional correlation (Nth
+request ↔ Nth step) cannot work precisely because of those extra requests; the id
+is what makes the join robust to them.
+
+**The join key is present exactly when the rewrite succeeded.** The interceptor
+overwrites `cached_tokens` only when it can read the usage; when the usage is
+unparseable it relays unchanged and writes no record, and opencode then reports a
+**zero** cache-read. Since an id is a nonce ≥ 1, a non-zero carried value is
+therefore always a real id with a record on the stream, and a step with no id
+(zero) is one the rewrite could not tag — passed through **unattributed** rather
+than mis-joined. This is why the consumer needs no buffer and cannot desync: it
+scans the stream for a step's id (an id-bearing step's record is guaranteed
+present, so the scan always terminates at its match), and an id-less step is never
+scanned for.
 
 The stream is a **live broadcast**, per-token-scoped: each record fans out to every
 current subscriber, and a subscriber sees only records produced after it subscribes.

@@ -533,18 +533,19 @@ func TestChatSurfacesGeminiQuotaRetryDelay(t *testing.T) {
 // TestErrorFromResponsePerDayQuotaWaitsForDailyReset verifies that a Gemini
 // free-tier 429 whose QuotaFailure violation names a per-day quota
 // ("GenerateRequestsPerDayPerProjectPerModel-FreeTier") sets RetryAfter() to
-// the next midnight America/Los_Angeles — the true daily reset — rather than
-// trusting the misleading short prose delay ("Please retry in 42s") Google
-// attaches to it.
+// the next Pacific midnight — the daily reset — rather than trusting the
+// misleading short prose delay ("Please retry in 42s") Google attaches to it.
+// The reset is computed at a fixed −8 (PST) offset with no tz database, so in
+// summer it lands an hour late (1am PDT = 08:00 UTC) — a deliberate bias, since
+// an early estimate would retry before the reset, see it still blocked, and
+// skip forward a full day.
 func TestErrorFromResponsePerDayQuotaWaitsForDailyReset(t *testing.T) {
 	t.Parallel()
 
-	pacific, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, time.July, 11, 15, 0, 0, 0, pacific)
-	wantMidnight := time.Date(2026, time.July, 12, 0, 0, 0, 0, pacific)
+	// A summer instant (DST in effect): 15:00 Pacific = 22:00 UTC.
+	now := time.Date(2026, time.July, 11, 22, 0, 0, 0, time.UTC)
+	// Next −8 midnight: July 12 00:00 at −8 = 08:00 UTC (= 1am PDT, an hour late).
+	wantMidnight := time.Date(2026, time.July, 12, 8, 0, 0, 0, time.UTC)
 
 	body := `{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-2.5-flash\nPlease retry in 42s.\n{\"status\": \"RESOURCE_EXHAUSTED\"}","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","quotaValue":"20"}]}]}}`
 	resp := &http.Response{
@@ -560,7 +561,7 @@ func TestErrorFromResponsePerDayQuotaWaitsForDailyReset(t *testing.T) {
 		t.Fatalf("error carries no RetryAfter(): %v", got)
 	}
 	if !ra.RetryAfter().Equal(wantMidnight) {
-		t.Errorf("RetryAfter: got %v, want %v (next midnight America/Los_Angeles, not now+42s)", ra.RetryAfter(), wantMidnight)
+		t.Errorf("RetryAfter: got %v, want %v (next Pacific midnight at fixed −8, not now+42s)", ra.RetryAfter(), wantMidnight)
 	}
 }
 
