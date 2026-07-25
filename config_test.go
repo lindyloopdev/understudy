@@ -271,6 +271,18 @@ func TestConfigResolve(t *testing.T) {
 		wantErr: `understudy\.models\.m: target "ghost/mb" references unknown backend "ghost"`,
 	})
 
+	tests.Add("should reject a logical model configured with no targets", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},
+			},
+			Models: map[string]LogicalModelSpec{
+				"m": {Targets: []Target{}},
+			},
+		},
+		wantErr: `understudy\.models\.m: no targets`,
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		got, err := tt.cfg.Resolve()

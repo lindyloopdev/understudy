@@ -76,6 +76,9 @@ func (c Config) Resolve() (*BackendConfig, error) {
 	if len(c.Models) > 0 {
 		out.Models = make(map[string]LogicalModel, len(c.Models))
 		for name, m := range c.Models {
+			if len(m.Targets) == 0 {
+				return nil, fmt.Errorf("understudy.models.%s: no targets", name)
+			}
 			for _, t := range m.Targets {
 				if _, ok := out.Backends[t.backend]; !ok {
 					return nil, fmt.Errorf("understudy.models.%s: target %q references unknown backend %q", name, t.identity(), t.backend)
