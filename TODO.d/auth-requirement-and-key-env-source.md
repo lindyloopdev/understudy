@@ -22,11 +22,11 @@ Build the `auth` requirement declaration and the third key source it depends on.
 - Under `auth = "auto"`, `Resolve` drops an unresolvable backend, drops targets
   naming it, and drops logical models left with no targets — then reports the
   skipped backend names (a field on `BackendConfig`; `Resolve`'s signature stays).
+  Decide whether `default` dropping to empty differs from any other model doing
+  so: the daemon can serve nothing at all in that case, so it may warrant its own
+  failure rather than the silent drop.
 - Reject the invalid combinations: a key source declared under `none`; no source
   declared under `required` or `auto`.
-
-Blocked on [[empty-logical-model-panic]] — the model drop is what makes an empty
-target list ordinary rather than hand-written.
 
 The library never runs the validator (`go-playground` appears only in
 `config_test.go`), so the `validate` tags are a contract embedders enforce. Any
