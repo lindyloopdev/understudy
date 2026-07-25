@@ -13,12 +13,9 @@
   equivalents is fine for chat/iteration; pin a single smart model when an
   agent needs consistent capability — don't oversell) and a TOS disclaimer
   ("use your own keys; follow each provider's terms").
-- `examples/free-tiers.toml`: commented sample config with multiple free-tier
-  providers (Gemini free, Groq, Cerebras, OpenRouter `:free`, Mistral free),
-  grouped by capability tier (`fast`, `smart`), each backend commented with
-  signup URL + limit shape + last-verified date; `default` → `fast`. The killer
-  demo — exercises failover depth in 5 minutes at zero cost, where a
-  single-provider demo hides it.
+- `examples/free-tiers.toml` — the killer demo (failover depth in 5 minutes at
+  zero cost, where a single-provider demo hides it). The file itself is
+  [[free-tier-drop-in-config]]; the README must link and explain it.
 - `providers-tested.md` matrix: provider · OpenAI-compat endpoint · free-tier
   limit shape · last-verified date · quirks. Re-verify monthly (free tiers rot;
   Cerebras has paused theirs before).

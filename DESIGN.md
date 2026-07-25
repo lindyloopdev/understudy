@@ -39,13 +39,50 @@ mint is the fallthrough either way.
 understudy config. A lindy agent can read both the config file and the host
 environment, so to keep the plaintext out of the agent's reach a backend may
 reference the key by file instead of inlining it: it sets exactly one of
-`api_key` or `api_key_file`. `api_key_file` resolves to an absolute path — a
+`api_key`, `api_key_file`, or `api_key_env`. `api_key_file` resolves to an absolute path — a
 leading `~/` expands against the home directory, an otherwise-relative path
 against the config file's directory — whose contents supply the key. Placing
 that file outside the worktree and unmounted from the container keeps the secret
-where agent-generated code cannot read it. An empty or whitespace-only file, an
-unreadable path, a non-absolute path at understudy's resolve, or setting both
-fields is a config error.
+where agent-generated code cannot read it. `api_key_env` names an environment
+variable holding the key; it names the variable rather than interpolating its
+value so that *declaring* a credential stays distinguishable from *resolving*
+one — the distinction `auth` below depends on. An empty or whitespace-only file, an
+unreadable path, a non-absolute path at understudy's resolve, or setting more than one
+source is a config error.
+
+**Credential requirement (`auth`).** A backend declares whether it needs a
+credential at all, and what an absent one means. The value governs the backend's
+presence in the resolved config, so one vocabulary covers the keyless upstream, the
+strict backend, and the config file distributed to operators who hold only some of
+its keys:
+
+- `required` (the default) — a declared source that does not resolve is a config
+  error. Preserves the strict behavior for a hand-written config, where an
+  unresolvable credential is a typo, not an expectation.
+- `none` — the backend needs no credential (a local ollama or LM Studio). It is
+  always present and is called without one. Declaring a key source is a config
+  error, since the source could never be read. If the upstream turns out to demand
+  a credential after all, its `401` is the diagnostic — understudy adds no special
+  handling.
+- `auto` — the backend needs a credential, and an unresolvable one **drops the
+  backend** from the resolved config rather than failing. `Resolve` also drops
+  targets naming a dropped backend, and any logical model left with no targets,
+  reporting what it skipped. This is what makes a shared config
+  (`examples/free-tiers.toml`) drop-in: an operator holding one provider's key
+  gets that provider, not a startup error, and the backends they cannot reach
+  generate no traffic and so no upstream auth failures.
+- `optional` — **reserved, rejected at `Resolve`.** Send a credential when one
+  resolves, stay present when none does. Its name is held so that `auto` does not
+  drift into meaning it.
+
+`auto` and `required` each require a declared source; the invalid combinations are
+rejected within the one field rather than across two, so no state that cannot be
+expressed needs forbidding.
+
+Dropping a backend is distinct from an upstream rejecting a credential. `auth`
+governs only whether a backend enters the config; a credential that resolves and is
+then refused is a defect the operator can act on, logged at ERROR when the target is
+demoted, regardless of the backend's `auth` value.
 
 **Transport encryption.** understudy serves the agent over **TLS, not cleartext**.
 The container reaches it across the Docker bridge — a segment other, untrusted
