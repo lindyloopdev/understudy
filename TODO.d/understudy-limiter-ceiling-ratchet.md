@@ -15,13 +15,11 @@ gaps, each independently landable:
 - **Split the growth regimes at the last known-good cap.** One slot per success is
   doubling-per-round under saturation, which is right far from the edge and wrong near
   it. Track the known-good boundary and fall back to one slot per round at or above it.
-- **Make the decrease a measurement.** `throttle()` seeds the cap from the in-flight
-  count only `if l.inflight < l.limit` — false at saturation, which is exactly when the
-  reading is informative — so the first signal-less 429 at a saturated cap is a no-op.
-  Its `seeded` latch never resets, so every later 429 halves for the process's lifetime,
-  and per-upstream state outlives tenants by design. Set the cap just below the in-flight
-  count at rejection, record it as the known-good boundary, and reserve halving for a
-  repeat rejection at or below that boundary.
+- **Make the decrease a measurement.** `throttle()`'s `seeded` latch never resets, so
+  every 429 after the first halves the cap for the rest of the process's lifetime, and
+  per-upstream state outlives tenants by design. Record the cap a saturated rejection
+  measures as the known-good boundary, and reserve halving for a repeat rejection at or
+  below that boundary.
 
 ## Deferred refinements
 

@@ -304,14 +304,19 @@ func (l *upstreamLimiter) shrink() {
 }
 
 // throttle reacts to a signal-less rate limit. On the first call it seeds the
-// cap to the observed in-flight count (a per-process over-estimate the account's
-// true limit sits at or below), never raising it; later calls halve the cap.
+// cap from the observed in-flight count, never raising it; later calls halve the
+// cap. A rejection arriving at saturation is a capacity measurement — the
+// account's limit sits just below the count in flight at that moment — so the
+// cap lands one slot under it rather than staying put.
 func (l *upstreamLimiter) throttle() {
 	l.mu.Lock()
 	if !l.seeded {
 		l.seeded = true
-		if l.inflight < l.limit {
+		switch {
+		case l.inflight < l.limit:
 			l.limit = l.inflight
+		case l.inflight > 1:
+			l.limit = l.inflight - 1
 		}
 		l.mu.Unlock()
 		return

@@ -3734,17 +3734,23 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 2,
 		wantSlots: 2,
 	})
-	tests.Add("should leave the cap unchanged when the first throttle arrives at full saturation", test{
+	tests.Add("should set the cap just below the in-flight count when a signal-less rate limit arrives at saturation", test{
 		start:     4,
 		acquire:   4,
 		throttles: 1,
-		wantSlots: 4,
+		wantSlots: 3,
 	})
 	tests.Add("should halve after a saturated seed on the next throttle", test{
 		start:     4,
 		acquire:   4,
 		throttles: 2,
-		wantSlots: 2,
+		wantSlots: 1,
+	})
+	tests.Add("should hold the cap at one when a signal-less rate limit arrives at a saturated cap of one", test{
+		start:     1,
+		acquire:   1,
+		throttles: 1,
+		wantSlots: 1,
 	})
 
 	tests.Parallel()
