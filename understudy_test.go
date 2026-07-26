@@ -3740,11 +3740,11 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 1,
 		wantSlots: 3,
 	})
-	tests.Add("should halve after a saturated seed on the next throttle", test{
+	tests.Add("should measure the cap again rather than halve when a repeat rate limit arrives above the known-good boundary", test{
 		start:     4,
 		acquire:   4,
 		throttles: 2,
-		wantSlots: 1,
+		wantSlots: 3,
 	})
 	tests.Add("should hold the cap at one when a signal-less rate limit arrives at a saturated cap of one", test{
 		start:     1,
@@ -3752,6 +3752,11 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 1,
 		wantSlots: 1,
 	})
+	// TODO: add "should halve the cap when a repeat rate limit arrives at or below the
+	// known-good boundary" — start 5, fill, throttle (boundary 4), release 2, throttle
+	// again at in-flight 3, expect 2 slots. Nothing exercises that halving today. The
+	// runner acquires every slot before throttling, so the case needs releases
+	// interleaved between throttles: a `release` count applied after the first one.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {

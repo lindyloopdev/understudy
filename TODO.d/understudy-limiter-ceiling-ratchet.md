@@ -15,11 +15,11 @@ gaps, each independently landable:
 - **Split the growth regimes at the last known-good cap.** One slot per success is
   doubling-per-round under saturation, which is right far from the edge and wrong near
   it. Track the known-good boundary and fall back to one slot per round at or above it.
-- **Make the decrease a measurement.** `throttle()`'s `seeded` latch never resets, so
-  every 429 after the first halves the cap for the rest of the process's lifetime, and
-  per-upstream state outlives tenants by design. Record the cap a saturated rejection
-  measures as the known-good boundary, and reserve halving for a repeat rejection at or
-  below that boundary.
+- **Collapse the `seeded` latch into the known-good boundary.** A repeat rejection is
+  measured against the boundary only once one has been recorded; before that the latch
+  still routes it to halving, so a first 429 below the cap followed by one at saturation
+  halves instead of measuring. The boundary is the only state the law needs — retire the
+  latch and let every saturated rejection measure.
 
 ## Deferred refinements
 

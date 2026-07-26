@@ -231,7 +231,10 @@ type upstreamLimiter struct {
 	limit    int
 	inflight int
 	seeded   bool
-	ready    chan struct{}
+	// knownGood is the cap the last saturated rejection measured, zero before any
+	// such rejection has arrived. Halving is reserved for a rejection at or below it.
+	knownGood int
+	ready     chan struct{}
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
@@ -307,7 +310,10 @@ func (l *upstreamLimiter) shrink() {
 // cap from the observed in-flight count, never raising it; later calls halve the
 // cap. A rejection arriving at saturation is a capacity measurement — the
 // account's limit sits just below the count in flight at that moment — so the
-// cap lands one slot under it rather than staying put.
+// cap lands one slot under it and that value is remembered as known-good.
+// Halving is reserved for a repeat rejection at or below the known-good
+// boundary, where the measurement itself is in doubt; a rejection above it is
+// just another measurement.
 func (l *upstreamLimiter) throttle() {
 	l.mu.Lock()
 	if !l.seeded {
@@ -316,13 +322,27 @@ func (l *upstreamLimiter) throttle() {
 		case l.inflight < l.limit:
 			l.limit = l.inflight
 		case l.inflight > 1:
-			l.limit = l.inflight - 1
+			l.measure()
+		}
+		l.mu.Unlock()
+		return
+	}
+	if l.knownGood > 0 && l.inflight > l.knownGood {
+		if l.inflight > 1 {
+			l.measure()
 		}
 		l.mu.Unlock()
 		return
 	}
 	l.mu.Unlock()
 	l.shrink()
+}
+
+// measure sets the cap one slot below the in-flight count and records it as the
+// known-good boundary; caller holds l.mu.
+func (l *upstreamLimiter) measure() {
+	l.limit = l.inflight - 1
+	l.knownGood = l.limit
 }
 
 // grow raises the cap by one (AIMD additive increase); no per-account ceiling —
