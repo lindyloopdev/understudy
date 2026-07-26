@@ -1,40 +1,37 @@
-# Credential requirement vocabulary + `api_key_env` source
+# Credential requirement vocabulary (`auth`)
 
 **Tag:** understudy / config
 
 **Design:** [DESIGN.md §LLM API Keys via Understudy](../DESIGN.md#llm-api-keys-via-understudy)
-(credential sourcing, the `auth` vocabulary),
-[DESIGN.md §Understudy](../DESIGN.md#understudy) (a logical model resolves to a
-priority-ordered target list, which the drop prunes).
+(credential sourcing, the `auth` vocabulary and its availability framing),
+[DESIGN.md §Understudy](../DESIGN.md#understudy) (the availability layer that
+carries a credential-less backend).
 
-Build the `auth` requirement declaration and the third key source it depends on.
+Build the `auth` declaration: what kind of fact an absent credential is.
 
-- Add `api_key_env` to `BackendSpec` — names an environment variable, mutually
-  exclusive with `api_key`/`api_key_file`. An unset or empty variable is
-  unresolved, matching `api_key_file`'s existing empty-contents rule.
 - Add `auth` (`required` default / `none` / `auto`, plus `optional` reserved).
-  This replaces the `validate:"required_without=APIKeyFile"` tag, which makes a
-  keyless backend contract-illegal today — the tag is the reason a local ollama
-  entry cannot currently be expressed.
-- Reject `auth = "optional"` at `Resolve` with a reserved-value error, following
-  the `thinking=true` precedent in `target.go`, and carry the matching inline
+- Express the combination rules as tags, not a method: `excluded_if`/`required_if`
+  against the `auth` value cover "a key source under `none`" and "no source under
+  `required`/`auto`". The exactly-one-of rule is likewise `excluded_with` naming
+  the sibling sources — `excluded_with` takes a list and fires if any named field
+  is set, so it stays one tag per field rather than growing pairwise.
+- Reject `auth = "optional"` with a reserved-value error, following the
+  `thinking=true` precedent in `target.go`, and carry the matching inline
   `TODO(TODO.d/…)` marker.
-- Under `auth = "auto"`, `Resolve` drops an unresolvable backend, drops targets
-  naming it, and drops logical models left with no targets — then reports the
-  skipped backend names (a field on `BackendConfig`; `Resolve`'s signature stays).
-  Decide whether `default` dropping to empty differs from any other model doing
-  so: the daemon can serve nothing at all in that case, so it may warrant its own
-  failure rather than the silent drop.
-- Reject the invalid combinations: a key source declared under `none`; no source
-  declared under `required` or `auto`.
+- Under `auth = "auto"`, an empty key must **not** fail validation. The backend
+  stays in the configuration and is instead **unavailable** — seed the health
+  state the failover walk already consults, so `pickTarget` passes over it exactly
+  as it does a demoted target. Nothing is pruned: no backend removed, no target
+  rewritten, no model emptied.
+- Under `auth = "required"`, an empty key is a validation error naming both the
+  backend and the source that should have supplied it.
 
-The library never runs the validator (`go-playground` appears only in
-`config_test.go`), so the `validate` tags are a contract embedders enforce. Any
-tag change here is a contract change lindy sees; relaxing a constraint keeps
+Depends on [[resolve-validate-split]] for the stage that runs these rules; the
+`api_key_env` source itself is built.
+
+Any tag change here is a contract change lindy sees; relaxing a constraint keeps
 existing configs valid, so the two sides need not land together.
 
-Deferred: `api_key`/`api_key_file`/`api_key_env` as three mutually-exclusive
-fields needs three pairwise exclusions, and a fourth source would need six — the
-shape is asking to become one `[backends.<name>.key]` sub-table with a source
-discriminator. Not worth restructuring at v0; noted so the next source added
-reconsiders rather than adding a fourth field.
+Deferred: three key-source fields work today, but a fourth would be the point to
+reconsider a `[backends.<name>.key]` sub-table with a source discriminator rather
+than a fourth sibling field.

@@ -35,6 +35,28 @@ path and differ only in transport. A daemon may additionally wrap the validator
 with a static operator token for external (non-engine) clients; the engine's
 mint is the fallthrough either way.
 
+**Config handling is two stages: load, then validate.** *Loading* gets the
+configuration into the struct — decode the TOML, parse the base URL and each
+target into their types, and fill each backend's key from whichever source it
+names. Reading a file or an environment variable to populate a field is part of
+loading, in the same sense that decoding the document is; it is one more level of
+indirection, not a separate phase. Loading fails only where loading is
+*impossible*: a malformed document, an unreadable path. *Validation* then runs
+over the loaded struct — tags for per-field shape, `Validate() error` methods for
+the relationships tags express poorly — and carries every rule about whether the
+configuration is acceptable.
+
+**Loading never discards the source fields.** A backend that names
+`api_key_env = "GROQ_API_KEY"` still carries that name after its key is filled,
+so validation sees both the empty key *and* where it should have come from, and
+says which variable to set. Keeping one struct through validation is what makes
+the diagnostic specific; transforming into a credential-only type would discard
+exactly the fact the operator needs.
+
+*(Planned. Today `Config.Resolve` performs the loading and much of the validation
+in one pass, and the library never runs the tags itself — see
+[TODO.d/resolve-validate-split.md](TODO.d/resolve-validate-split.md).)*
+
 **Credential sourcing.** Each backend's upstream key lives in the resolved
 understudy config. A lindy agent can read both the config file and the host
 environment, so to keep the plaintext out of the agent's reach a backend may
@@ -51,38 +73,37 @@ unreadable path, a non-absolute path at understudy's resolve, or setting more th
 source is a config error.
 
 **Credential requirement (`auth`).** A backend declares whether it needs a
-credential at all, and what an absent one means. The value governs the backend's
-presence in the resolved config, so one vocabulary covers the keyless upstream, the
-strict backend, and the config file distributed to operators who hold only some of
-its keys:
+credential at all. The value decides **what kind of fact an absent credential
+is** — a defect in the document, or a fact about the world:
 
-- `required` (the default) — a declared source that does not resolve is a config
-  error. Preserves the strict behavior for a hand-written config, where an
-  unresolvable credential is a typo, not an expectation.
-- `none` — the backend needs no credential (a local ollama or LM Studio). It is
-  always present and is called without one. Declaring a key source is a config
-  error, since the source could never be read. If the upstream turns out to demand
-  a credential after all, its `401` is the diagnostic — understudy adds no special
-  handling.
-- `auto` — the backend needs a credential, and an unresolvable one **drops the
-  backend** from the resolved config rather than failing. `Resolve` also drops
-  targets naming a dropped backend, and any logical model left with no targets,
-  reporting what it skipped. This is what makes a shared config
+- `required` (the default) — an empty key is a **config error**. Preserves the
+  strict behavior for a hand-written config, where a credential that fails to load
+  is a typo, not an expectation.
+- `auto` — an empty key is a **valid configuration**; the backend is simply
+  **unavailable**. This is what makes a shared config
   (`examples/free-tiers.toml`) drop-in: an operator holding one provider's key
-  gets that provider, not a startup error, and the backends they cannot reach
-  generate no traffic and so no upstream auth failures.
-- `optional` — **reserved, rejected at `Resolve`.** Send a credential when one
-  resolves, stay present when none does. Its name is held so that `auto` does not
-  drift into meaning it.
+  gets that provider and a startup that succeeds.
+- `none` — no credential is wanted (a local ollama or LM Studio), so there is
+  nothing to be absent. Naming a key source is a config error, since it could
+  never be read. If the upstream turns out to demand a credential after all, its
+  `401` is the diagnostic — understudy adds no special handling.
+- `optional` — **reserved, rejected.** Send a credential when one loads, stay
+  available when none does. Its name is held so that `auto` does not drift into
+  meaning it.
 
-`auto` and `required` each require a declared source; the invalid combinations are
-rejected within the one field rather than across two, so no state that cannot be
-expressed needs forbidding.
+**`auth` is not a config transformation.** A backend whose variable is unset is
+still in the configuration — the document said it exists, and that remains true.
+Nothing is pruned: no backend is removed, no target naming it is rewritten, no
+logical model is emptied. What changes is *availability*, which understudy already
+models for a demoted or rate-limited target — a backend with no credential is
+unusable in the same way, and the failover walk passes over it for the same reason.
+An operator who exports the variable makes it usable again without the
+configuration having changed at all.
 
-Dropping a backend is distinct from an upstream rejecting a credential. `auth`
-governs only whether a backend enters the config; a credential that resolves and is
-then refused is a defect the operator can act on, logged at ERROR when the target is
-demoted, regardless of the backend's `auth` value.
+That also keeps `auto` distinct from an upstream *rejecting* a credential. `auth`
+governs only whether an absent credential is an error; a credential that loads and
+is then refused is a defect the operator can act on, logged at ERROR when the
+target is demoted, regardless of the backend's `auth` value.
 
 **Transport encryption.** understudy serves the agent over **TLS, not cleartext**.
 The container reaches it across the Docker bridge — a segment other, untrusted

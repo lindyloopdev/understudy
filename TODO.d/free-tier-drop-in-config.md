@@ -19,17 +19,18 @@ An unedited file, one key set, a working failover chain.
 - `examples/free-tiers.toml` — every backend `auth = "auto"` + `api_key_env`,
   grouped into capability tiers (`fast`, `smart`), `default` → `fast`. Comment
   each backend with signup URL, limit shape, and last-verified date, so the
-  startup skip line is self-explanatory to someone enabling one. Overlaps the
-  entry in [[documentation]]; this item owns the file, that one owns the README.
-- `cmd/understudyd` reports the skipped backends from `Resolve` as **one** INFO
-  summary line naming the unset variables — five separate lines on a first run
-  reads as something being wrong. INFO, not DEBUG: "why isn't groq being used?"
-  should not require raising the log level.
-- Exit with `no backends configured: set one of GEMINI_API_KEY, …` when every
-  backend drops. Check `len(Backends) == 0` rather than a missing `default` —
-  `Config.DefaultModel` derives `default` from backend presence rather than
-  requiring an explicit table. A configless understudy stays legal at the library
-  level, so this check is the daemon's.
+  startup report is self-explanatory to someone enabling one. Overlaps the entry
+  in [[documentation]]; this item owns the file, that one owns the README.
+- `cmd/understudyd` reports the backends that started **unavailable** for want of
+  a credential as **one** INFO summary line naming the unset variables — five
+  separate lines on a first run reads as something being wrong. INFO, not DEBUG:
+  "why isn't groq being used?" should not require raising the log level. This is a
+  report about availability, not about the config: every backend is still
+  configured.
+- Exit with `no backends have credentials: set one of GEMINI_API_KEY, …` when none
+  is usable. This is a daemon-level judgement that serving nothing is pointless,
+  not a config rejection — the library keeps accepting the configuration, and a
+  configless understudy stays legal.
 
 Depends on [[auth-requirement-and-key-env-source]] and the daemon in
 [[standalone-daemon]].
