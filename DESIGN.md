@@ -533,6 +533,69 @@ This log record is understudy's own, distinct from the served-model provenance
 downstream joins/cost, while the `LogRecord` snapshot is what the mount projects to the log
 line. They overlap on backend/model but answer to different consumers, so they stay separate.
 
+## Concurrency & Rate Limiting <a id="concurrency-rate-limiting"></a>
+
+understudy bounds the requests it holds in flight to one upstream account, so a burst
+cannot trip the account's *own* concurrency limiting. The bound is keyed on canonical
+upstream identity (§Upstream-identity canonicalization) and, in the shared daemon, is
+therefore global across tenants (§Shared understudy daemon).
+
+**The cap is learned, not configured.** An account's real concurrency limit is rarely
+documented and varies by plan, so understudy estimates it from the traffic it is already
+sending. A configured number would be wrong on every account but the one it was tuned
+for. The configured value is a **cold-start allowance** only — where the estimate begins
+before any evidence exists.
+
+**Growth is demand-gated.** The cap rises only when a request actually waited for a
+slot. Without the gate the estimate rises on every success, including on an idle system
+where nothing is contending, and so encodes *cumulative successful traffic* rather than
+capacity — it drifts upward without bound and the only thing that ever pulls it back is
+provoking a rejection. Demand is what makes an increase evidence-bearing: raising a cap
+nobody is pressing against asserts nothing about the account.
+
+**Two growth regimes, split at the last known-good cap.** An increase of one slot per
+successful request is geometric in aggregate, not linear: while saturated, a cap of *L*
+completes *L* requests per round trip, so the cap doubles each round. That is the right
+speed when the estimate is far below the truth and the wrong speed when it is near it —
+approaching the real limit at doubling speed guarantees overshoot, and the overshoot is
+paid for in real rejections. So the cap remembers the last value known to be safe and
+changes instrument there:
+
+- **Below it — one slot per success.** Doubling per round; the estimate is far from the
+  edge and the cost of being wrong is one rejection.
+- **At or above it — one slot per round.** Additive probing; the estimate is near the
+  edge and each step must be cheap to retract.
+
+**A rejection is a measurement, not a reflex.** A signal-less 429 arriving while
+saturated says the account's limit is approximately the in-flight count at that moment —
+the most precise capacity reading understudy ever gets. It sets the cap just below that
+count and records it as the new known-good boundary. Halving instead would discard the
+measurement just paid for.
+
+Multiplicative decrease is held in reserve for the case that earns it: a repeat
+rejection at or below the known-good boundary, which means the estimate is wrong or the
+account is not understudy's alone. Halving is a *fairness* instrument — it is what makes
+many independent flows converge on a shared resource — and the shared daemon exists
+precisely so that understudy is the single flow per account (§Shared understudy daemon).
+With no competing flow to converge with, halving on first contact costs accuracy and buys
+nothing.
+
+A 429 that carries a usable signal is not a concurrency measurement at all: it is quota
+or rate exhaustion, and it routes to quota-class-aware demotion (§Understudy) rather than
+to the cap. Only the signal-less case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
+feeds the estimator.
+
+**Per-upstream state outlives the tenant that taught it.** The learned cap is a property
+of the account, accumulated across runs; tearing down a tenant frees its in-flight slots
+but never resets the estimate (§Shared understudy daemon, Two lifecycles).
+
+**The FD budget is a process backstop, not the account bound.** A process-wide limit
+sized from `RLIMIT_NOFILE` sheds with `503` rather than queueing, so exhaustion cannot
+accumulate the goroutines and buffered bodies it exists to protect. It guards the
+*process* against resource exhaustion; on a host with a generous soft limit it sits far
+above any cap the control law reaches and so bounds nothing about the account. Growth is
+bounded by the demand gate and the known-good boundary, never by the FD budget.
+
 ## Shared understudy daemon <a id="shared-daemon"></a>
 
 A single understudy process hosts many concurrent runs' configs, so a provider
