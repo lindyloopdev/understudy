@@ -3717,7 +3717,10 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		start     int
 		acquire   int
 		throttles int
-		wantSlots int
+		// releaseBetween slots are released after the first throttle, so a later
+		// one can arrive with fewer in flight than the throttle that preceded it.
+		releaseBetween int
+		wantSlots      int
 	}
 
 	tests := testy.NewTable[test]()
@@ -3752,11 +3755,13 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 1,
 		wantSlots: 1,
 	})
-	// TODO: add "should halve the cap when a repeat rate limit arrives at or below the
-	// known-good boundary" — start 5, fill, throttle (boundary 4), release 2, throttle
-	// again at in-flight 3, expect 2 slots. Nothing exercises that halving today. The
-	// runner acquires every slot before throttling, so the case needs releases
-	// interleaved between throttles: a `release` count applied after the first one.
+	tests.Add("should halve the cap when a repeat rate limit arrives at or below the known-good boundary", test{
+		start:          5,
+		acquire:        5,
+		throttles:      2,
+		releaseBetween: 2,
+		wantSlots:      2,
+	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
@@ -3767,13 +3772,20 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 			}
 		}
 
-		for range tt.throttles {
+		held := tt.acquire
+		for i := range tt.throttles {
+			if i > 0 {
+				for range tt.releaseBetween {
+					l.release()
+					held--
+				}
+			}
 			l.throttle()
 		}
 
 		// Release the held slots so the drain observes the post-throttle cap, not
 		// what is left above the in-flight count.
-		for range tt.acquire {
+		for range held {
 			l.release()
 		}
 
