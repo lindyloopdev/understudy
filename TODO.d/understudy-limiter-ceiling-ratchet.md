@@ -9,12 +9,9 @@
 ## Bring the control law up to the design
 
 The limiter grows and shrinks, but not by the law
-[§Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting) states. Three
+[§Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting) states. Two
 gaps, each independently landable:
 
-- **Demand-gate the increase.** `grow()` fires on every successful relay regardless of
-  whether the limiter was saturated, so the cap climbs on an idle system and, with no
-  ceiling since `a4ee7a9`, without bound. Grow only when the request waited for a slot.
 - **Split the growth regimes at the last known-good cap.** One slot per success is
   doubling-per-round under saturation, which is right far from the edge and wrong near
   it. Track the known-good boundary and fall back to one slot per round at or above it.

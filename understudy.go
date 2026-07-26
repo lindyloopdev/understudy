@@ -238,24 +238,27 @@ func newUpstreamLimiter(limit int) *upstreamLimiter {
 	return &upstreamLimiter{limit: limit, ready: make(chan struct{})}
 }
 
-// acquire takes a slot, blocking until one is free or ctx is done. A free slot
-// is taken immediately without consulting ctx, so a request with an
+// acquire takes a slot, blocking until one is free or ctx is done, and reports
+// whether it had to wait — the demand signal that gates growth of the cap. A
+// free slot is taken immediately without consulting ctx, so a request with an
 // already-cancelled context but an available slot still runs and surfaces the
 // handler's own cause.
-func (l *upstreamLimiter) acquire(ctx context.Context) error {
+func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
+	waited := false
 	for {
 		l.mu.Lock()
 		if l.inflight < l.limit {
 			l.inflight++
 			l.mu.Unlock()
-			return nil
+			return waited, nil
 		}
 		ready := l.ready
 		l.mu.Unlock()
 		select {
 		case <-ready:
+			waited = true
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return waited, context.Cause(ctx)
 		}
 	}
 }
@@ -1435,7 +1438,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
-		if err := lim.acquire(ctx); err != nil {
+		waited, err := lim.acquire(ctx)
+		if err != nil {
 			cancel(nil)
 			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
 		}
@@ -1463,7 +1467,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// health tracking (a direct backend/model reference has no chosen target).
 		switch {
 		case err == nil:
-			lim.grow()
+			// Demand-gated: a success that never waited for a slot is no evidence
+			// about the account's capacity, so it does not raise the cap.
+			if waited {
+				lim.grow()
+			}
 		case sig.condition == signalless:
 			lim.throttle()
 		}
