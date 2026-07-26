@@ -384,11 +384,12 @@ transcript step on the id.
 The correspondence is **step → record**, not request → step. Every step is one
 served request, so it has exactly one record; but the reverse does not hold —
 opencode also issues requests that never become steps (session title/summarize,
-retries), each producing its own record. The consumer skips those orphan records
-and matches each step to *its* record **by id**, so the join is exact at line
-granularity and correct even across a failover. Positional correlation (Nth
-request ↔ Nth step) cannot work precisely because of those extra requests; the id
-is what makes the join robust to them.
+retries), each producing its own record. Those orphan records land on the stream
+too, keyed by ids no step carries, and are simply never looked up; each step is
+matched to *its* record **by id**, so the join is exact at line granularity and
+correct even across a failover. Positional correlation (Nth request ↔ Nth step)
+cannot work precisely because of those extra requests; the id is what makes the
+join robust to them.
 
 **The join key is present exactly when the rewrite succeeded.** The interceptor
 overwrites `cached_tokens` only when it can read the usage; when the usage is
@@ -396,10 +397,19 @@ unparseable it relays unchanged and writes no record, and opencode then reports 
 **zero** cache-read. Since an id is a nonce ≥ 1, a non-zero carried value is
 therefore always a real id with a record on the stream, and a step with no id
 (zero) is one the rewrite could not tag — passed through **unattributed** rather
-than mis-joined. This is why the consumer needs no buffer and cannot desync: it
-scans the stream for a step's id (an id-bearing step's record is guaranteed
-present, so the scan always terminates at its match), and an id-less step is never
-scanned for.
+than mis-joined; an id-less step is never joined.
+
+An id-bearing step is joined **by id, not by position**: a **single per-token
+subscriber** drains the stream into an `id → record` map, and each step reads its
+record out of that map. The map — not a positional scan — is essential because a
+token's requests run **concurrently**: many transcript steps are in flight at once
+(a review's parallel reviewers all share one token), so records interleave and a
+step routinely reaches the consumer before its own record does. The lookup waits,
+bounded, for a not-yet-arrived record; on a genuine miss — a record dropped under
+buffer pressure, or never broadcast — it passes the step through **unattributed**
+rather than stall. Provenance is best-effort: it never blocks or fails a transcript
+step. The single per-token subscriber is also what the producer is sized for (one
+reader per token, not one per in-flight request).
 
 The stream is a **live broadcast**, per-token-scoped: each record fans out to every
 current subscriber, and a subscriber sees only records produced after it subscribes.
