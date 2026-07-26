@@ -230,7 +230,6 @@ type upstreamLimiter struct {
 	mu       sync.Mutex
 	limit    int
 	inflight int
-	seeded   bool
 	// knownGood is the cap the last saturated rejection measured, zero before any
 	// such rejection has arrived. Halving is reserved for a rejection at or below it.
 	knownGood int
@@ -306,36 +305,26 @@ func (l *upstreamLimiter) shrink() {
 	l.mu.Unlock()
 }
 
-// throttle reacts to a signal-less rate limit. On the first call it seeds the
-// cap from the observed in-flight count, never raising it; later calls halve the
-// cap. A rejection arriving at saturation is a capacity measurement — the
-// account's limit sits just below the count in flight at that moment — so the
-// cap lands one slot under it and that value is remembered as known-good.
-// Halving is reserved for a repeat rejection at or below the known-good
-// boundary, where the measurement itself is in doubt; a rejection above it is
-// just another measurement.
+// throttle reacts to a signal-less rate limit. A rejection arriving at
+// saturation is a capacity measurement — the account's limit sits just below the
+// count in flight at that moment — so the cap lands one slot under it and that
+// value is remembered as known-good. Halving is reserved for a rejection at or
+// below the known-good boundary, where the measurement itself is in doubt.
+// Arriving under the cap measures nothing about capacity, but the count in
+// flight is still an upper bound the cap is pulled down to.
 func (l *upstreamLimiter) throttle() {
 	l.mu.Lock()
-	if !l.seeded {
-		l.seeded = true
-		switch {
-		case l.inflight < l.limit:
-			l.limit = l.inflight
-		case l.inflight > 1:
-			l.measure()
-		}
+	switch {
+	case l.knownGood > 0 && l.inflight <= l.knownGood:
 		l.mu.Unlock()
+		l.shrink()
 		return
-	}
-	if l.knownGood > 0 && l.inflight > l.knownGood {
-		if l.inflight > 1 {
-			l.measure()
-		}
-		l.mu.Unlock()
-		return
+	case l.inflight < l.limit:
+		l.limit = l.inflight
+	case l.inflight > 1:
+		l.measure()
 	}
 	l.mu.Unlock()
-	l.shrink()
 }
 
 // measure sets the cap one slot below the in-flight count and records it as the
@@ -693,8 +682,7 @@ const (
 	sustainedRate
 	// signalless is a 429 with no Retry-After — the ambiguous, unsignalled case
 	// (z.ai-shaped): it may be concurrency or an exhausted quota. It throttles the
-	// cap — seeding it to the in-flight count on the first occurrence, halving on
-	// later ones; whether it also demotes turns on the in-flight count (see
+	// cap (see throttle); whether it also demotes turns on the in-flight count (see
 	// chatCompletions).
 	signalless
 )

@@ -8,18 +8,12 @@
 
 ## Bring the control law up to the design
 
-The limiter grows and shrinks, but not by the law
-[§Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting) states. Two
-gaps, each independently landable:
+The limiter grows by one slot per demand-gated success, not by the law
+[§Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting) states:
 
 - **Split the growth regimes at the last known-good cap.** One slot per success is
   doubling-per-round under saturation, which is right far from the edge and wrong near
-  it. Track the known-good boundary and fall back to one slot per round at or above it.
-- **Collapse the `seeded` latch into the known-good boundary.** A repeat rejection is
-  measured against the boundary only once one has been recorded; before that the latch
-  still routes it to halving, so a first 429 below the cap followed by one at saturation
-  halves instead of measuring. The boundary is the only state the law needs — retire the
-  latch and let every saturated rejection measure.
+  it. Fall back to one slot per round at or above the known-good boundary.
 
 ## Deferred refinements
 
