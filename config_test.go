@@ -271,6 +271,14 @@ func TestConfigResolve(t *testing.T) {
 		wantErr: `understudy\.models\.m: target "ghost/mb" references unknown backend "ghost"`,
 	})
 
+	// TODO(TODO.d/auth-requirement-and-key-env-source.md): the auth cases belong
+	// in this table — auth="none" permits a backend with no key source;
+	// auth="optional" is rejected as reserved; auth="auto" drops a backend whose
+	// declared source does not resolve, along with targets naming it and models
+	// left empty; a key source under auth="none", or none under "required"/"auto",
+	// is a config error. Drive the drop with an api_key_file at a nonexistent path
+	// so these stay in this parallel table; only the unset-variable case needs the
+	// env-coupled test in understudy_test.go.
 	tests.Add("should reject a logical model configured with no targets", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{

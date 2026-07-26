@@ -33,15 +33,27 @@ type LogicalModelSpec struct {
 // BackendSpec is a single `[understudy.backends.<name>]` table. The table key
 // (the operator-chosen name) is the routing namespace; provider_type selects
 // which provider handler serves the backend.
+//
+// A backend names its upstream credential through one of api_key, api_key_file,
+// or api_key_env. Only the first two are covered by the validate tags, which
+// still require api_key whenever api_key_file is absent — so a backend declaring
+// only api_key_env fails validation for an embedder that runs the validator, and
+// Resolve lets a backend set several sources, applying api_key_env last.
+// TODO(TODO.d/auth-requirement-and-key-env-source.md): the auth field replaces
+// these tags and makes the sources mutually exclusive.
 type BackendSpec struct {
 	ProviderType string `toml:"provider_type" validate:"required,oneof=openai"`
 	BaseURL      string `toml:"base_url" validate:"required,url"`
 	APIKey       string `toml:"api_key" validate:"required_without=APIKeyFile,excluded_with=APIKeyFile"`
 
 	// APIKeyFile is the absolute path to a file whose trimmed contents Resolve
-	// uses as the backend's key when set; Resolve rejects a relative path. It is
-	// mutually exclusive with api_key: exactly one of the two must be set.
+	// uses as the backend's key when set; Resolve rejects a relative path.
 	APIKeyFile string `toml:"api_key_file"`
+
+	// APIKeyEnv names an environment variable whose value Resolve uses as the
+	// backend's key. It names the variable rather than interpolating its value so
+	// that a declared credential stays distinguishable from a resolved one.
+	APIKeyEnv string `toml:"api_key_env"`
 }
 
 // Resolve builds a [BackendConfig] from the parsed configuration. URL parsing
@@ -67,6 +79,9 @@ func (c Config) Resolve() (*BackendConfig, error) {
 			if apiKey == "" {
 				return nil, fmt.Errorf("understudy.backends.%s: api_key_file %q is empty", name, b.APIKeyFile)
 			}
+		}
+		if b.APIKeyEnv != "" {
+			apiKey = os.Getenv(b.APIKeyEnv)
 		}
 		out.Backends[name] = Backend{
 			ProviderType: b.ProviderType,

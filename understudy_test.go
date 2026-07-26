@@ -4209,3 +4209,54 @@ func TestShouldLogViaProcessDefaultLoggerWithoutLoggerOption(t *testing.T) {
 		t.Errorf("expected the prefix-scan log on the process-default logger, got: %q", buf.String())
 	}
 }
+
+// TODO(TODO.d/auth-requirement-and-key-env-source.md): once auth="auto" exists,
+// this becomes a table with a second case — a backend is dropped because the
+// variable it names is unset. That mapping is what makes examples/free-tiers.toml
+// drop-in, and the api_key_file-driven drop cases in config_test.go cannot prove
+// it. Until then an unset variable silently resolves to an empty key, which is
+// neither designed answer.
+func TestChatCompletionsAuthenticatesUpstreamWithEnvNamedCredential(t *testing.T) {
+	t.Setenv("GROQ_API_KEY", "sk-from-env")
+
+	cfg := Config{
+		Backends: map[string]BackendSpec{
+			"groq": {ProviderType: "openai", BaseURL: "http://groq/v1", APIKeyEnv: "GROQ_API_KEY"},
+		},
+	}
+	resolved, err := cfg.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	var gotAuth string
+	backend := resolved.Backends["groq"]
+	backend.Config.HTTPClient = testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+		gotAuth = r.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	resolved.Backends["groq"] = backend
+
+	validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return resolved, nil
+	}}
+	srv := New(validator, WithLogger(testLogger(t)))
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"groq/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer user-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.ServeHTTP(httptest.NewRecorder(), req)
+
+	if want := "Bearer sk-from-env"; gotAuth != want {
+		t.Errorf("upstream call authenticated with %q, want %q", gotAuth, want)
+	}
+}
