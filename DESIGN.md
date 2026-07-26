@@ -53,10 +53,6 @@ says which variable to set. Keeping one struct through validation is what makes
 the diagnostic specific; transforming into a credential-only type would discard
 exactly the fact the operator needs.
 
-*(Planned. Today `Config.Resolve` performs the loading and much of the validation
-in one pass, and the library never runs the tags itself — see
-[TODO.d/resolve-validate-split.md](TODO.d/resolve-validate-split.md).)*
-
 **Credential sourcing.** Each backend's upstream key lives in the resolved
 understudy config. A lindy agent can read both the config file and the host
 environment, so to keep the plaintext out of the agent's reach a backend may

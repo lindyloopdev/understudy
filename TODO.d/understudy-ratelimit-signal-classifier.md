@@ -39,9 +39,9 @@ was prose-only — so the prose parse is kept as the resilient fallback. See
 Classification lives in one place — `classifyLimit(err) limitClassification`
 (`understudy.go`), carrying `hasRetryAfter`/`retryAfter`/`shouldReject` plus a
 `condition` (`limitCondition`). `errToResponse` reads the reject/forward/
-synthesize fields; `chatCompletions` throttles (seeds, then shrinks) on the
-signal-less condition and derives the demote from the `condition` plus the
-limiter's in-flight count. The remaining work extends this seam.
+synthesize fields; `chatCompletions` throttles the cap on the signal-less
+condition and derives the demote from the `condition` plus the limiter's
+in-flight count. The remaining work extends this seam.
 
 ## Build path
 

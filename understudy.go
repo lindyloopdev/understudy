@@ -233,6 +233,9 @@ type upstreamLimiter struct {
 	// knownGood is the cap the last saturated rejection measured, zero before any
 	// such rejection has arrived. Halving is reserved for a rejection at or below it.
 	knownGood int
+	// successes accrue toward the next additive step, once the cap has climbed
+	// back to the known-good boundary; a full round of them raises it by one.
+	successes int
 	ready     chan struct{}
 }
 
@@ -334,10 +337,22 @@ func (l *upstreamLimiter) measure() {
 	l.knownGood = l.limit
 }
 
-// grow raises the cap by one (AIMD additive increase); no per-account ceiling —
-// the process-wide FD budget is the hard backstop.
+// grow raises the cap on a success that waited for a slot; no per-account
+// ceiling — the process-wide FD budget is the hard backstop. Below the
+// known-good boundary the estimate is far from the edge, so one slot per success
+// is right: while saturated that doubles the cap each round trip. At or above
+// the boundary the edge is near and overshoot is paid for in real rejections, so
+// growth drops to one slot per round of successes.
 func (l *upstreamLimiter) grow() {
 	l.mu.Lock()
+	if l.knownGood > 0 && l.limit >= l.knownGood {
+		l.successes++
+		if l.successes < l.limit {
+			l.mu.Unlock()
+			return
+		}
+		l.successes = 0
+	}
 	l.limit++
 	l.wake()
 	l.mu.Unlock()

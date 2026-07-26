@@ -3702,6 +3702,24 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 		wantSlots: 3,
 	})
 
+	tests.Add("should raise the cap by one slot per round of successes once it reaches the known-good boundary", test{
+		newLimiter: func() *upstreamLimiter {
+			l := newUpstreamLimiter(4)
+			for range 4 {
+				l.tryAcquire()
+			}
+			l.throttle() // measures a cap of 3 and records it as known-good
+			for range 4 {
+				l.release()
+			}
+			for range 3 {
+				l.grow()
+			}
+			return l
+		},
+		wantSlots: 4,
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		if got := acquirable(tt.newLimiter()); got != tt.wantSlots {
