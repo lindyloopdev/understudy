@@ -5,7 +5,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+
+	"github.com/go-playground/validator/v10"
 
 	"github.com/lindyloopdev/understudy/providers"
 )
@@ -97,6 +100,31 @@ func (c Config) Resolve() (*BackendConfig, error) {
 		}
 	}
 	return out, nil
+}
+
+// tagValidator checks the per-field constraints declared in the validate struct
+// tags, reporting each field by its TOML key so a violation names what the
+// operator wrote rather than the Go identifier behind it.
+var tagValidator = func() *validator.Validate {
+	v := validator.New()
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		return fld.Tag.Get("toml")
+	})
+	return v
+}()
+
+// Validate reports the first rule the configuration breaks — the per-field
+// constraints in the validate tags, then the rules spanning the document — so an
+// embedder can reject a bad document before resolving it, or before writing it.
+// [Config.Resolve] repeats only the second group, so a document that violates a
+// tag resolves today unless the caller asks.
+// TODO(TODO.d/resolve-validate-split.md): Resolve calls Validate, so loading
+// enforces every rule and no embedder can skip them.
+func (c Config) Validate() error {
+	if err := tagValidator.Struct(c); err != nil {
+		return err
+	}
+	return c.validate()
 }
 
 // validate reports the first document rule the configuration breaks: a logical

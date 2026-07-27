@@ -68,6 +68,55 @@ targets = ["opencode-go/deepseek-v4-flash", "opencode-go/glm-4.7?thinking=false"
 	})
 }
 
+func TestConfigShouldReportRuleViolationsBeforeResolving(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		cfg     Config
+		wantErr string
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should report a backend that names no credential source", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1"},
+			},
+		},
+		wantErr: `api_key`,
+	})
+
+	tests.Add("should report a logical model that lists no targets", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+			Models: map[string]LogicalModelSpec{"cheap": {}},
+		},
+		wantErr: `understudy\.models\.cheap: no targets`,
+	})
+
+	tests.Add("should report nothing for a configuration that breaks no rule", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+			Models: map[string]LogicalModelSpec{
+				"cheap": {Targets: []Target{{backend: "groq", model: "llama"}}},
+			},
+		},
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		err := tt.cfg.Validate()
+		if !testy.ErrorMatchesRE(tt.wantErr, err) {
+			t.Errorf("unexpected error, got %v, want /%s/", err, tt.wantErr)
+		}
+	})
+}
+
 func TestConfigResolve(t *testing.T) {
 	t.Parallel()
 
