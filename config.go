@@ -88,24 +88,36 @@ func (c Config) Resolve() (*BackendConfig, error) {
 			Config:       providers.Config{BaseURL: u, APIKey: apiKey},
 		}
 	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
 	if len(c.Models) > 0 {
 		out.Models = make(map[string]LogicalModel, len(c.Models))
 		for name, m := range c.Models {
-			if len(m.Targets) == 0 {
-				return nil, fmt.Errorf("understudy.models.%s: no targets", name)
-			}
-			for _, t := range m.Targets {
-				if _, ok := out.Backends[t.backend]; !ok {
-					return nil, fmt.Errorf("understudy.models.%s: target %q references unknown backend %q", name, t.identity(), t.backend)
-				}
-				if err := t.validate(); err != nil {
-					return nil, fmt.Errorf("understudy.models.%s: target %q: %w", name, t.identity(), err)
-				}
-			}
 			out.Models[name] = LogicalModel(m)
 		}
 	}
 	return out, nil
+}
+
+// validate reports the first document rule the configuration breaks: a logical
+// model with no targets, a target naming a backend the document does not
+// declare, or a target whose overrides are unacceptable.
+func (c Config) validate() error {
+	for name, m := range c.Models {
+		if len(m.Targets) == 0 {
+			return fmt.Errorf("understudy.models.%s: no targets", name)
+		}
+		for _, t := range m.Targets {
+			if _, ok := c.Backends[t.backend]; !ok {
+				return fmt.Errorf("understudy.models.%s: target %q references unknown backend %q", name, t.identity(), t.backend)
+			}
+			if err := t.validate(); err != nil {
+				return fmt.Errorf("understudy.models.%s: target %q: %w", name, t.identity(), err)
+			}
+		}
+	}
+	return nil
 }
 
 // DefaultModel returns the reserved default logical model when at least one
