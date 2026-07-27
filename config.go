@@ -58,19 +58,18 @@ type BackendSpec struct {
 	APIKeyEnv string `toml:"api_key_env"`
 }
 
-// Resolve builds a [BackendConfig] from the parsed configuration. URL parsing
-// happens here so the proxy receives validated *url.URL values at the
-// type-system boundary.
+// Resolve builds a [BackendConfig] from the parsed configuration, applying
+// [Config.Validate] before it reads anything. URL parsing happens here so the
+// proxy receives *url.URL values at the type-system boundary.
 func (c Config) Resolve() (*BackendConfig, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	out := &BackendConfig{Backends: make(map[string]Backend, len(c.Backends))}
 	for name, b := range c.Backends {
-		u, err := url.Parse(b.BaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("understudy.backends.%s: invalid base_url %q: %w", name, b.BaseURL, err)
-		}
+		// The url tag rejects everything url.Parse does, and Validate ran it above,
+		// so a parse failure here is unreachable.
+		u, _ := url.Parse(b.BaseURL)
 		apiKey := b.APIKey
 		if b.APIKeyFile != "" {
 			if !filepath.IsAbs(b.APIKeyFile) {

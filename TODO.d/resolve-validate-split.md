@@ -42,9 +42,7 @@ about the world.
    where they don't — a target naming an unknown backend is a cross-map reference
    no tag can express; `Target`'s fields are unexported so tags cannot see them.
 3. Reduce `Resolve` to filling credentials, or fold it into loading entirely and
-   decide what remains of the `Config`/`BackendConfig` split. Its `url.Parse`
-   failure branch is unreachable — the `url` tag rejects everything `url.Parse`
-   does — so that error and its `fmt` wrapping go first.
+   decide what remains of the `Config`/`BackendConfig` split.
 
 ## Constraints
 
