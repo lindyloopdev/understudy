@@ -199,13 +199,22 @@ func TestConfigResolve(t *testing.T) {
 		wantErr: `understudy\.backends\.groq: api_key_file "relative/lindy-key" must be an absolute path`,
 	})
 
-	tests.Add("should return error when a backend base_url is invalid", test{
+	tests.Add("should refuse to resolve a backend whose base_url is not a URL", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{
-				"groq": {ProviderType: "openai", BaseURL: "://bad"},
+				"groq": {ProviderType: "openai", BaseURL: "://bad", APIKey: "sk-test"},
 			},
 		},
-		wantErr: `understudy\.backends\.groq: invalid base_url "://bad"`,
+		wantErr: `backends\[groq\]\.base_url`,
+	})
+
+	tests.Add("should refuse to resolve a backend that names no credential source", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1"},
+			},
+		},
+		wantErr: `api_key`,
 	})
 
 	tests.Add("should return an empty BackendConfig when Backends is nil", test{

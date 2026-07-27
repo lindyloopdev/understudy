@@ -62,6 +62,9 @@ type BackendSpec struct {
 // happens here so the proxy receives validated *url.URL values at the
 // type-system boundary.
 func (c Config) Resolve() (*BackendConfig, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	out := &BackendConfig{Backends: make(map[string]Backend, len(c.Backends))}
 	for name, b := range c.Backends {
 		u, err := url.Parse(b.BaseURL)
@@ -90,9 +93,6 @@ func (c Config) Resolve() (*BackendConfig, error) {
 			Config:       providers.Config{BaseURL: u, APIKey: apiKey},
 		}
 	}
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	if len(c.Models) > 0 {
 		out.Models = make(map[string]LogicalModel, len(c.Models))
 		for name, m := range c.Models {
@@ -114,12 +114,10 @@ var tagValidator = func() *validator.Validate {
 }()
 
 // Validate reports the first rule the configuration breaks — the per-field
-// constraints in the validate tags, then the rules spanning the document — so an
-// embedder can reject a bad document before resolving it, or before writing it.
-// [Config.Resolve] repeats only the second group, so a document that violates a
-// tag resolves today unless the caller asks.
-// TODO(TODO.d/resolve-validate-split.md): Resolve calls Validate, so loading
-// enforces every rule and no embedder can skip them.
+// constraints in the validate tags, then the rules spanning the whole
+// configuration. [Config.Resolve] applies it before reading anything, so a
+// caller need not remember to; calling it directly answers the question earlier,
+// against a configuration still being assembled or about to be written.
 func (c Config) Validate() error {
 	if err := tagValidator.Struct(c); err != nil {
 		return err

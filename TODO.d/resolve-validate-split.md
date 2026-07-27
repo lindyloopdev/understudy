@@ -8,9 +8,9 @@
 whose rules move into the validation stage).
 
 Config handling is load then validate, and understudy has neither stage cleanly.
-`Config.Resolve` decodes, dereferences credentials, *and* rejects malformed
-documents in one pass, while the `validate` struct tags express a partial second
-set of rules the library never runs — an embedder must build its own validator.
+`Config.Resolve` parses, dereferences credentials, and reports failures of its
+own in one pass; the rules it delegates to `Config.Validate` are split between
+struct tags and hand-written Go with no principle deciding which goes where.
 
 **Loading** — decode the TOML, parse `base_url` into a `*url.URL` and each target
 into its type, fill each backend's key from the source it names. Fails only where
@@ -42,7 +42,9 @@ about the world.
    where they don't — a target naming an unknown backend is a cross-map reference
    no tag can express; `Target`'s fields are unexported so tags cannot see them.
 3. Reduce `Resolve` to filling credentials, or fold it into loading entirely and
-   decide what remains of the `Config`/`BackendConfig` split.
+   decide what remains of the `Config`/`BackendConfig` split. Its `url.Parse`
+   failure branch is unreachable — the `url` tag rejects everything `url.Parse`
+   does — so that error and its `fmt` wrapping go first.
 
 ## Constraints
 
@@ -62,9 +64,7 @@ about the world.
 
 ## Open
 
-- **Are the document rules also callable on a config held in memory?** Loading
-  runs them regardless, so no embedder can skip them. Exposing them additionally
-  buys a `check`/lint path that reports every problem at once rather than the
-  first, and lets lindy validate a config it assembled before writing it. The
-  reference pattern (`pth/admin/main/backend/validate`) has the caller invoke a
-  helper that runs tags then `Validate()`.
+- **Report every problem at once, or just the first?** `Validate` stops at the
+  first rule broken, so an operator with three mistakes fixes them one restart at
+  a time. A `check`/lint path wants the whole list; the tag validator already
+  returns every field failure and only the hand-written rules short-circuit.
