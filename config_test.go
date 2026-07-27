@@ -384,6 +384,11 @@ func TestBackendSpecKeySourceValidation(t *testing.T) {
 		valid: true,
 	})
 
+	tests.Add("should accept a backend whose key comes only from api_key_env", test{
+		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com", APIKeyEnv: "GROQ_API_KEY"},
+		valid: true,
+	})
+
 	tests.Add("should reject a backend that supplies neither api_key nor api_key_file", test{
 		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com"},
 		valid: false,
@@ -393,6 +398,11 @@ func TestBackendSpecKeySourceValidation(t *testing.T) {
 		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com", APIKey: "sk-test", APIKeyFile: "/some/path"},
 		valid: false,
 	})
+	// TODO(TODO.d/auth-requirement-and-key-env-source.md): add the two pairings
+	// api_key_env takes part in — api_key + api_key_env, and api_key_file +
+	// api_key_env — as rejections. Both validate clean today because excluded_with
+	// names only APIKeyFile, so they cannot be asserted until that tag names every
+	// sibling source.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
