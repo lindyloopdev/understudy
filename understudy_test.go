@@ -2057,6 +2057,23 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should record the upstream status of an attempt that failed", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream busy"}}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want:        map[string]any{"upstream_status": float64(http.StatusServiceUnavailable)},
+		}
+	})
+
 	tests.AddFunc("should record the abandoned target when a request fails over", func(t *testing.T) test {
 		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{

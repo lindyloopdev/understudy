@@ -22,6 +22,3 @@ account-level fact in backend-name terms.
 Name the target that actually failed, or name the account rather than an
 arbitrary alias. Same for the `backend up` line in `clearFailure`, which is
 paired with it and has the same aliasing.
-
-The missing log entry for a failed-over attempt is a separate defect in
-`LogRecord`'s shape — [[understudy-demotion-without-logged-request]].
