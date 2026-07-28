@@ -684,6 +684,12 @@ func isFatalUpstream(err error) bool {
 	return yerrors.HTTPStatus(err) >= 500
 }
 
+// isCredentialRefused reports whether the upstream refused the target's
+// credential (402: out of funds).
+func isCredentialRefused(err error) bool {
+	return yerrors.HTTPStatus(err) == http.StatusPaymentRequired
+}
+
 // rateLimitDemotionThreshold is the Retry-After delay at or above which a 429 is
 // treated as the target being unhealthy rather than a brief throttle: such a
 // target is demoted immediately so requests fail over to a fallback instead of
@@ -1565,7 +1571,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.clearFailure(chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(chosen, sig.retryAfter, backend.Backends)
-			case demote:
+			case demote || isCredentialRefused(err):
 				s.recordImmediateFailure(chosen, backend.Backends)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
@@ -1573,10 +1579,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		if err != nil {
-			// A sustainedRate 429 has just demoted chosen above; if another target
-			// has not yet been tried this request, replay it there rather than
-			// surface the 429 to the client.
-			if logicalTargets != nil && sig.condition == sustainedRate {
+			// A sustainedRate 429 or an unfunded credential has just demoted chosen
+			// above; if another target has not yet been tried this request, replay it
+			// there rather than surface the refusal to the client.
+			if logicalTargets != nil && (sig.condition == sustainedRate || isCredentialRefused(err)) {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
 					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
