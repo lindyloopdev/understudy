@@ -1506,6 +1506,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel)
 					continue
 				}
 			}

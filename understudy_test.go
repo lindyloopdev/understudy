@@ -2057,10 +2057,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO: an abandoned attempt should also record its upstream status and the
-	// error that ended it, and the pre-header stall path (errHeaderStall) should
-	// record its abandoned target too — see
-	// TODO.d/understudy-demotion-without-logged-request.md.
+	// TODO(TODO.d/understudy-demotion-without-logged-request.md): an abandoned
+	// attempt should also record its upstream status and the error that ended it.
 	tests.AddFunc("should record the abandoned target when a request fails over", func(t *testing.T) test {
 		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2180,6 +2178,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		wantStatus  int
 		wantBody    string
 		wantBackend string
+		// wantFailedOver is the targets the request walked past, asserted only
+		// when non-nil so the cases that are not about the log record stay silent
+		// on it.
+		wantFailedOver []Attempt
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
 	// plus its stubbed round-trip: given the request and the 1-based call count, it
@@ -2231,6 +2233,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should name the stalled target an operator would otherwise not see", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: stall},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma"}}},
 		},
 	})
 
@@ -2471,9 +2484,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer user-token")
 				req.Header.Set("Content-Type", "application/json")
 				rr := httptest.NewRecorder()
-				srv.ServeHTTP(rr, req)
+				ctx := WithLogCtx(req.Context())
+				srv.ServeHTTP(rr, req.WithContext(ctx))
 				if rr.Code != s.wantStatus {
 					t.Errorf("step %d: status got %d want %d", i, rr.Code, s.wantStatus)
+				}
+				if s.wantFailedOver != nil {
+					rec, _ := LogRecordFromContext(ctx)
+					if d := gocmp.Diff(s.wantFailedOver, rec.FailedOver); d != "" {
+						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
+					}
 				}
 				if s.wantBody != "" {
 					if d := testy.DiffJSON([]byte(s.wantBody), rr.Body.Bytes()); d != nil {

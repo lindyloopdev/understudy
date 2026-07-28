@@ -8,36 +8,24 @@ must be attributable to),
 only what understudy can supply, and the mount emits one entry per request).
 
 A `backend down` transition should always have a corresponding logged request
-that caused it. Observed anomaly at the start of a review run: google was
-demoted (`backend down google`) with **no logged google request** preceding it
-— the only earlier entry was `POST /session`.
+that caused it. `FailedOver []Attempt` carries the targets a failover abandoned,
+but an `Attempt` names only its backend and upstream model — not why it was
+given up on.
 
-The cause is that `LogRecord` holds one attempt per request while a failover
-makes several. `chatCompletions` resets `parsedBackendName` at the top of each
-pass and `setLogBackendName` overwrites the record, so a request that fails on
-google and replays onto a sibling logs only the sibling. The google attempt that
-called `recordFailure`/`recordRateLimited` never appears, but the demotion it
-caused does.
+- Carry the abandoned attempt's **upstream status** and **its own error** on
+  `Attempt`, so a reader can tell a 429 apart from a 502 apart from a stall
+  without correlating against another line. Rendering stays the mount's call.
+- A demotion is attributable only once **every**
+  `recordFailure`/`recordImmediateFailure`/`recordRateLimited` call site leaves
+  its target somewhere in the record — in `FailedOver` if the request moved on,
+  in the flat fields if there was nowhere to go. Audit the switch for a path
+  that still demotes silently.
 
-Give the record room for the attempts a failover abandoned, without displacing
-the fact operators actually search on:
-
-- `BackendName`/`ModelUpstream`/`UpstreamStatus` keep naming the attempt that
-  **determined the client's outcome** — the one whose response was relayed, or,
-  when every target failed, the one that produced `Err`. These stay flat and
-  greppable; searching "which model served this" must not become "read the tail
-  of an array".
-- Add `FailedOver []Attempt` alongside them for the attempts abandoned before
-  that one, each carrying its backend, upstream model, upstream status and its
-  own error. Empty for the overwhelming majority of requests.
-- Every `recordFailure`/`recordImmediateFailure`/`recordRateLimited` call site
-  must then leave its target somewhere in the record — in `FailedOver` if the
-  request moved on, in the flat fields if there was nowhere to go. Cover the
-  header-stall path (`errHeaderStall` demotes and replays) as well as the
-  `sustainedRate` replay.
-
-Additive, so nothing an embedder reads today breaks. Rendering is the mount's
-call — a single `failed_over=…` attribute keeps it one line.
+Keep `BackendName`/`ModelUpstream`/`UpstreamStatus` naming the attempt that
+**determined the client's outcome** — the one whose response was relayed, or,
+when every target failed, the one that produced `Err`. They stay flat and
+greppable; searching "which model served this" must not become "read the tail of
+an array".
 
 **Out of scope: log ordering.** The mount emits at request end, so a concurrent
 request's `pickTarget` can still log `backend down google` before the demoting
