@@ -7,19 +7,16 @@ must be attributable to),
 [DESIGN.md §Handler boundary](../DESIGN.md#handler-boundary) (`LogRecord` holds
 only what understudy can supply, and the mount emits one entry per request).
 
-A `backend down` transition should always have a corresponding logged request
-that caused it. `FailedOver []Attempt` carries the targets a failover abandoned,
-but an `Attempt` names only its backend and upstream model — not why it was
-given up on.
+Every demotion leaves its target in the record, but not **why** it was given up
+on. A reader can see that a target was walked past without being able to tell a
+429 from a 502 from a stall. Close that on both halves of the record:
 
 - Carry the abandoned attempt's **upstream status** and **its own error** on
-  `Attempt`, so a reader can tell a 429 apart from a 502 apart from a stall
-  without correlating against another line. Rendering stays the mount's call.
-- A demotion is attributable only once **every**
-  `recordFailure`/`recordImmediateFailure`/`recordRateLimited` call site leaves
-  its target somewhere in the record — in `FailedOver` if the request moved on,
-  in the flat fields if there was nowhere to go. Audit the switch for a path
-  that still demotes silently.
+  `Attempt`. Rendering stays the mount's call.
+- Set the flat `UpstreamStatus` for a **failed** final attempt.
+  `setLogUpstreamStatus` sits past the error check, so a request whose last
+  target failed records the status it failed with as `0` — the one path that
+  still reports only *that* it failed, not what happened.
 
 Keep `BackendName`/`ModelUpstream`/`UpstreamStatus` naming the attempt that
 **determined the client's outcome** — the one whose response was relayed, or,

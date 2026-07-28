@@ -803,6 +803,9 @@ type Attempt struct {
 	Backend string
 	// ModelUpstream is the upstream model name the attempt requested.
 	ModelUpstream string
+	// UpstreamStatus is the status the attempt answered with, or 0 when it never
+	// produced a response — a pre-header stall, or a transport failure.
+	UpstreamStatus int
 }
 
 type logCtxKey struct{}
@@ -850,9 +853,9 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	}
 }
 
-func addLogFailedOver(ctx context.Context, backend, upstreamModel string) {
+func addLogFailedOver(ctx context.Context, backend, upstreamModel string, status int) {
 	if h := logCtxFrom(ctx); h != nil {
-		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel})
+		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel, UpstreamStatus: status})
 	}
 }
 
@@ -1506,7 +1509,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel)
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, 0)
 					continue
 				}
 			}
@@ -1555,7 +1558,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil && sig.condition == sustainedRate {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel)
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err))
 					releaseHeld()
 					cancel(nil)
 					continue

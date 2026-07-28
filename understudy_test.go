@@ -2097,7 +2097,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"backend_name": "b",
-				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma"}},
+				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests}},
 			},
 		}
 	})
@@ -2244,6 +2244,25 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma"}}},
+		},
+	})
+
+	tests.Add("should show the status the walked-past target answered with", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{
+				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests},
+			}},
 		},
 	})
 
