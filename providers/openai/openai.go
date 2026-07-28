@@ -101,11 +101,10 @@ func (e retryAfterError) RetryAfter() time.Time { return e.retryAfter }
 func (e retryAfterError) Unwrap() error { return e.error }
 
 // errorFromResponse turns an upstream non-2xx response into an error carrying
-// the client-facing HTTP status. An upstream 5xx becomes 502 Bad Gateway
-// because the upstream, not us, is at fault; a 4xx is carried verbatim so
-// callers can act on it (429/Retry-After, 400, 404, ...). now is the reference
-// time for resolving a per-day quota exhaustion to its reset boundary (the next
-// Pacific midnight at a fixed −8 offset).
+// the status the upstream itself returned; what the client is shown is the
+// core's to derive. now is the reference time for resolving a per-day quota
+// exhaustion to its reset boundary (the next Pacific midnight at a fixed −8
+// offset).
 func errorFromResponse(resp *http.Response, now time.Time) error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -117,15 +116,11 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 	if len(msg) > maxErrorBodyBytes {
 		msg = msg[:maxErrorBodyBytes]
 	}
-	clientStatus := resp.StatusCode
-	if resp.StatusCode >= 500 {
-		clientStatus = http.StatusBadGateway
-	}
 	errType := apiErr.Type
 	if errType == "" {
 		errType = typeForStatus(resp.StatusCode)
 	}
-	err := yerrors.WithHTTPStatusf(clientStatus, "upstream returned status %d: %s", resp.StatusCode, msg)
+	err := yerrors.WithHTTPStatusf(resp.StatusCode, "upstream returned status %d: %s", resp.StatusCode, msg)
 	attrs := []any{
 		slog.Int("upstream_status", resp.StatusCode),
 		slog.String("upstream_error_type", errType),
