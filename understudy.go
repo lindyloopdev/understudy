@@ -787,6 +787,22 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
+	// FailedOver holds the attempts a failover abandoned before the one the
+	// fields above describe, in the order they were tried. It is empty for a
+	// request that never failed over. A demotion is attributable through it: the
+	// target it demoted is here when the request moved on, and in the fields
+	// above when there was nowhere left to go.
+	FailedOver []Attempt
+}
+
+// Attempt describes one upstream call a request made and abandoned, so a
+// failover leaves a record of the targets it walked past rather than only the
+// one that determined the client's outcome.
+type Attempt struct {
+	// Backend is the backend the attempt called.
+	Backend string
+	// ModelUpstream is the upstream model name the attempt requested.
+	ModelUpstream string
 }
 
 type logCtxKey struct{}
@@ -831,6 +847,12 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.ModelRequested = requested
 		h.ModelUpstream = upstream
+	}
+}
+
+func addLogFailedOver(ctx context.Context, backend, upstreamModel string) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel})
 	}
 }
 
@@ -1532,6 +1554,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil && sig.condition == sustainedRate {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel)
 					releaseHeld()
 					cancel(nil)
 					continue

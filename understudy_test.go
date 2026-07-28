@@ -2057,6 +2057,53 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	// TODO: an abandoned attempt should also record its upstream status and the
+	// error that ended it, and the pre-header stall path (errHeaderStall) should
+	// record its abandoned target too — see
+	// TODO.d/understudy-demotion-without-logged-request.md.
+	tests.AddFunc("should record the abandoned target when a request fails over", func(t *testing.T) test {
+		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serves := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		backend := func(rawURL, key string, client *http.Client) Backend {
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return Backend{ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: key, HTTPClient: client}}
+		}
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"a": backend("http://a/v1", "sk-a", rateLimited),
+						"b": backend("http://b/v1", "sk-b", serves),
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "a", model: "ma"},
+						{backend: "b", model: "mb"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"backend_name": "b",
+				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma"}},
+			},
+		}
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := New(tt.validator, WithLogger(testLogger(t)))
@@ -2078,6 +2125,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			"model_requested": rec.ModelRequested,
 			"model_upstream":  rec.ModelUpstream,
 			"upstream_status": float64(rec.UpstreamStatus),
+			"failed_over":     rec.FailedOver,
 		}
 		for k := range got {
 			if _, present := tt.want[k]; !present {
