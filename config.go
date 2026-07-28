@@ -1,6 +1,8 @@
 package understudy
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -8,7 +10,10 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/go-playground/locales/en"
+	ut "github.com/go-playground/universal-translator"
 	"github.com/go-playground/validator/v10"
+	entranslations "github.com/go-playground/validator/v10/translations/en"
 
 	"github.com/lindyloopdev/understudy/providers"
 )
@@ -103,14 +108,61 @@ func (c Config) Resolve() (*BackendConfig, error) {
 
 // tagValidator checks the per-field constraints declared in the validate struct
 // tags, reporting each field by its TOML key so a violation names what the
-// operator wrote rather than the Go identifier behind it.
-var tagValidator = func() *validator.Validate {
+// operator wrote rather than the Go identifier behind it. tagTranslator renders
+// those violations as English sentences.
+var tagValidator, tagTranslator = func() (*validator.Validate, ut.Translator) {
+	eng := en.New()
+	// GetFallback rather than GetTranslator("en"): the fallback is the same
+	// English locale and is returned unconditionally, so there is no lookup that
+	// could miss and no found-flag worth discarding.
+	trans := ut.New(eng, eng).GetFallback()
 	v := validator.New()
 	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
 		return fld.Tag.Get("toml")
 	})
-	return v
+	if err := entranslations.RegisterDefaultTranslations(v, trans); err != nil {
+		panic("understudy: registering validation translations: " + err.Error())
+	}
+	// The stock required_without_all sentence reads "api_key is a required
+	// field", which is false — naming api_key_file or api_key_env satisfies it.
+	if err := v.RegisterTranslation("required_without_all", trans,
+		func(ut.Translator) error { return nil },
+		func(_ ut.Translator, fe validator.FieldError) string {
+			return fmt.Sprintf("%s is required unless %s is set", fe.Field(), alternatives(fe))
+		},
+	); err != nil {
+		panic("understudy: registering the credential-source translation: " + err.Error())
+	}
+	return v, trans
 }()
+
+// backendKeys maps BackendSpec's Go field names to the TOML keys an operator
+// writes. A tag names its sibling fields in Go, but a message about them has to
+// speak the operator's vocabulary, and BackendSpec is the only spec whose fields
+// a tag names.
+var backendKeys = func() map[string]string {
+	spec := reflect.TypeFor[BackendSpec]()
+	keys := make(map[string]string, spec.NumField())
+	for f := range spec.Fields() {
+		if key := f.Tag.Get("toml"); key != "" {
+			keys[f.Name] = key
+		}
+	}
+	return keys
+}()
+
+// alternatives renders a tag's sibling field names the way an operator reads
+// them — TOML keys, joined by "or" — for a rule whose message must say which
+// other fields would satisfy it. A name from outside BackendSpec renders as the
+// Go identifier: wrong-looking in a message about a TOML file, which is the
+// point — it shows up rather than vanishing.
+func alternatives(fe validator.FieldError) string {
+	names := make([]string, 0, 2)
+	for param := range strings.FieldsSeq(fe.Param()) {
+		names = append(names, cmp.Or(backendKeys[param], param))
+	}
+	return strings.Join(names, " or ")
+}
 
 // Validate reports the first rule the configuration breaks — the per-field
 // constraints in the validate tags, then the rules spanning the whole
@@ -119,9 +171,25 @@ var tagValidator = func() *validator.Validate {
 // against a configuration still being assembled or about to be written.
 func (c Config) Validate() error {
 	if err := tagValidator.Struct(c); err != nil {
+		if fieldErrs, ok := errors.AsType[validator.ValidationErrors](err); ok && len(fieldErrs) > 0 {
+			return fieldViolation(fieldErrs[0])
+		}
 		return err
 	}
 	return c.validate()
+}
+
+// fieldViolation renders a tag failure the way understudy reports its own: the
+// TOML path the operator wrote, then what they must change. The validator's
+// default rendering names the tag that fired, which says nothing to someone
+// editing a config file.
+func fieldViolation(fe validator.FieldError) error {
+	// Namespace is "Config.backends[groq].api_key"; the operator's path is what
+	// follows the struct name, with the map key unbracketed.
+	path := strings.NewReplacer("[", ".", "]", "").Replace(fe.Namespace())
+	_, path, _ = strings.Cut(path, ".")
+	section := strings.TrimSuffix(path, "."+fe.Field())
+	return fmt.Errorf("understudy.%s: %s", section, fe.Translate(tagTranslator))
 }
 
 // validate reports the first document rule the configuration breaks: a logical

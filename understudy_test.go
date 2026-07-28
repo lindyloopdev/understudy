@@ -4342,6 +4342,7 @@ func TestChatCompletionsAuthenticatesUpstreamWithEnvNamedCredential(t *testing.T
 
 	cfg := Config{
 		Backends: map[string]BackendSpec{
+			//nolint:gosec // G101 fires on the api_key_env name; the value is the variable's name, not its contents.
 			"groq": {ProviderType: "openai", BaseURL: "http://groq/v1", APIKeyEnv: "GROQ_API_KEY"},
 		},
 	}
