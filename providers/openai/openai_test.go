@@ -278,12 +278,12 @@ func TestChatResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should map an upstream 5xx to 502 Bad Gateway", func(t *testing.T) test {
+	tests.AddFunc("should carry an upstream 5xx as the status the upstream sent", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusInternalServerError, http.Header{"Content-Type": {"application/json"}}, `{"error":{"message":"kaboom"}}`)
 		return test{
 			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
 			wantErr:       "upstream returned status 500",
-			wantStatus:    http.StatusBadGateway,
+			wantStatus:    http.StatusInternalServerError,
 			wantErrorType: "server_error",
 			wantAttrs: map[string]any{
 				"upstream_status":        int64(http.StatusInternalServerError),
@@ -422,7 +422,7 @@ func TestChatResponse(t *testing.T) {
 		if !testy.ErrorMatchesRE(tt.wantErr, err) {
 			t.Errorf("unexpected error: got %v, want /%s/", err, tt.wantErr)
 		}
-		gotStatus := testy.StatusCode(err)
+		gotStatus := yerrors.HTTPStatus(err)
 		if err == nil {
 			gotStatus = resp.StatusCode
 		}

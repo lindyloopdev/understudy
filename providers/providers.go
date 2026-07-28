@@ -14,9 +14,30 @@ import (
 // chat-completions request body to the upstream identified by cfg and returns
 // its response. Models lists the models the upstream identified by cfg
 // advertises.
+//
+// An error a Handler returns carries the status the upstream itself returned,
+// via yerrors.HTTPStatus, and may carry further upstream detail through the
+// optional interfaces below — an error implementing none still renders, so a
+// provider whose transport is not HTTP implements only what it can supply. A
+// provider reports what the upstream said; what the client is shown is derived
+// at the handler boundary, never set by a provider.
 type Handler interface {
 	Chat(ctx context.Context, cfg Config, body io.Reader) (*http.Response, error)
 	Models(ctx context.Context, cfg Config) ([]Model, error)
+}
+
+// RetryAfterError carries the moment the upstream advertised as its retry
+// boundary, however the provider recovered it — a Retry-After header, a
+// structured body field, or a quota's reset time.
+type RetryAfterError interface {
+	error
+	RetryAfter() time.Time
+}
+
+// ErrorTyper carries the error envelope's type string for the failure.
+type ErrorTyper interface {
+	error
+	ErrorType() string
 }
 
 // Config carries the per-call configuration for an LLM provider call.

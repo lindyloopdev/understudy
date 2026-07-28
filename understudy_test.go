@@ -2057,6 +2057,66 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should record the upstream status of an attempt that failed", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream busy"}}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want:        map[string]any{"upstream_status": float64(http.StatusServiceUnavailable)},
+		}
+	})
+
+	tests.AddFunc("should record the abandoned target when a request fails over", func(t *testing.T) test {
+		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serves := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		backend := func(rawURL, key string, client *http.Client) Backend {
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return Backend{ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: key, HTTPClient: client}}
+		}
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"a": backend("http://a/v1", "sk-a", rateLimited),
+						"b": backend("http://b/v1", "sk-b", serves),
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "a", model: "ma"},
+						{backend: "b", model: "mb"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"backend_name": "b",
+				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")}},
+			},
+		}
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := New(tt.validator, WithLogger(testLogger(t)))
@@ -2078,13 +2138,14 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			"model_requested": rec.ModelRequested,
 			"model_upstream":  rec.ModelUpstream,
 			"upstream_status": float64(rec.UpstreamStatus),
+			"failed_over":     rec.FailedOver,
 		}
 		for k := range got {
 			if _, present := tt.want[k]; !present {
 				delete(got, k)
 			}
 		}
-		if d := gocmp.Diff(tt.want, got); d != "" {
+		if d := gocmp.Diff(tt.want, got, errorText); d != "" {
 			t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
 		}
 	})
@@ -2098,6 +2159,12 @@ func logRecordErrString(err error) string {
 	}
 	return err.Error()
 }
+
+// errorText compares errors by their message, so a want built with errors.New
+// matches the wrapped error the proxy actually recorded.
+var errorText = gocmp.Comparer(func(a, b error) bool {
+	return logRecordErrString(a) == logRecordErrString(b)
+})
 
 func TestChatCompletionsFailoverRouting(t *testing.T) {
 	t.Parallel()
@@ -2132,6 +2199,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		wantStatus  int
 		wantBody    string
 		wantBackend string
+		// wantFailedOver is the targets the request walked past, asserted only
+		// when non-nil so the cases that are not about the log record stay silent
+		// on it.
+		wantFailedOver []Attempt
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
 	// plus its stubbed round-trip: given the request and the 1-based call count, it
@@ -2183,6 +2254,68 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should name the stalled target an operator would otherwise not see", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: stall},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: errHeaderStall}}},
+		},
+	})
+
+	tests.Add("should show the client 502 for an upstream 5xx", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+		},
+	})
+
+	tests.Add("should carry the upstream's own words for why a target was walked past", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"quota gemini-2.5-flash exhausted"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{
+				Backend:        "a",
+				ModelUpstream:  "ma",
+				UpstreamStatus: http.StatusTooManyRequests,
+				Err:            errors.New("upstream returned status 429: quota gemini-2.5-flash exhausted"),
+			}}},
+		},
+	})
+
+	tests.Add("should show the status the walked-past target answered with", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{
+				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")},
+			}},
 		},
 	})
 
@@ -2423,9 +2556,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer user-token")
 				req.Header.Set("Content-Type", "application/json")
 				rr := httptest.NewRecorder()
-				srv.ServeHTTP(rr, req)
+				ctx := WithLogCtx(req.Context())
+				srv.ServeHTTP(rr, req.WithContext(ctx))
 				if rr.Code != s.wantStatus {
 					t.Errorf("step %d: status got %d want %d", i, rr.Code, s.wantStatus)
+				}
+				if s.wantFailedOver != nil {
+					rec, _ := LogRecordFromContext(ctx)
+					if d := gocmp.Diff(s.wantFailedOver, rec.FailedOver, errorText); d != "" {
+						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
+					}
 				}
 				if s.wantBody != "" {
 					if d := testy.DiffJSON([]byte(s.wantBody), rr.Body.Bytes()); d != nil {

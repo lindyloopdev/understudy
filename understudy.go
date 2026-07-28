@@ -661,11 +661,27 @@ func (s *server) clearFailure(t Target, backends map[string]Backend) {
 	delete(s.health, id)
 }
 
+// clientFacing maps an error returned by a provider call into the status the
+// client is shown: an upstream 5xx becomes 502 Bad Gateway, because the
+// upstream, not understudy, is at fault, while a 4xx passes verbatim so a client
+// can act on it (429/Retry-After, 400, 404, ...). A cancellation cause is the
+// caller's own error travelling back out — a consumer's shutdown 503, say — so
+// it is surfaced untouched.
+func clientFacing(ctx context.Context, err error) error {
+	if errors.Is(err, context.Cause(ctx)) {
+		return err
+	}
+	if yerrors.HTTPStatus(err) >= 500 {
+		return yerrors.WithHTTPStatus(http.StatusBadGateway, err)
+	}
+	return err
+}
+
 // isFatalUpstream reports whether err is an upstream failure that should count
-// against a target's health: a connection failure or an upstream 5xx, both of
-// which the provider renders as 502 Bad Gateway.
+// against a target's health: an upstream 5xx, or a connection failure that never
+// reached one, which the provider raises as 502.
 func isFatalUpstream(err error) bool {
-	return yerrors.HTTPStatus(err) == http.StatusBadGateway
+	return yerrors.HTTPStatus(err) >= 500
 }
 
 // rateLimitDemotionThreshold is the Retry-After delay at or above which a 429 is
@@ -703,11 +719,13 @@ const (
 )
 
 // limitClassification is understudy's classification of an upstream backpressure error
-// (a rate-limit 429, or a 5xx rendered as 502) into the facts the response path
+// (a rate-limit 429, or a 5xx) into the facts the response path
 // and the concurrency limiter act on. classifyLimit is the single place this
 // classification lives.
 type limitClassification struct {
-	// status is the client-facing HTTP status (via responseStatus).
+	// status is the error's HTTP status (via responseStatus): the upstream's own
+	// where the error has not yet passed clientFacing, the client's where it has.
+	// Only isRateLimit reads it, and a 429 is the same either side of the map.
 	status int
 	// isRateLimit reports status == 429 Too Many Requests.
 	isRateLimit bool
@@ -787,6 +805,28 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
+	// FailedOver holds the attempts a failover abandoned before the one the
+	// fields above describe, in the order they were tried. It is empty for a
+	// request that never failed over. A demotion is attributable through it: the
+	// target it demoted is here when the request moved on, and in the fields
+	// above when there was nowhere left to go.
+	FailedOver []Attempt
+}
+
+// Attempt describes one upstream call a request made and abandoned, so a
+// failover leaves a record of the targets it walked past rather than only the
+// one that determined the client's outcome.
+type Attempt struct {
+	// Backend is the backend the attempt called.
+	Backend string
+	// ModelUpstream is the upstream model name the attempt requested.
+	ModelUpstream string
+	// UpstreamStatus is the status the attempt answered with, or 0 when it never
+	// produced a response — a pre-header stall, or a transport failure.
+	UpstreamStatus int
+	// Err is the error that ended the attempt, carrying the upstream's own
+	// message where it sent one.
+	Err error
 }
 
 type logCtxKey struct{}
@@ -831,6 +871,12 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.ModelRequested = requested
 		h.ModelUpstream = upstream
+	}
+}
+
+func addLogFailedOver(ctx context.Context, backend, upstreamModel string, status int, err error) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel, UpstreamStatus: status, Err: err})
 	}
 }
 
@@ -1107,11 +1153,11 @@ func writeRetryAfterReject(ctx context.Context, w http.ResponseWriter, err error
 	})
 }
 
-// responseStatus classifies a handler error into an HTTP status. A status-less
-// upstream-call timeout (context.DeadlineExceeded) maps to 504 Gateway Timeout;
-// a status-less client cancellation (context.Canceled) maps to 499 Client
-// Closed Request; any other error keeps its own status via yerrors.HTTPStatus,
-// which defaults a status-less error to 500.
+// responseStatus classifies an error into an HTTP status. A status-less
+// upstream-call timeout (context.DeadlineExceeded) maps to
+// 504 Gateway Timeout; a status-less client cancellation (context.Canceled) maps
+// to 499 Client Closed Request; any other error keeps its own status via
+// yerrors.HTTPStatus, which defaults a status-less error to 500.
 func responseStatus(err error) int {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
@@ -1155,7 +1201,7 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 		matched = true
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
-			return err
+			return clientFacing(r.Context(), err)
 		}
 		for i := range data {
 			data[i].ID = name + "/" + data[i].ID
@@ -1484,6 +1530,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, 0, err)
 					continue
 				}
 			}
@@ -1532,14 +1579,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil && sig.condition == sustainedRate {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
 					releaseHeld()
 					cancel(nil)
 					continue
 				}
 			}
+			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
 			releaseHeld()
 			cancel(nil)
-			return err
+			return clientFacing(ctx, err)
 		}
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
