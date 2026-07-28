@@ -2,12 +2,13 @@
 
 **Tag:** understudy / ratelimit
 
-**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy),
+**Design:** [DESIGN.md §Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting),
 [§Shared understudy daemon](../DESIGN.md#shared-daemon),
 [§Upstream-identity canonicalization](../DESIGN.md#upstream-identity-canonicalization).
 
-Refinements to the floating per-account limiter and its FD-budget backstop, each behind
-its own trigger:
+## Deferred refinements
+
+Each behind its own trigger:
 
 - **Fairness in `acquire()`** — `wake()` broadcasts and waiters race. Revisit only if
   slot-waits persist; FIFO plus a runtime-shrinkable cap needs a real waiter queue.

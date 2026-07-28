@@ -230,32 +230,40 @@ type upstreamLimiter struct {
 	mu       sync.Mutex
 	limit    int
 	inflight int
-	seeded   bool
-	ready    chan struct{}
+	// knownGood is the cap the last saturated rejection measured, zero before any
+	// such rejection has arrived. Halving is reserved for a rejection at or below it.
+	knownGood int
+	// successes accrue toward the next additive step, once the cap has climbed
+	// back to the known-good boundary; a full round of them raises it by one.
+	successes int
+	ready     chan struct{}
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
 	return &upstreamLimiter{limit: limit, ready: make(chan struct{})}
 }
 
-// acquire takes a slot, blocking until one is free or ctx is done. A free slot
-// is taken immediately without consulting ctx, so a request with an
+// acquire takes a slot, blocking until one is free or ctx is done, and reports
+// whether it had to wait — the demand signal that gates growth of the cap. A
+// free slot is taken immediately without consulting ctx, so a request with an
 // already-cancelled context but an available slot still runs and surfaces the
 // handler's own cause.
-func (l *upstreamLimiter) acquire(ctx context.Context) error {
+func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
+	waited := false
 	for {
 		l.mu.Lock()
 		if l.inflight < l.limit {
 			l.inflight++
 			l.mu.Unlock()
-			return nil
+			return waited, nil
 		}
 		ready := l.ready
 		l.mu.Unlock()
 		select {
 		case <-ready:
+			waited = true
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return waited, context.Cause(ctx)
 		}
 	}
 }
@@ -300,27 +308,51 @@ func (l *upstreamLimiter) shrink() {
 	l.mu.Unlock()
 }
 
-// throttle reacts to a signal-less rate limit. On the first call it seeds the
-// cap to the observed in-flight count (a per-process over-estimate the account's
-// true limit sits at or below), never raising it; later calls halve the cap.
+// throttle reacts to a signal-less rate limit. A rejection arriving at
+// saturation is a capacity measurement — the account's limit sits just below the
+// count in flight at that moment — so the cap lands one slot under it and that
+// value is remembered as known-good. Halving is reserved for a rejection at or
+// below the known-good boundary, where the measurement itself is in doubt.
+// Arriving under the cap measures nothing about capacity, but the count in
+// flight is still an upper bound the cap is pulled down to.
 func (l *upstreamLimiter) throttle() {
 	l.mu.Lock()
-	if !l.seeded {
-		l.seeded = true
-		if l.inflight < l.limit {
-			l.limit = l.inflight
-		}
+	switch {
+	case l.knownGood > 0 && l.inflight <= l.knownGood:
 		l.mu.Unlock()
+		l.shrink()
 		return
+	case l.inflight < l.limit:
+		l.limit = l.inflight
+	case l.inflight > 1:
+		l.measure()
 	}
 	l.mu.Unlock()
-	l.shrink()
 }
 
-// grow raises the cap by one (AIMD additive increase); no per-account ceiling —
-// the process-wide FD budget is the hard backstop.
+// measure sets the cap one slot below the in-flight count and records it as the
+// known-good boundary; caller holds l.mu.
+func (l *upstreamLimiter) measure() {
+	l.limit = l.inflight - 1
+	l.knownGood = l.limit
+}
+
+// grow raises the cap on a success that waited for a slot; no per-account
+// ceiling — the process-wide FD budget is the hard backstop. Below the
+// known-good boundary the estimate is far from the edge, so one slot per success
+// is right: while saturated that doubles the cap each round trip. At or above
+// the boundary the edge is near and overshoot is paid for in real rejections, so
+// growth drops to one slot per round of successes.
 func (l *upstreamLimiter) grow() {
 	l.mu.Lock()
+	if l.knownGood > 0 && l.limit >= l.knownGood {
+		l.successes++
+		if l.successes < l.limit {
+			l.mu.Unlock()
+			return
+		}
+		l.successes = 0
+	}
 	l.limit++
 	l.wake()
 	l.mu.Unlock()
@@ -665,8 +697,7 @@ const (
 	sustainedRate
 	// signalless is a 429 with no Retry-After — the ambiguous, unsignalled case
 	// (z.ai-shaped): it may be concurrency or an exhausted quota. It throttles the
-	// cap — seeding it to the in-flight count on the first occurrence, halving on
-	// later ones; whether it also demotes turns on the in-flight count (see
+	// cap (see throttle); whether it also demotes turns on the in-flight count (see
 	// chatCompletions).
 	signalless
 )
@@ -1435,7 +1466,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
-		if err := lim.acquire(ctx); err != nil {
+		waited, err := lim.acquire(ctx)
+		if err != nil {
 			cancel(nil)
 			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
 		}
@@ -1463,7 +1495,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// health tracking (a direct backend/model reference has no chosen target).
 		switch {
 		case err == nil:
-			lim.grow()
+			// Demand-gated: a success that never waited for a slot is no evidence
+			// about the account's capacity, so it does not raise the cap.
+			if waited {
+				lim.grow()
+			}
 		case sig.condition == signalless:
 			lim.throttle()
 		}

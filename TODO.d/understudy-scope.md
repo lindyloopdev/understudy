@@ -20,8 +20,24 @@ understudy logs *which target actually served* a request server-side
 accounting can attribute the outcome to what really ran. Remaining: surface the
 served target back to the client/beat (a fallback's outcome is not yet attributed to
 the beat — `BeatStart.Model` carries only the requested logical name), and deliver
-the unknown-logical-model WARN to the config owner (per-tenant routing +
-request-originator/CLI surfacing). Detail: [[understudy-provenance-reporting]].
+the unknown-logical-model notice to the config owner (per-tenant routing +
+request-originator/CLI surfacing).
+
+**Delivery is the unsolved half.** An operator-relevant event understudy logs
+correctly is still invisible to an operator who is not watching the log — running
+`/oc-review`, nobody sees a `backend down` line, so a paid backend silently
+dropping to a pricier fallback goes unnoticed however loudly it is logged. No log
+level fixes this; the event has to reach a surface the operator is already looking
+at. Cross-ref the demotions this carries: [[non-transient-credential-failover]].
+
+Expose the health state **programmatically** rather than building a view here: a
+read-only snapshot (demoted targets, reason, since when) that an embedder renders.
+The operator surface belongs to the embedder — the status view wanted today is
+`lindy proxy`'s, not `understudyd`'s — so understudy owns the mechanism and lindy
+owns the presentation, the same split as the `ResponseInterceptor` seam
+([[understudy-response-interceptor]]). A standalone `understudyd` status endpoint,
+if ever wanted, builds on the same accessor rather than a parallel path. Defer the
+accessor until lindy's proxy view consumes it, so it lands with a caller.
 
 ## Quality lives in the list's composition, not understudy's execution
 

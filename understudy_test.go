@@ -3215,11 +3215,12 @@ func TestChatCompletionsConcurrencyCapPreservesOnSignaledRateLimit(t *testing.T)
 	})
 }
 
-func TestChatCompletionsConcurrencyCapGrowsOnSuccess(t *testing.T) {
+func TestChatCompletionsConcurrencyCapGrowsOnContendedSuccess(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
 		var calls, inFlight, maxInFlight int
-		release := make(chan struct{})
+		// gate releases exactly one blocked upstream call per send.
+		gate := make(chan struct{})
 
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			mu.Lock()
@@ -3227,18 +3228,11 @@ func TestChatCompletionsConcurrencyCapGrowsOnSuccess(t *testing.T) {
 			call := calls
 			mu.Unlock()
 
-			switch call {
-			case 1:
+			if call == 1 {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{},
-				}, nil
-			case 2:
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"id":"ok"}`)),
-					Header:     make(http.Header),
 				}, nil
 			}
 
@@ -3249,7 +3243,7 @@ func TestChatCompletionsConcurrencyCapGrowsOnSuccess(t *testing.T) {
 			}
 			mu.Unlock()
 
-			<-release
+			<-gate
 
 			mu.Lock()
 			inFlight--
@@ -3286,9 +3280,18 @@ func TestChatCompletionsConcurrencyCapGrowsOnSuccess(t *testing.T) {
 			t.Errorf("tripping request: Code=%d, want %d", rec.Code, http.StatusTooManyRequests)
 		}
 
-		if rec := post(); rec.Code != http.StatusOK {
-			t.Errorf("growing request: Code=%d, want %d", rec.Code, http.StatusOK)
-		}
+		go post()
+		synctest.Wait()
+
+		// This one finds the single seeded slot taken and waits for it.
+		go post()
+		synctest.Wait()
+
+		gate <- struct{}{}
+		synctest.Wait()
+
+		gate <- struct{}{}
+		synctest.Wait()
 
 		for range 3 {
 			go post()
@@ -3298,11 +3301,11 @@ func TestChatCompletionsConcurrencyCapGrowsOnSuccess(t *testing.T) {
 
 		mu.Lock()
 		if maxInFlight != 2 {
-			t.Errorf("after seed then grow on success: maxInFlight=%d, want 2", maxInFlight)
+			t.Errorf("after seed then grow on a contended success: maxInFlight=%d, want 2", maxInFlight)
 		}
 		mu.Unlock()
 
-		close(release)
+		close(gate)
 		synctest.Wait()
 	})
 }
@@ -3533,6 +3536,83 @@ func TestChatCompletionsConcurrencyLimitPerUpstreamIdentity(t *testing.T) {
 	})
 }
 
+func TestChatCompletionsConcurrencyCapGrowth(t *testing.T) {
+	type test struct {
+		wantEntered int
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should leave the cap unchanged after a success that never waited for a slot", test{
+		wantEntered: 1,
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls, entered int
+			release := make(chan struct{})
+
+			client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+				mu.Lock()
+				calls++
+				held := calls > 1
+				if held {
+					entered++
+				}
+				mu.Unlock()
+				if held {
+					<-release
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"id":"ok"}`)),
+					Header:     make(http.Header),
+				}, nil
+			})
+
+			backend := &BackendConfig{Backends: map[string]Backend{
+				"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: client}},
+			}}
+			srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return backend, nil
+			}})
+			srv.logger = testLogger(t)
+			srv.maxConcurrentPerUpstream = 1
+
+			post := func() {
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+					strings.NewReader(`{"model":"a/m","messages":[{"role":"user","content":"hi"}]}`))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				req.Header.Set("Authorization", "Bearer user-token")
+				req.Header.Set("Content-Type", "application/json")
+				srv.ServeHTTP(httptest.NewRecorder(), req)
+			}
+
+			post()
+			synctest.Wait()
+
+			go post()
+			synctest.Wait()
+			go post()
+			synctest.Wait()
+
+			mu.Lock()
+			got := entered
+			mu.Unlock()
+			if got != tt.wantEntered {
+				t.Errorf("requests admitted to the upstream after an uncontended success: got %d, want %d", got, tt.wantEntered)
+			}
+
+			close(release)
+			synctest.Wait()
+		})
+	})
+}
+
 func TestUpstreamLimiterAcquire(t *testing.T) {
 	t.Parallel()
 
@@ -3540,7 +3620,7 @@ func TestUpstreamLimiterAcquire(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := l.acquire(ctx); err != nil {
+	if _, err := l.acquire(ctx); err != nil {
 		t.Errorf("acquire with a free slot and a cancelled context: got err %v, want nil", err)
 	}
 	if got := l.inFlight(); got != 1 {
@@ -3622,6 +3702,24 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 		wantSlots: 3,
 	})
 
+	tests.Add("should raise the cap by one slot per round of successes once it reaches the known-good boundary", test{
+		newLimiter: func() *upstreamLimiter {
+			l := newUpstreamLimiter(4)
+			for range 4 {
+				l.tryAcquire()
+			}
+			l.throttle() // measures a cap of 3 and records it as known-good
+			for range 4 {
+				l.release()
+			}
+			for range 3 {
+				l.grow()
+			}
+			return l
+		},
+		wantSlots: 4,
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		if got := acquirable(tt.newLimiter()); got != tt.wantSlots {
@@ -3637,7 +3735,10 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		start     int
 		acquire   int
 		throttles int
-		wantSlots int
+		// releaseBetween slots are released after the first throttle, so a later
+		// one can arrive with fewer in flight than the throttle that preceded it.
+		releaseBetween int
+		wantSlots      int
 	}
 
 	tests := testy.NewTable[test]()
@@ -3648,23 +3749,36 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 1,
 		wantSlots: 3,
 	})
-	tests.Add("should halve the cap on the second throttle once seeding has happened", test{
+	tests.Add("should measure the cap when a saturated rate limit follows one that arrived below the cap", test{
 		start:     8,
 		acquire:   4,
 		throttles: 2,
-		wantSlots: 2,
+		wantSlots: 3,
 	})
-	tests.Add("should leave the cap unchanged when the first throttle arrives at full saturation", test{
+	tests.Add("should set the cap just below the in-flight count when a signal-less rate limit arrives at saturation", test{
 		start:     4,
 		acquire:   4,
 		throttles: 1,
-		wantSlots: 4,
+		wantSlots: 3,
 	})
-	tests.Add("should halve after a saturated seed on the next throttle", test{
+	tests.Add("should measure the cap again rather than halve when a repeat rate limit arrives above the known-good boundary", test{
 		start:     4,
 		acquire:   4,
 		throttles: 2,
-		wantSlots: 2,
+		wantSlots: 3,
+	})
+	tests.Add("should hold the cap at one when a signal-less rate limit arrives at a saturated cap of one", test{
+		start:     1,
+		acquire:   1,
+		throttles: 1,
+		wantSlots: 1,
+	})
+	tests.Add("should halve the cap when a repeat rate limit arrives at or below the known-good boundary", test{
+		start:          5,
+		acquire:        5,
+		throttles:      2,
+		releaseBetween: 2,
+		wantSlots:      2,
 	})
 
 	tests.Parallel()
@@ -3676,13 +3790,20 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 			}
 		}
 
-		for range tt.throttles {
+		held := tt.acquire
+		for i := range tt.throttles {
+			if i > 0 {
+				for range tt.releaseBetween {
+					l.release()
+					held--
+				}
+			}
 			l.throttle()
 		}
 
 		// Release the held slots so the drain observes the post-throttle cap, not
 		// what is left above the in-flight count.
-		for range tt.acquire {
+		for range held {
 			l.release()
 		}
 
@@ -4207,5 +4328,57 @@ func TestShouldLogViaProcessDefaultLoggerWithoutLoggerOption(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "model field beyond prefix scan threshold") {
 		t.Errorf("expected the prefix-scan log on the process-default logger, got: %q", buf.String())
+	}
+}
+
+// TODO(TODO.d/auth-requirement-and-key-env-source.md): once auth="auto" exists,
+// this becomes a table with a second case — a backend is dropped because the
+// variable it names is unset. That mapping is what makes examples/free-tiers.toml
+// drop-in, and the api_key_file-driven drop cases in config_test.go cannot prove
+// it. Until then an unset variable silently resolves to an empty key, which is
+// neither designed answer.
+func TestChatCompletionsAuthenticatesUpstreamWithEnvNamedCredential(t *testing.T) {
+	t.Setenv("GROQ_API_KEY", "sk-from-env")
+
+	cfg := Config{
+		Backends: map[string]BackendSpec{
+			//nolint:gosec // G101 fires on the api_key_env name; the value is the variable's name, not its contents.
+			"groq": {ProviderType: "openai", BaseURL: "http://groq/v1", APIKeyEnv: "GROQ_API_KEY"},
+		},
+	}
+	resolved, err := cfg.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	var gotAuth string
+	backend := resolved.Backends["groq"]
+	backend.Config.HTTPClient = testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+		gotAuth = r.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	resolved.Backends["groq"] = backend
+
+	validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return resolved, nil
+	}}
+	srv := New(validator, WithLogger(testLogger(t)))
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"groq/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer user-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.ServeHTTP(httptest.NewRecorder(), req)
+
+	if want := "Bearer sk-from-env"; gotAuth != want {
+		t.Errorf("upstream call authenticated with %q, want %q", gotAuth, want)
 	}
 }

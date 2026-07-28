@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
-	"github.com/go-playground/validator/v10"
 	gocmp "github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gitlab.com/flimzy/testy/v2"
@@ -68,6 +67,92 @@ targets = ["opencode-go/deepseek-v4-flash", "opencode-go/glm-4.7?thinking=false"
 	})
 }
 
+func TestConfigShouldReportRuleViolationsBeforeResolving(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		cfg     Config
+		wantErr string
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should report a backend that names no credential source", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: api_key is required unless api_key_file or api_key_env is set$`,
+	})
+
+	tests.Add("should report a backend that names no provider type", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: provider_type is a required field$`,
+	})
+
+	tests.Add("should report a backend whose provider type no handler serves", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "anthropic", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: provider_type must be one of \[openai\]$`,
+	})
+
+	tests.Add("should report a backend that names no base URL", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", APIKey: "sk-test"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: base_url is a required field$`,
+	})
+
+	tests.Add("should report a backend that inlines a key and names a key file", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				//nolint:gosec // G101 fires on the api_key_file name; the value is a path, and the key beside it is a fixture.
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test", APIKeyFile: "/run/secrets/groq"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: api_key is an excluded field$`,
+	})
+
+	tests.Add("should report a logical model that lists no targets", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+			Models: map[string]LogicalModelSpec{"cheap": {}},
+		},
+		wantErr: `^understudy\.models\.cheap: no targets$`,
+	})
+
+	tests.Add("should report nothing for a configuration that breaks no rule", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKey: "sk-test"},
+			},
+			Models: map[string]LogicalModelSpec{
+				"cheap": {Targets: []Target{{backend: "groq", model: "llama"}}},
+			},
+		},
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		err := tt.cfg.Validate()
+		if !testy.ErrorMatchesRE(tt.wantErr, err) {
+			t.Errorf("unexpected error, got %v, want /%s/", err, tt.wantErr)
+		}
+	})
+}
+
 func TestConfigResolve(t *testing.T) {
 	t.Parallel()
 
@@ -123,7 +208,7 @@ func TestConfigResolve(t *testing.T) {
 				"groq": {ProviderType: "openai", BaseURL: "https://api.openai.com", APIKeyFile: "/nonexistent/lindy-key"},
 			},
 		},
-		wantErr: `understudy\.backends\.groq: read api_key_file "/nonexistent/lindy-key": .+`,
+		wantErr: `^understudy\.backends\.groq: read api_key_file "/nonexistent/lindy-key": .+$`,
 	})
 
 	tests.AddFunc("should return error when a backend api_key_file is empty", func(t *testing.T) test {
@@ -137,7 +222,7 @@ func TestConfigResolve(t *testing.T) {
 					"groq": {ProviderType: "openai", BaseURL: "https://api.openai.com", APIKeyFile: path},
 				},
 			},
-			wantErr: `understudy\.backends\.groq: api_key_file ".+" is empty`,
+			wantErr: `^understudy\.backends\.groq: api_key_file ".+" is empty$`,
 		}
 	})
 
@@ -147,16 +232,25 @@ func TestConfigResolve(t *testing.T) {
 				"groq": {ProviderType: "openai", BaseURL: "https://api.openai.com", APIKeyFile: "relative/lindy-key"},
 			},
 		},
-		wantErr: `understudy\.backends\.groq: api_key_file "relative/lindy-key" must be an absolute path`,
+		wantErr: `^understudy\.backends\.groq: api_key_file "relative/lindy-key" must be an absolute path$`,
 	})
 
-	tests.Add("should return error when a backend base_url is invalid", test{
+	tests.Add("should refuse to resolve a backend whose base_url is not a URL", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{
-				"groq": {ProviderType: "openai", BaseURL: "://bad"},
+				"groq": {ProviderType: "openai", BaseURL: "://bad", APIKey: "sk-test"},
 			},
 		},
-		wantErr: `understudy\.backends\.groq: invalid base_url "://bad"`,
+		wantErr: `^understudy\.backends\.groq: base_url must be a valid URL$`,
+	})
+
+	tests.Add("should refuse to resolve a backend that names no credential source", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"groq": {ProviderType: "openai", BaseURL: "https://api.groq.com/openai/v1"},
+			},
+		},
+		wantErr: `^understudy\.backends\.groq: api_key is required unless api_key_file or api_key_env is set$`,
 	})
 
 	tests.Add("should return an empty BackendConfig when Backends is nil", test{
@@ -222,7 +316,7 @@ func TestConfigResolve(t *testing.T) {
 				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"thinking": {"maybe"}}}}},
 			},
 		},
-		wantErr: `understudy\.models\.m: target "a/ma": invalid thinking value`,
+		wantErr: `^understudy\.models\.m: target "a/ma": invalid thinking value.+$`,
 	})
 
 	tests.Add("should reject a reserved thinking=true value at resolve", test{
@@ -234,7 +328,7 @@ func TestConfigResolve(t *testing.T) {
 				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"thinking": {"true"}}}}},
 			},
 		},
-		wantErr: "reserved",
+		wantErr: `^understudy\.models\.m: target "a/ma": thinking=true is reserved.+$`,
 	})
 
 	tests.Add("should ignore an unknown query parameter at resolve", test{
@@ -268,7 +362,27 @@ func TestConfigResolve(t *testing.T) {
 				"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "ghost", model: "mb"}}},
 			},
 		},
-		wantErr: `understudy\.models\.m: target "ghost/mb" references unknown backend "ghost"`,
+		wantErr: `^understudy\.models\.m: target "ghost/mb" references unknown backend "ghost"$`,
+	})
+
+	// TODO(TODO.d/auth-requirement-and-key-env-source.md): the auth cases belong
+	// in this table — auth="none" permits a backend with no key source;
+	// auth="optional" is rejected as reserved; auth="auto" drops a backend whose
+	// declared source does not resolve, along with targets naming it and models
+	// left empty; a key source under auth="none", or none under "required"/"auto",
+	// is a config error. Drive the drop with an api_key_file at a nonexistent path
+	// so these stay in this parallel table; only the unset-variable case needs the
+	// env-coupled test in understudy_test.go.
+	tests.Add("should reject a logical model configured with no targets", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},
+			},
+			Models: map[string]LogicalModelSpec{
+				"m": {Targets: []Target{}},
+			},
+		},
+		wantErr: `^understudy\.models\.m: no targets$`,
 	})
 
 	tests.Parallel()
@@ -328,7 +442,7 @@ func TestConfigDefaultModel(t *testing.T) {
 func TestRegisteredProvidersPassValidation(t *testing.T) {
 	t.Parallel()
 
-	validate := validator.New()
+	validate := tagValidator
 	for provider := range defaultProviders() {
 		t.Run(provider, func(t *testing.T) {
 			t.Parallel()
@@ -364,6 +478,12 @@ func TestBackendSpecKeySourceValidation(t *testing.T) {
 		valid: true,
 	})
 
+	tests.Add("should accept a backend whose key comes only from api_key_env", test{
+		//nolint:gosec // G101 fires on the api_key_env name; the value is the variable's name, not its contents.
+		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com", APIKeyEnv: "GROQ_API_KEY"},
+		valid: true,
+	})
+
 	tests.Add("should reject a backend that supplies neither api_key nor api_key_file", test{
 		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com"},
 		valid: false,
@@ -373,10 +493,15 @@ func TestBackendSpecKeySourceValidation(t *testing.T) {
 		spec:  BackendSpec{ProviderType: "openai", BaseURL: "https://example.com", APIKey: "sk-test", APIKeyFile: "/some/path"},
 		valid: false,
 	})
+	// TODO(TODO.d/auth-requirement-and-key-env-source.md): add the two pairings
+	// api_key_env takes part in — api_key + api_key_env, and api_key_file +
+	// api_key_env — as rejections. Both validate clean today because excluded_with
+	// names only APIKeyFile, so they cannot be asserted until that tag names every
+	// sibling source.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		err := validator.New().Struct(tt.spec)
+		err := tagValidator.Struct(tt.spec)
 		if (err == nil) != tt.valid {
 			t.Errorf("validation valid=%v, want %v (err: %v)", err == nil, tt.valid, err)
 		}

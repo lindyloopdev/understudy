@@ -35,17 +35,71 @@ path and differ only in transport. A daemon may additionally wrap the validator
 with a static operator token for external (non-engine) clients; the engine's
 mint is the fallthrough either way.
 
+**Config handling is two stages: load, then validate.** *Loading* gets the
+configuration into the struct — decode the TOML, parse the base URL and each
+target into their types, and fill each backend's key from whichever source it
+names. Reading a file or an environment variable to populate a field is part of
+loading, in the same sense that decoding the document is; it is one more level of
+indirection, not a separate phase. Loading fails only where loading is
+*impossible*: a malformed document, an unreadable path. *Validation* then runs
+over the loaded struct — tags for per-field shape, `Validate() error` methods for
+the relationships tags express poorly — and carries every rule about whether the
+configuration is acceptable.
+
+**Loading never discards the source fields.** A backend that names
+`api_key_env = "GROQ_API_KEY"` still carries that name after its key is filled,
+so validation sees both the empty key *and* where it should have come from, and
+says which variable to set. Keeping one struct through validation is what makes
+the diagnostic specific; transforming into a credential-only type would discard
+exactly the fact the operator needs.
+
 **Credential sourcing.** Each backend's upstream key lives in the resolved
 understudy config. A lindy agent can read both the config file and the host
 environment, so to keep the plaintext out of the agent's reach a backend may
 reference the key by file instead of inlining it: it sets exactly one of
-`api_key` or `api_key_file`. `api_key_file` resolves to an absolute path — a
+`api_key`, `api_key_file`, or `api_key_env`. `api_key_file` resolves to an absolute path — a
 leading `~/` expands against the home directory, an otherwise-relative path
 against the config file's directory — whose contents supply the key. Placing
 that file outside the worktree and unmounted from the container keeps the secret
-where agent-generated code cannot read it. An empty or whitespace-only file, an
-unreadable path, a non-absolute path at understudy's resolve, or setting both
-fields is a config error.
+where agent-generated code cannot read it. `api_key_env` names an environment
+variable holding the key; it names the variable rather than interpolating its
+value so that *declaring* a credential stays distinguishable from *resolving*
+one — the distinction `auth` below depends on. An empty or whitespace-only file, an
+unreadable path, a non-absolute path at understudy's resolve, or setting more than one
+source is a config error.
+
+**Credential requirement (`auth`).** A backend declares whether it needs a
+credential at all. The value decides **what kind of fact an absent credential
+is** — a defect in the document, or a fact about the world:
+
+- `required` (the default) — an empty key is a **config error**. Preserves the
+  strict behavior for a hand-written config, where a credential that fails to load
+  is a typo, not an expectation.
+- `auto` — an empty key is a **valid configuration**; the backend is simply
+  **unavailable**. This is what makes a shared config
+  (`examples/free-tiers.toml`) drop-in: an operator holding one provider's key
+  gets that provider and a startup that succeeds.
+- `none` — no credential is wanted (a local ollama or LM Studio), so there is
+  nothing to be absent. Naming a key source is a config error, since it could
+  never be read. If the upstream turns out to demand a credential after all, its
+  `401` is the diagnostic — understudy adds no special handling.
+- `optional` — **reserved, rejected.** Send a credential when one loads, stay
+  available when none does. Its name is held so that `auto` does not drift into
+  meaning it.
+
+**`auth` is not a config transformation.** A backend whose variable is unset is
+still in the configuration — the document said it exists, and that remains true.
+Nothing is pruned: no backend is removed, no target naming it is rewritten, no
+logical model is emptied. What changes is *availability*, which understudy already
+models for a demoted or rate-limited target — a backend with no credential is
+unusable in the same way, and the failover walk passes over it for the same reason.
+An operator who exports the variable makes it usable again without the
+configuration having changed at all.
+
+That also keeps `auto` distinct from an upstream *rejecting* a credential. `auth`
+governs only whether an absent credential is an error; a credential that loads and
+is then refused is a defect the operator can act on, logged at ERROR when the
+target is demoted, regardless of the backend's `auth` value.
 
 **Transport encryption.** understudy serves the agent over **TLS, not cleartext**.
 The container reaches it across the Docker bridge — a segment other, untrusted
@@ -347,11 +401,12 @@ transcript step on the id.
 The correspondence is **step → record**, not request → step. Every step is one
 served request, so it has exactly one record; but the reverse does not hold —
 opencode also issues requests that never become steps (session title/summarize,
-retries), each producing its own record. The consumer skips those orphan records
-and matches each step to *its* record **by id**, so the join is exact at line
-granularity and correct even across a failover. Positional correlation (Nth
-request ↔ Nth step) cannot work precisely because of those extra requests; the id
-is what makes the join robust to them.
+retries), each producing its own record. Those orphan records land on the stream
+too, keyed by ids no step carries, and are simply never looked up; each step is
+matched to *its* record **by id**, so the join is exact at line granularity and
+correct even across a failover. Positional correlation (Nth request ↔ Nth step)
+cannot work precisely because of those extra requests; the id is what makes the
+join robust to them.
 
 **The join key is present exactly when the rewrite succeeded.** The interceptor
 overwrites `cached_tokens` only when it can read the usage; when the usage is
@@ -359,10 +414,19 @@ unparseable it relays unchanged and writes no record, and opencode then reports 
 **zero** cache-read. Since an id is a nonce ≥ 1, a non-zero carried value is
 therefore always a real id with a record on the stream, and a step with no id
 (zero) is one the rewrite could not tag — passed through **unattributed** rather
-than mis-joined. This is why the consumer needs no buffer and cannot desync: it
-scans the stream for a step's id (an id-bearing step's record is guaranteed
-present, so the scan always terminates at its match), and an id-less step is never
-scanned for.
+than mis-joined; an id-less step is never joined.
+
+An id-bearing step is joined **by id, not by position**: a **single per-token
+subscriber** drains the stream into an `id → record` map, and each step reads its
+record out of that map. The map — not a positional scan — is essential because a
+token's requests run **concurrently**: many transcript steps are in flight at once
+(a review's parallel reviewers all share one token), so records interleave and a
+step routinely reaches the consumer before its own record does. The lookup waits,
+bounded, for a not-yet-arrived record; on a genuine miss — a record dropped under
+buffer pressure, or never broadcast — it passes the step through **unattributed**
+rather than stall. Provenance is best-effort: it never blocks or fails a transcript
+step. The single per-token subscriber is also what the producer is sized for (one
+reader per token, not one per in-flight request).
 
 The stream is a **live broadcast**, per-token-scoped: each record fans out to every
 current subscriber, and a subscriber sees only records produced after it subscribes.
@@ -464,6 +528,69 @@ This log record is understudy's own, distinct from the served-model provenance
 `RequestMetadata` (§Served-model provenance): provenance is a per-request broadcast for
 downstream joins/cost, while the `LogRecord` snapshot is what the mount projects to the log
 line. They overlap on backend/model but answer to different consumers, so they stay separate.
+
+## Concurrency & Rate Limiting <a id="concurrency-rate-limiting"></a>
+
+understudy bounds the requests it holds in flight to one upstream account, so a burst
+cannot trip the account's *own* concurrency limiting. The bound is keyed on canonical
+upstream identity (§Upstream-identity canonicalization) and, in the shared daemon, is
+therefore global across tenants (§Shared understudy daemon).
+
+**The cap is learned, not configured.** An account's real concurrency limit is rarely
+documented and varies by plan, so understudy estimates it from the traffic it is already
+sending. A configured number would be wrong on every account but the one it was tuned
+for. The configured value is a **cold-start allowance** only — where the estimate begins
+before any evidence exists.
+
+**Growth is demand-gated.** The cap rises only when a request actually waited for a
+slot. Without the gate the estimate rises on every success, including on an idle system
+where nothing is contending, and so encodes *cumulative successful traffic* rather than
+capacity — it drifts upward without bound and the only thing that ever pulls it back is
+provoking a rejection. Demand is what makes an increase evidence-bearing: raising a cap
+nobody is pressing against asserts nothing about the account.
+
+**Two growth regimes, split at the last known-good cap.** An increase of one slot per
+successful request is geometric in aggregate, not linear: while saturated, a cap of *L*
+completes *L* requests per round trip, so the cap doubles each round. That is the right
+speed when the estimate is far below the truth and the wrong speed when it is near it —
+approaching the real limit at doubling speed guarantees overshoot, and the overshoot is
+paid for in real rejections. So the cap remembers the last value known to be safe and
+changes instrument there:
+
+- **Below it — one slot per success.** Doubling per round; the estimate is far from the
+  edge and the cost of being wrong is one rejection.
+- **At or above it — one slot per round.** Additive probing; the estimate is near the
+  edge and each step must be cheap to retract.
+
+**A rejection is a measurement, not a reflex.** A signal-less 429 arriving while
+saturated says the account's limit is approximately the in-flight count at that moment —
+the most precise capacity reading understudy ever gets. It sets the cap just below that
+count and records it as the new known-good boundary. Halving instead would discard the
+measurement just paid for.
+
+Multiplicative decrease is held in reserve for the case that earns it: a repeat
+rejection at or below the known-good boundary, which means the estimate is wrong or the
+account is not understudy's alone. Halving is a *fairness* instrument — it is what makes
+many independent flows converge on a shared resource — and the shared daemon exists
+precisely so that understudy is the single flow per account (§Shared understudy daemon).
+With no competing flow to converge with, halving on first contact costs accuracy and buys
+nothing.
+
+A 429 that carries a usable signal is not a concurrency measurement at all: it is quota
+or rate exhaustion, and it routes to quota-class-aware demotion (§Understudy) rather than
+to the cap. Only the signal-less case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
+feeds the estimator.
+
+**Per-upstream state outlives the tenant that taught it.** The learned cap is a property
+of the account, accumulated across runs; tearing down a tenant frees its in-flight slots
+but never resets the estimate (§Shared understudy daemon, Two lifecycles).
+
+**The FD budget is a process backstop, not the account bound.** A process-wide limit
+sized from `RLIMIT_NOFILE` sheds with `503` rather than queueing, so exhaustion cannot
+accumulate the goroutines and buffered bodies it exists to protect. It guards the
+*process* against resource exhaustion; on a host with a generous soft limit it sits far
+above any cap the control law reaches and so bounds nothing about the account. Growth is
+bounded by the demand gate and the known-good boundary, never by the FD budget.
 
 ## Shared understudy daemon <a id="shared-daemon"></a>
 
