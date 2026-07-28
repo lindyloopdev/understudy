@@ -82,7 +82,10 @@ is** — a defect in the document, or a fact about the world:
 - `none` — no credential is wanted (a local ollama or LM Studio), so there is
   nothing to be absent. Naming a key source is a config error, since it could
   never be read. If the upstream turns out to demand a credential after all, its
-  `401` is the diagnostic — understudy adds no special handling.
+  `401` is the diagnostic and reaches the client — the one exception to the
+  credential-refusal failover below. A `401` here contradicts the *declaration*,
+  not an account, so no sibling can serve in its place; routing around it would
+  hide a wrong config behind a paid backend.
 - `optional` — **reserved, rejected.** Send a credential when one loads, stay
   available when none does. Its name is held so that `auto` does not drift into
   meaning it.
@@ -151,7 +154,14 @@ understudy routes each request to the first target not currently
 failing past a threshold, tracking a failing-since per canonical `(url + key + model)` and
 classifying a 502/connection error as an availability failure. understudy **walks** the list,
 advancing to the next target when an attempt is **classified an availability
-failure** — a hard error (502/connection) or a rate-limited target. **Stalls: two axes, three dispositions.** Whether a stalled request can be
+failure** — a hard error (502/connection), a rate-limited target, or a **refused
+credential**: a `401` (rejected) or `402` (out of funds) from a backend that
+supplies one. A refused credential is an availability fact about the one account
+called, not a client error — a cost-ordered candidate list reaches an exhausted
+balance in the ordinary course — so the target is demoted at once and the request
+continues on a sibling instead of the refusal reaching the client. A backend
+declaring `auth = none` is excluded: it supplies no credential to refuse, so its
+`401` is a config diagnostic and passes through (see §LLM API Keys via Understudy). **Stalls: two axes, three dispositions.** Whether a stalled request can be
 salvaged turns on two independent facts. **Replayability** is set by the header
 boundary: *pre-header* (no first byte yet) means nothing is written to the client,
 so the request is replayable to another target; *mid-stream* (headers, maybe
