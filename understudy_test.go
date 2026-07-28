@@ -2057,8 +2057,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/understudy-demotion-without-logged-request.md): an abandoned
-	// attempt should also record its upstream status and the error that ended it.
 	tests.AddFunc("should record the abandoned target when a request fails over", func(t *testing.T) test {
 		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2097,7 +2095,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"backend_name": "b",
-				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests}},
+				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")}},
 			},
 		}
 	})
@@ -2130,7 +2128,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				delete(got, k)
 			}
 		}
-		if d := gocmp.Diff(tt.want, got); d != "" {
+		if d := gocmp.Diff(tt.want, got, errorText); d != "" {
 			t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
 		}
 	})
@@ -2144,6 +2142,12 @@ func logRecordErrString(err error) string {
 	}
 	return err.Error()
 }
+
+// errorText compares errors by their message, so a want built with errors.New
+// matches the wrapped error the proxy actually recorded.
+var errorText = gocmp.Comparer(func(a, b error) bool {
+	return logRecordErrString(a) == logRecordErrString(b)
+})
 
 func TestChatCompletionsFailoverRouting(t *testing.T) {
 	t.Parallel()
@@ -2243,7 +2247,29 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma"}}},
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: errHeaderStall}}},
+		},
+	})
+
+	tests.Add("should carry the upstream's own words for why a target was walked past", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"quota gemini-2.5-flash exhausted"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{
+				Backend:        "a",
+				ModelUpstream:  "ma",
+				UpstreamStatus: http.StatusTooManyRequests,
+				Err:            errors.New("upstream returned status 429: quota gemini-2.5-flash exhausted"),
+			}}},
 		},
 	})
 
@@ -2261,7 +2287,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{
-				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests},
+				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")},
 			}},
 		},
 	})
@@ -2510,7 +2536,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				}
 				if s.wantFailedOver != nil {
 					rec, _ := LogRecordFromContext(ctx)
-					if d := gocmp.Diff(s.wantFailedOver, rec.FailedOver); d != "" {
+					if d := gocmp.Diff(s.wantFailedOver, rec.FailedOver, errorText); d != "" {
 						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
 					}
 				}

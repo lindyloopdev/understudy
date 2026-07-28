@@ -7,16 +7,11 @@ must be attributable to),
 [DESIGN.md §Handler boundary](../DESIGN.md#handler-boundary) (`LogRecord` holds
 only what understudy can supply, and the mount emits one entry per request).
 
-Every demotion leaves its target in the record, but not **why** it was given up
-on. A reader can see that a target was walked past without being able to tell a
-429 from a 502 from a stall. Close that on both halves of the record:
-
-- Carry the abandoned attempt's **upstream status** and **its own error** on
-  `Attempt`. Rendering stays the mount's call.
-- Set the flat `UpstreamStatus` for a **failed** final attempt.
-  `setLogUpstreamStatus` sits past the error check, so a request whose last
-  target failed records the status it failed with as `0` — the one path that
-  still reports only *that* it failed, not what happened.
+Set the flat `UpstreamStatus` for a **failed** final attempt.
+`setLogUpstreamStatus` sits past the error check, so a request whose last target
+failed records the status it failed with as `0`. An abandoned attempt says why it
+was given up on; the attempt that ended the request reports only *that* it
+failed, not what happened.
 
 Keep `BackendName`/`ModelUpstream`/`UpstreamStatus` naming the attempt that
 **determined the client's outcome** — the one whose response was relayed, or,
