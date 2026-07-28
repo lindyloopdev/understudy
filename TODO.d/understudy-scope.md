@@ -28,7 +28,8 @@ correctly is still invisible to an operator who is not watching the log — runn
 `/oc-review`, nobody sees a `backend down` line, so a paid backend silently
 dropping to a pricier fallback goes unnoticed however loudly it is logged. No log
 level fixes this; the event has to reach a surface the operator is already looking
-at. Cross-ref the demotions this carries: [[non-transient-credential-failover]].
+at — including the demotion of a target whose credential the upstream refused,
+which routes spend to a sibling on nothing louder than a log line.
 
 Expose the health state **programmatically** rather than building a view here: a
 read-only snapshot (demoted targets, reason, since when) that an embedder renders.

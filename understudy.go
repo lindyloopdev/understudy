@@ -685,9 +685,13 @@ func isFatalUpstream(err error) bool {
 }
 
 // isCredentialRefused reports whether the upstream refused the target's
-// credential (402: out of funds).
+// credential (401: rejected, 402: out of funds).
 func isCredentialRefused(err error) bool {
-	return yerrors.HTTPStatus(err) == http.StatusPaymentRequired
+	switch yerrors.HTTPStatus(err) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired:
+		return true
+	}
+	return false
 }
 
 // rateLimitDemotionThreshold is the Retry-After delay at or above which a 429 is
@@ -1579,7 +1583,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		if err != nil {
-			// A sustainedRate 429 or an unfunded credential has just demoted chosen
+			// A sustainedRate 429 or a refused credential has just demoted chosen
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
 			if logicalTargets != nil && (sig.condition == sustainedRate || isCredentialRefused(err)) {
