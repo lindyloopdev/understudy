@@ -161,7 +161,26 @@ called, not a client error — a cost-ordered candidate list reaches an exhauste
 balance in the ordinary course — so the target is demoted at once and the request
 continues on a sibling instead of the refusal reaching the client. A backend
 declaring `auth = none` is excluded: it supplies no credential to refuse, so its
-`401` is a config diagnostic and passes through (see §LLM API Keys via Understudy). **Stalls: two axes, three dispositions.** Whether a stalled request can be
+`401` is a config diagnostic and passes through (see §LLM API Keys via Understudy).
+
+**Least degradation: a target understudy cannot use is one target's problem.** The
+refused-credential rule generalizes. Whatever makes a target unusable — an account
+out of funds, an unreachable host, or a **malformed target** (a backend the operator
+declared without a base URL) — is a fact about *that* target, and the candidate list
+exists precisely so one such fact does not decide the request. So a malformed target
+demotes and the walk advances, exactly as a refused credential does; a config defect
+is as much an availability fact as a runtime one, and a request that resolves to a
+healthy sibling must not pay for a target it never names. The defect surfaces
+terminally only at **exhaustion** — when the unusable target was the last candidate —
+and understudy records the target it walked past in the request's `LogRecord`
+failover trail (§Handler boundary), which is what makes the misconfiguration
+visible without failing traffic that could be served. Validating every declared backend up front instead —
+rejecting the whole request because *some* backend is malformed — buys deterministic
+error ordering at the cost of turning one operator typo into total unavailability;
+determinism is recovered by validating the target actually chosen, at the point it
+is chosen.
+
+**Stalls: two axes, three dispositions.** Whether a stalled request can be
 salvaged turns on two independent facts. **Replayability** is set by the header
 boundary: *pre-header* (no first byte yet) means nothing is written to the client,
 so the request is replayable to another target; *mid-stream* (headers, maybe
