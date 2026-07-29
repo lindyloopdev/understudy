@@ -2429,6 +2429,22 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should start a fresh streak once a demotion has gone untouched past the eviction window", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				advance:      24*time.Hour + time.Second,
+				wantStatus:   http.StatusBadGateway,
+				wantBody:     badGateway502,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+			},
+		},
+	})
+
 	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
