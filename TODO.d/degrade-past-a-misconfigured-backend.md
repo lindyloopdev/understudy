@@ -35,6 +35,12 @@ Least degradation: a target understudy cannot use is one target's problem.
 - Report the skipped target through `LogRecord.FailedOver` (`addLogFailedOver`),
   which already exists to make a demotion attributable. No new log line — and
   not a WARN.
+- Degrade in the `default` catalog-fallback loop too, a third site with the same
+  defect and no middleware involvement: a failed catalog fetch and an
+  empty-catalog backend both `return` rather than `continue`
+  (`understudy.go:1522`, `1526`). Backends are walked in sorted order, so a
+  `default` request against `{broken, good}` fails on `broken` while `good`
+  could have served it.
 
 Distinct from [reject-unconfigured-logical-model.md](reject-unconfigured-logical-model.md):
 that one is a name with no targets at all, this one is a target list whose

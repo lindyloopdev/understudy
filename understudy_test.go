@@ -181,7 +181,7 @@ func TestChatCompletionsValidation(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should resolve a bare model request via the registered provider's catalog", func(t *testing.T) test {
+	tests.AddFunc("should resolve the default model via the registered provider's catalog", func(t *testing.T) test {
 		decoy := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("no HTTP probe expected: catalog must come from the registered provider")
 		})
@@ -200,7 +200,7 @@ func TestChatCompletionsValidation(t *testing.T) {
 				response: `{"id":"served-by-acme"}`,
 				models:   []providers.Model{{ID: "frobnicator-1"}},
 			})},
-			body:       `{"model":"unconfigured-bare","messages":[{"role":"user","content":"hi"}]}`,
+			body:       `{"model":"default","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus: http.StatusOK,
 			wantBody:   `{"id":"served-by-acme"}`,
 		}
