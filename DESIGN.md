@@ -163,22 +163,50 @@ continues on a sibling instead of the refusal reaching the client. A backend
 declaring `auth = none` is excluded: it supplies no credential to refuse, so its
 `401` is a config diagnostic and passes through (see §LLM API Keys via Understudy).
 
-**Least degradation: a target understudy cannot use is one target's problem.** The
-refused-credential rule generalizes. Whatever makes a target unusable — an account
-out of funds, an unreachable host, or a **malformed target** (a backend the operator
-declared without a base URL) — is a fact about *that* target, and the candidate list
-exists precisely so one such fact does not decide the request. So a malformed target
-demotes and the walk advances, exactly as a refused credential does; a config defect
-is as much an availability fact as a runtime one, and a request that resolves to a
-healthy sibling must not pay for a target it never names. The defect surfaces
-terminally only at **exhaustion** — when the unusable target was the last candidate —
-and understudy records the target it walked past in the request's `LogRecord`
-failover trail (§Handler boundary), which is what makes the misconfiguration
-visible without failing traffic that could be served. Validating every declared backend up front instead —
-rejecting the whole request because *some* backend is malformed — buys deterministic
-error ordering at the cost of turning one operator typo into total unavailability;
-determinism is recovered by validating the target actually chosen, at the point it
-is chosen.
+**Least degradation: a backend understudy cannot use costs that backend, not the
+request.** The refused-credential rule generalizes past runtime faults. A backend
+may also be unusable *statically* — its `provider_type` has no registered handler,
+or it reached understudy without a base URL — and that is still a fact about one
+backend, which the candidate list exists precisely so one fact cannot decide the
+request. So an unusable backend is **skipped where a target is chosen**, and a
+request that resolves to a usable sibling never pays for it.
+
+Skipped, not demoted. A refused credential is a fact about the world that can
+change on its own, so it belongs in the health state the failover walk consults; a
+statically unusable backend cannot become usable without a configuration change, so
+demoting it would seed a health entry no recovery probe can ever clear
+(§Recovery probing). Rejecting up front is the other wrong answer: validating every
+declared backend before routing buys deterministic error ordering at the cost of
+turning one typo into total unavailability, failing requests that would never have
+touched the offending backend. Determinism is recovered by validating the backend
+actually chosen, where it is chosen.
+
+**The reason travels with the skip.** A skip that discards *why* turns understudy's
+own errors into falsehoods — a caller told a configured-but-unusable backend is
+"unknown", or told "no backend configured" when several are. So the reason reaches
+whichever answer the request produces: the terminal error when the skipping
+exhausted the candidates, and the operator's diagnostic either way.
+
+**Operator and caller learn different things.** The caller gets the best available
+answer to the request it made; the reason a backend was skipped is the *operator's*
+fact and goes to understudy's own logger at ERROR — deduplicated per condition, not
+emitted per request, since a `TokenValidator` runs on every one. In an embedded
+deployment the two may be the same person; understudy must not assume it, so a
+caller's request is never failed to deliver an operator's diagnostic.
+
+**Two endpoints, two answers.** `/v1/models` asks *what can you serve* — emptiness
+is a valid answer whatever its cause, so unusable backends are skipped and a usable
+backend advertising nothing contributes nothing; the listing does not fail because
+some backend, or every backend, could not be reached. Chat asks understudy to
+*serve this*, and there failure is failure: a request naming a model no usable
+backend can serve is an error carrying the reason. The consequence is deliberate —
+a total upstream outage renders as an empty catalog rather than an error, and the
+operator learns of it from the log rather than the response.
+
+A consumer wanting stricter behavior enforces it in its own `TokenValidator`,
+before handing understudy a configuration. Routability as *understudy* defines it
+(a registered `provider_type`) is not visible from there; exposing the registered
+set would make it so, and is deliberately not built until a consumer needs it.
 
 **Stalls: two axes, three dispositions.** Whether a stalled request can be
 salvaged turns on two independent facts. **Replayability** is set by the header
