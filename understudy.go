@@ -1274,6 +1274,18 @@ func (s *server) resolveBackend(b Backend) (sel selection, candidate bool) {
 	return selection{cfg: b.Config, handler: h}, true
 }
 
+// firstCandidateBackend returns the routable backend that sorts first by name,
+// so a name-only model resolves deterministically rather than by map iteration
+// order. found=false means no configured backend is routable at all.
+func (s *server) firstCandidateBackend(backends map[string]Backend) (name string, sel selection, found bool) {
+	for _, backendName := range slices.Sorted(maps.Keys(backends)) {
+		if sel, ok := s.resolveBackend(backends[backendName]); ok {
+			return backendName, sel, true
+		}
+	}
+	return "", selection{}, false
+}
+
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
@@ -1513,31 +1525,27 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			prefix, bare, ok := strings.Cut(model, "/")
 			if !ok {
-				for _, bname := range slices.Sorted(maps.Keys(backend.Backends)) {
-					bval := backend.Backends[bname]
-					selected, isCandidate := s.resolveBackend(bval)
-					if !isCandidate {
-						continue
-					}
-					catalog, cerr := selected.handler.Models(r.Context(), selected.cfg)
-					if cerr != nil {
-						return "", resolveError{cerr}
-					}
-					if len(catalog) == 0 {
-						return "", resolveError{yerrors.WithHTTPStatus(http.StatusBadGateway, fmt.Errorf("backend %q advertises no models", bname))}
-					}
-					parsedBackendName = bname
-					upstreamModel = catalog[0].ID
-					if requestedModel != DefaultLogicalModel {
-						s.logger.WarnContext(r.Context(), "requested model is not configured, using default",
-							slog.String("model_requested", requestedModel),
-							slog.String("model_resolved", parsedBackendName+"/"+upstreamModel),
-						)
-					}
-					return upstreamModel, nil
+				backendName, selected, found := s.firstCandidateBackend(backend.Backends)
+				if !found {
+					// Nothing resolved: parsedBackendName stays empty, which this
+					// function reports as errNoBackendConfigured once rewriteModel
+					// returns.
+					upstreamModel = model
+					return model, nil
 				}
-				upstreamModel = model
-				return model, nil
+				if requestedModel != DefaultLogicalModel {
+					return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
+				}
+				catalog, cerr := selected.handler.Models(r.Context(), selected.cfg)
+				if cerr != nil {
+					return "", resolveError{cerr}
+				}
+				if len(catalog) == 0 {
+					return "", resolveError{yerrors.WithHTTPStatus(http.StatusBadGateway, fmt.Errorf("backend %q advertises no models", backendName))}
+				}
+				parsedBackendName = backendName
+				upstreamModel = catalog[0].ID
+				return upstreamModel, nil
 			}
 			parsedBackendName = prefix
 			upstreamModel = bare

@@ -42,6 +42,6 @@ Least degradation: a target understudy cannot use is one target's problem.
   `default` request against `{broken, good}` fails on `broken` while `good`
   could have served it.
 
-Distinct from [reject-unconfigured-logical-model.md](reject-unconfigured-logical-model.md):
-that one is a name with no targets at all, this one is a target list whose
+Not the same defect as an unconfigured logical model, which is a name with no
+targets at all and is now rejected outright; this one is a target list whose
 members are unequally usable.
