@@ -13,28 +13,10 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
-The per-`(backend, model)` health substrate this feature was scoped around is
-built: `targetHealth{failingSince, readmitAt, …}` keyed by `identity()`, a
-duration-based `pickTarget` failover walk (`defaultFailoverThreshold` 15s) with
-half-open re-probes, and 429 demotion (`classifyLimit` → `recordRateLimited`). So
-failover-first exists and a sustained 429 now accrues a streak. What remains:
-
 - **Graduated injected backoff.** understudy still injects only a **fixed** 60s
   `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
   `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
   below.
-- **Terminal-threshold trip on a header-less streak.** The terminal `400` reject
-  fires only on an *advertised* `Retry-After` past the 2m cap; a header-less
-  5xx/429 storm that exhausts every target just returns the last one instead of
-  escalating. Trip into the 400 once a target's streak crosses the terminal
-  threshold with nowhere to fail over.
-- **Streak accrual for short/transient 429s.** A 429 with a *sub-threshold*
-  `Retry-After` (< `rateLimitDemotionThreshold`, 30s) classifies as
-  `transientRate` and neither demotes nor shrinks — so the 2026-07-09 gemini
-  free-tier loop (`review-standard` → `google/gemini-2.5-flash`, ~28s
-  `Retry-After` honored and retried ~7 min with zero failover) still would not
-  accrue. A recurring sub-threshold 429 must advance the streak and eventually
-  redirect; otherwise "honor as-is" is a retry-the-same-dead-target-forever trap.
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
@@ -57,10 +39,7 @@ the interval up first.
 **Unresolved (v1 rung):** the **graduated** injected-backoff assumes opencode
 honors an understudy-*injected* `Retry-After` on a retryable response — still
 unconfirmed (the 2026-07-03 repro drove only the plain 502 storm, not injection).
-The header-less terminal trip and the short-429 accrual need no such assumption
-(they reuse the shipped reject and the existing streak/`pickTarget` redirect), so
-they can land first. The lindy-side [[review-beat-idle-timeout]] is a coarse
-stopgap this supersedes.
+The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
 
 ## Mechanism
 
@@ -98,14 +77,6 @@ from the current target:
    **redirect** to the next target (it becomes current).
 3. **No alternate (or all exhausted), failing longer than the TERMINAL
    threshold** → **rewrite to terminal 400** (the reject's terminal case).
-
-Plus: a short *upstream* `Retry-After` → honor it for the in-place wait (don't
-synthesize over a real header), **but still accrue the target's streak** —
-honoring the header and advancing `failingSince` are orthogonal. A target that
-keeps re-arming a sub-terminal `Retry-After` (free-tier quota exhaustion) must
-still cross the FAILOVER threshold and redirect; otherwise "honor as-is" is a
-retry-the-same-dead-target-forever trap. Reset the streak only on success. The
-stateless reject is the degenerate version with no health state.
 
 **Thresholds are durations, not failure counts.** understudy serves many clients,
 so a count-based trip fires at volume-dependent wall-clock intervals (10 clients

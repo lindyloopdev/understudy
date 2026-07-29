@@ -332,6 +332,69 @@ only where that delay provably lies. (The delay itself is still read from messag
 endpoint changes, so prose remains the resilient source; the quota id is the one
 structured field we depend on.)
 
+**Recovery probing is demand-triggered and off the request path.**
+<a id="recovery-probing"></a> A demoted target is re-admitted by a half-open
+probe, and that probe is neither carried by a client request nor driven by a
+standing timer. A request arriving for a logical model whose candidate list holds
+a target due for a check is **served immediately by the first healthy target**,
+and the probe is launched **asynchronously**; its outcome lands in the health map
+for the next request to read. Demand is the trigger, so an idle install — a
+single user away for a long weekend — issues nothing at all; but no client ever
+pays the probe's latency, which for a stalled target is the full header-stall gate
+and for a slow 5xx is worse.
+
+Both alternatives are rejected. A **standing background timer** polls on a
+schedule set by the outage's length rather than by anyone's need, so its cost
+grows while nobody is waiting — wrong for the single-user installation understudy
+is first deployed into. **Probing in-band** — routing a live request to a target
+believed dead, as a demoted target's next caller — spends a client's latency, and
+sometimes a hard failure, on a target the failover list can already route around.
+A middle option, proactive polling gated on *recent activity*, is also rejected:
+during active use the traffic already is the clock (a beat's requests arrive
+seconds apart, so a staleness check on arrival fires about as often as a timer
+would), and where traffic is sparse the lag costs one request served by a fallback
+rather than the preferred target — a cost-order regression, not an outage. Not
+worth a timer, a lifecycle, and an activity window.
+
+The probe is a **synthetic minimal completion**, never the triggering client's
+body: that payload is the client's own data, and replaying it bills tokens for a
+response nobody reads. It must exercise the **chat** path, the only one that tests
+the same credential, balance, and quota bucket a real request does — `/v1/models`
+shares neither the billing check nor the quota. A probe against a target still
+down bills nothing (a 429, 402, or 5xx is free), so the probe's cost is paid only
+on the success it is looking for.
+
+**The schedule escalates with the outage's age, jittered, and capped.** The
+interval grows from `failingSince` — the hazard of recovery declines with how long
+the outage has run, not with how many times understudy happened to look, so age is
+the honest independent variable, and it is the one the failover and terminal
+thresholds already key on. It is **capped low** (≈15m): at that rate a dead target
+costs under a hundred free probes a day, so growth past it buys rounding error
+while making worst-case detection unbounded — worst precisely when an operator has
+just paid and expects work to resume. Jitter, for the same reason the synthesized
+backoff needs it; reset to base on success. A known `readmitAt` **supersedes the
+schedule entirely** — there is nothing to discover, the advertised time is the
+answer.
+
+**Credential rotation needs no probe.** Health is keyed on the canonical
+`(url + key + model)`, so a rotated key is a *different* entry, healthy by
+construction: the demotion stays pinned to the credential that actually failed and
+the new one is live on its first request. The schedule therefore covers only
+*same-credential* recovery — an un-suspended account, a propagation delay, a
+topped-up balance (`402`, which no rotation heals and which the operator expects to
+clear the moment they pay).
+
+Two consequences to build against. understudy **originates traffic it was not
+asked to send**, the same charter expansion the synthesized backoff makes — pure
+relay toward controller — and is bounded the same way: one probe in flight per
+target, only while that target sits in a live candidate list. And a probe
+**outlives the request that triggered it**, so it cannot borrow that request's
+context or credential lifetime; it needs a server-scoped lifetime, a copy of the
+config taken at trigger, and single-flight so concurrent arrivals launch one probe,
+not many. An explicit operator signal (a "recheck now" on the daemon's control
+plane, §Control plane) beats any schedule for the case the operator can see
+coming; the schedule is the unattended fallback.
+
 **Request disposition: a Retry-After ladder.** Given a retryable failure and a
 healthy next target, understudy's disposition is gated by the remaining
 `Retry-After` against a **wait budget** — the tolerable in-request delay before

@@ -199,6 +199,10 @@ type server struct {
 	providers map[string]providers.Handler
 
 	failoverThreshold time.Duration
+	// terminalThreshold is how long a target may keep failing, with nowhere left
+	// to fail over to, before understudy stops relaying the retryable failure and
+	// hard-fails to the non-retryable reject.
+	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
 	headerStallGate   time.Duration
 
@@ -457,6 +461,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		logger:                   slog.Default(), //nolint:forbidigo // deliberate fallback when no WithLogger option is given; the rule targets implicit logging elsewhere
 		providers:                make(map[string]providers.Handler),
 		failoverThreshold:        defaultFailoverThreshold,
+		terminalThreshold:        maxPassthroughRetryAfter,
 		recoveryInterval:         defaultRecoveryInterval,
 		headerStallGate:          defaultHeaderStallGate,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
@@ -645,6 +650,39 @@ func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends 
 	s.health[id] = h
 }
 
+// failingFor reports how long t's current failure streak has run, or zero when
+// t is healthy.
+func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.health[healthKey(t, backends)]
+	if !ok {
+		return 0
+	}
+	return time.Since(h.failingSince)
+}
+
+// terminalFailure marks err terminal — the response path rejects it as
+// non-retryable rather than relaying it — when remaining is empty and t's
+// streak has crossed the terminal threshold. Both are required: a long streak
+// on a target the list can still route around is a demoted target, not an
+// exhausted list.
+func (s *server) terminalFailure(t Target, remaining []Target, backends map[string]Backend, err error) error {
+	if t.backend == "" || len(remaining) > 0 || s.failingFor(t, backends) < s.terminalThreshold {
+		return err
+	}
+	return terminalError{err}
+}
+
+// terminalError marks an upstream failure understudy has stopped relaying. It
+// carries the verdict only — the backoff the reject advertises is the response
+// path's to decide.
+type terminalError struct{ error }
+
+// Unwrap returns the underlying error so that errors.Is/As and
+// yerrors.HTTPStatus can still traverse the chain.
+func (e terminalError) Unwrap() error { return e.error }
+
 // clearFailure marks t healthy, ending any failure streak. It emits the
 // "backend up" transition iff the streak was previously announced "backend
 // down", keeping the up/down log pair symmetric.
@@ -743,8 +781,9 @@ type limitClassification struct {
 	hasRetryAfter bool
 	// retryAfter is the remaining Retry-After delay (valid when hasRetryAfter).
 	retryAfter time.Duration
-	// shouldReject reports a Retry-After beyond maxPassthroughRetryAfter, which
-	// understudy fails fast rather than forward.
+	// shouldReject reports a failure understudy fails fast rather than forwards:
+	// a Retry-After beyond maxPassthroughRetryAfter, or a failure the walk gave up
+	// on (a terminalError), which carries no Retry-After condition at all.
 	shouldReject bool
 	// condition is the nature of the limit; the shrink path reads it to distinguish
 	// a concurrency limit (signalless) from a timed backoff.
@@ -767,6 +806,16 @@ func classifyLimit(err error) limitClassification {
 		sig.retryAfter = time.Until(ra.RetryAfter())
 	}
 	sig.shouldReject = sig.hasRetryAfter && sig.retryAfter > maxPassthroughRetryAfter
+	// A failure the walk gave up on rejects on its own terms: the streak, not an
+	// advertised Retry-After, is what crossed the threshold.
+	if _, ok := errors.AsType[terminalError](err); ok {
+		sig.shouldReject = true
+		// Only a failure carrying no upstream backoff needs a synthesized one; the
+		// upstream's own delay is the honest value wherever it sent one.
+		if !sig.hasRetryAfter {
+			sig.retryAfter = maxPassthroughRetryAfter
+		}
+	}
 	switch {
 	case !sig.isRateLimit:
 		sig.condition = notRateLimited
@@ -1598,7 +1647,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
 			releaseHeld()
 			cancel(nil)
-			return clientFacing(ctx, err)
+			remaining := untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
+			return s.terminalFailure(chosen, remaining, backend.Backends, clientFacing(ctx, err))
 		}
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
