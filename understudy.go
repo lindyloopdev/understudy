@@ -134,13 +134,24 @@ var errHeaderStall = errors.New("upstream produced no response header before the
 // targetHealth tracks a target's failure streak: failingSince is when the streak
 // began; lastProbe is when the target was last attempted; readmitAt is a known
 // re-admission time from an advertised Retry-After, or zero if none; downLogged
-// is whether the "backend down" transition has been logged.
+// is whether the "backend down" transition has been logged; lastTouch is when
+// the entry was last written, the age the eviction sweep measures.
 type targetHealth struct {
 	failingSince time.Time
 	lastProbe    time.Time
 	readmitAt    time.Time
 	downLogged   bool
+	lastTouch    time.Time
 }
+
+// healthTTL is how long a health entry may sit untouched before the
+// sweep drops it. An entry is otherwise removed only by a success through its
+// own canonical (url + key + model), so a rotated credential or a withdrawn
+// backend strands one forever — no live target can produce the key again. Age is
+// the only proxy understudy has for that, since the backend set arrives per
+// request. It is set far above the recovery-probe schedule so a demotion that is
+// still being probed is never mistaken for a stranded one.
+const healthTTL = 24 * time.Hour
 
 // defaultMaxConcurrentPerUpstream is the per-account limiter's cold-start
 // allowance. It is a starting point, not a ceiling: grow() raises the cap toward
@@ -539,6 +550,7 @@ func (s *server) pickTarget(targets []Target, backends map[string]Backend) Targe
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	s.evictStaleHealth(now)
 	for _, t := range targets {
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
@@ -552,11 +564,13 @@ func (s *server) pickTarget(targets []Target, backends map[string]Backend) Targe
 			}
 			h.readmitAt = time.Time{}
 			h.lastProbe = now
+			h.lastTouch = now
 			s.health[id] = h
 			return t
 		}
 		if now.Sub(h.lastProbe) >= s.recoveryInterval {
 			h.lastProbe = now
+			h.lastTouch = now
 			s.health[id] = h
 			return t
 		}
@@ -593,7 +607,19 @@ func (s *server) noteBackendDown(id string, t Target, h targetHealth) {
 		slog.String("model", t.model),
 	)
 	h.downLogged = true
+	h.lastTouch = time.Now()
 	s.health[id] = h
+}
+
+// evictStaleHealth drops every entry untouched for healthTTL — the ones no live
+// target can reach any more, since a reachable demotion is re-stamped by the
+// probes and failures that keep measuring it. Caller holds s.mu.
+func (s *server) evictStaleHealth(now time.Time) {
+	for id, h := range s.health {
+		if now.Sub(h.lastTouch) >= healthTTL {
+			delete(s.health, id)
+		}
+	}
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
@@ -607,7 +633,7 @@ func (s *server) recordFailure(t Target, backends map[string]Backend) {
 	id := healthKey(t, backends)
 	if _, ok := s.health[id]; !ok {
 		now := time.Now()
-		s.health[id] = targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold)}
+		s.health[id] = targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold), lastTouch: now}
 	}
 }
 
@@ -617,7 +643,7 @@ func (s *server) recordFailure(t Target, backends map[string]Backend) {
 // half-open re-probe still waits a full recovery interval. readmitAt is the known
 // re-admission time from an advertised Retry-After, or zero for an unbounded one.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
-	return targetHealth{failingSince: now.Add(-s.failoverThreshold), lastProbe: now, readmitAt: readmitAt}
+	return targetHealth{failingSince: now.Add(-s.failoverThreshold), lastProbe: now, readmitAt: readmitAt, lastTouch: now}
 }
 
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
@@ -646,6 +672,7 @@ func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends 
 		h = s.demotedHealth(now, now.Add(retryAfter))
 	} else {
 		h.readmitAt = now.Add(retryAfter)
+		h.lastTouch = now
 	}
 	s.health[id] = h
 }
