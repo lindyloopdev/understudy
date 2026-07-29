@@ -2166,6 +2166,25 @@ var errorText = gocmp.Comparer(func(a, b error) bool {
 	return logRecordErrString(a) == logRecordErrString(b)
 })
 
+// errorEnvelope decodes the fields of understudy's error response a case may
+// assert on. Compared with assertedFields, a field left zero is one the case
+// does not assert, so each case pins only the aspect its behavior names.
+type errorEnvelope struct {
+	Error        errorDetail `json:"error"`
+	RetryAfterMS int         `json:"retry_after_ms"`
+}
+
+type errorDetail struct {
+	Type string `json:"type"`
+}
+
+// assertedFields ignores every field the want value leaves zero, so one
+// cmp.Diff over the whole struct still asserts only what a case set.
+var assertedFields = gocmp.FilterPath(func(p gocmp.Path) bool {
+	want, _ := p.Last().Values()
+	return want.IsValid() && want.IsZero()
+}, gocmp.Ignore())
+
 func TestChatCompletionsFailoverRouting(t *testing.T) {
 	t.Parallel()
 
@@ -2203,6 +2222,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		// when non-nil so the cases that are not about the log record stay silent
 		// on it.
 		wantFailedOver []Attempt
+		// wantEnvelope is the error response's asserted aspects; a field left zero
+		// is one this case's behavior does not name.
+		wantEnvelope errorEnvelope
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
 	// plus its stubbed round-trip: given the request and the 1-based call count, it
@@ -2389,6 +2411,75 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusBadGateway, wantBackend: "a"},
 			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
 			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should reject as non-retryable once a target has been failing past the terminal threshold with nowhere to fail over", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+		},
+	})
+
+	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway},
+			{
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{RetryAfterMS: 120000},
+			},
+		},
+	})
+
+	tests.Add("should keep relaying the upstream failure when a long-dead target is probed but an alternate remains untried", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadGateway,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				wantBackend:  "a",
+			},
+		},
+	})
+
+	tests.Add("should advertise the upstream's own backoff when the reject is terminal", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"600"}},
+				}, nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadRequest, wantEnvelope: errorEnvelope{RetryAfterMS: 600000}},
+			{
+				advance:      10*time.Minute + time.Second,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{RetryAfterMS: 600000},
+			},
 		},
 	})
 
@@ -2593,6 +2684,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					if d := testy.DiffJSON([]byte(s.wantBody), rr.Body.Bytes()); d != nil {
 						t.Errorf("step %d body: %s", i, d)
 					}
+				}
+				// A body that is not an error envelope leaves the fields zero, which
+				// only the cases asserting on them can fail on.
+				var envelope errorEnvelope
+				_ = json.Unmarshal(rr.Body.Bytes(), &envelope)
+				if d := gocmp.Diff(s.wantEnvelope, envelope, assertedFields); d != "" {
+					t.Errorf("step %d envelope (-want +got):\n%s", i, d)
 				}
 				if s.wantBackend != "" && lastDialed != s.wantBackend {
 					t.Errorf("step %d dialed %q want %q", i, lastDialed, s.wantBackend)

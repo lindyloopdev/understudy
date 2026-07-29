@@ -17,11 +17,6 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
   `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
   below.
-- **Terminal-threshold trip on a header-less streak.** The terminal `400` reject
-  fires only on an *advertised* `Retry-After` past the 2m cap; a header-less
-  5xx/429 storm that exhausts every target just returns the last one instead of
-  escalating. Trip into the 400 once a target's streak crosses the terminal
-  threshold with nowhere to fail over.
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
@@ -44,9 +39,7 @@ the interval up first.
 **Unresolved (v1 rung):** the **graduated** injected-backoff assumes opencode
 honors an understudy-*injected* `Retry-After` on a retryable response — still
 unconfirmed (the 2026-07-03 repro drove only the plain 502 storm, not injection).
-The header-less terminal trip needs no such assumption (it reuses the shipped
-reject and the existing streak/`pickTarget` redirect), so it can land first. The lindy-side [[review-beat-idle-timeout]] is a coarse
-stopgap this supersedes.
+The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
 
 ## Mechanism
 
