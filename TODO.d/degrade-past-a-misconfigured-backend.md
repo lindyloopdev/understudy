@@ -58,11 +58,10 @@ an undeduplicated log floods.
 Test surface: whatever asserts `model references unknown backend`, or a 500 from
 the retired pre-flight, for a backend that is declared rather than absent.
 
-**`/v1/models` answers its own question.** Skip unusable backends and stop
-aborting the listing when a catalog fetch fails — the `models` handler returns
-`clientFacing` on any backend's `Models` error today — making the endpoint
-effectively non-failing. Independent of the skip work: the chat path is what
-couples to it, the listing does not.
+**`/v1/models` answers its own question.** Skip unusable backends in the listing
+too, so a backend understudy cannot use contributes nothing instead of deciding
+the response. Independent of the skip work: the chat path is what couples to it,
+the listing does not.
 
 Test surface: three `/v1/models` cases turn from 500 into 200 — "should return 500
 when no backend configured", the sole nil-`BaseURL` case, and "should return 500

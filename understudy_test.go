@@ -1005,7 +1005,7 @@ func TestModels(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should map an upstream 5xx from openai.Models to 502 Bad Gateway", func(t *testing.T) test {
+	tests.AddFunc("should answer an empty listing when the only backend's catalog fetch fails", func(t *testing.T) test {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, `{"error":{"message":"boom"}}`)
@@ -1017,12 +1017,12 @@ func TestModels(t *testing.T) {
 					return openaiBackend(t, server.URL, "sk-models", nil), nil
 				},
 			},
-			wantStatus: http.StatusBadGateway,
-			wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":null}`,
 		}
 	})
 
-	tests.AddFunc("should render 502 when the upstream models response body is unparseable", func(t *testing.T) test {
+	tests.AddFunc("should answer an empty listing when the only backend's catalog response is unparseable", func(t *testing.T) test {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -1033,8 +1033,8 @@ func TestModels(t *testing.T) {
 					return openaiBackend(t, server.URL, "sk-models", nil), nil
 				},
 			},
-			wantStatus: http.StatusBadGateway,
-			wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":null}`,
 		}
 	})
 
@@ -1089,6 +1089,39 @@ func TestModels(t *testing.T) {
 		}},
 		wantStatus: http.StatusUnauthorized,
 		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
+	})
+
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the skip's reason is the
+	// operator's fact and reaches only the logger, so no case here asserts it. Pin
+	// that the skipped backend and its reason are logged at ERROR.
+	tests.AddFunc("should list the models of the backends that answer when another backend's catalog fetch fails", func(t *testing.T) test {
+		sick := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"catalog unavailable"}}`)),
+				Header:     http.Header{"Content-Type": {"application/json"}},
+			}, nil
+		})
+		good, err := url.Parse("http://good.example/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		down, err := url.Parse("http://down.example/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return test{
+			validator: &stubValidator{
+				ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+					return &BackendConfig{Backends: map[string]Backend{
+						"good": {ProviderType: "openai", Config: providers.Config{BaseURL: good, APIKey: "sk-good", HTTPClient: modelsClient}},
+						"down": {ProviderType: "openai", Config: providers.Config{BaseURL: down, APIKey: "sk-down", HTTPClient: sick}},
+					}}, nil
+				},
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":[{"id":"good/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
+		}
 	})
 
 	tests.Parallel()

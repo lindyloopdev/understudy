@@ -1288,7 +1288,14 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 		matched = true
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
-			return clientFacing(r.Context(), err)
+			// The listing answers what understudy can serve, so a backend that cannot
+			// answer contributes nothing rather than failing the request. The reason is
+			// the operator's fact and reaches the log alone.
+			s.logger.ErrorContext(r.Context(), "backend catalog unavailable",
+				slog.String("backend", name),
+				slog.Any("error", err),
+			)
+			continue
 		}
 		for i := range data {
 			data[i].ID = name + "/" + data[i].ID
