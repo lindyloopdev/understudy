@@ -32,10 +32,6 @@ import (
 // provider type. New provider types add their own constant alongside this one.
 const ProviderOpenAI = "openai"
 
-// DefaultLogicalModel is the reserved logical model the orchestrator requests when it
-// has no more specific one; understudy resolves it to a concrete target.
-const DefaultLogicalModel = "default"
-
 // openaiProvider implements [providers.Handler] over the openai package.
 type openaiProvider struct{}
 
@@ -1262,28 +1258,21 @@ type selection struct {
 	handler providers.Handler
 }
 
-// resolveBackend reports whether b is a candidate the proxy can route to: its
-// ProviderType has a registered handler. A non-candidate (unregistered type)
-// yields candidate=false, signalling the caller to skip it. Required-field
-// validation (e.g. BaseURL) is owned by the auth boundary, not here.
-func (s *server) resolveBackend(b Backend) (sel selection, candidate bool) {
+// resolveBackend reports whether b is a backend the proxy can route to, and why
+// not when it cannot: a nil error means routable, a non-nil error is the reason a
+// caller skips it. Required-field validation (e.g. BaseURL) is owned by the auth
+// boundary, not here.
+//
+// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no caller reads the reason
+// yet — they skip on any error and report what they reported when this returned a
+// bool. Retiring the auth boundary's pre-flight adds the missing-base-URL reason
+// and the callers that surface both.
+func (s *server) resolveBackend(b Backend) (selection, error) {
 	h, ok := s.providers[b.ProviderType]
 	if !ok {
-		return selection{}, false
+		return selection{}, fmt.Errorf("provider type %q has no registered handler", b.ProviderType)
 	}
-	return selection{cfg: b.Config, handler: h}, true
-}
-
-// firstCandidateBackend returns the routable backend that sorts first by name,
-// so a name-only model resolves deterministically rather than by map iteration
-// order. found=false means no configured backend is routable at all.
-func (s *server) firstCandidateBackend(backends map[string]Backend) (name string, sel selection, found bool) {
-	for _, backendName := range slices.Sorted(maps.Keys(backends)) {
-		if sel, ok := s.resolveBackend(backends[backendName]); ok {
-			return backendName, sel, true
-		}
-	}
-	return "", selection{}, false
+	return selection{cfg: b.Config, handler: h}, nil
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
@@ -1292,8 +1281,8 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	var all []providers.Model
 	matched := false
 	for name, b := range backend.Backends {
-		sel, candidate := s.resolveBackend(b)
-		if !candidate {
+		sel, err := s.resolveBackend(b)
+		if err != nil {
 			continue
 		}
 		matched = true
@@ -1525,27 +1514,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			prefix, bare, ok := strings.Cut(model, "/")
 			if !ok {
-				backendName, selected, found := s.firstCandidateBackend(backend.Backends)
-				if !found {
-					// Nothing resolved: parsedBackendName stays empty, which this
-					// function reports as errNoBackendConfigured once rewriteModel
-					// returns.
+				if len(backend.Backends) == 0 {
+					// Nothing is configured to have declared the model, so the absent
+					// configuration is the more useful answer: parsedBackendName stays
+					// empty, which this function reports as errNoBackendConfigured once
+					// rewriteModel returns.
 					upstreamModel = model
 					return model, nil
 				}
-				if requestedModel != DefaultLogicalModel {
-					return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
-				}
-				catalog, cerr := selected.handler.Models(r.Context(), selected.cfg)
-				if cerr != nil {
-					return "", resolveError{cerr}
-				}
-				if len(catalog) == 0 {
-					return "", resolveError{yerrors.WithHTTPStatus(http.StatusBadGateway, fmt.Errorf("backend %q advertises no models", backendName))}
-				}
-				parsedBackendName = backendName
-				upstreamModel = catalog[0].ID
-				return upstreamModel, nil
+				return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
 			}
 			parsedBackendName = prefix
 			upstreamModel = bare
@@ -1569,7 +1546,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		var sel selection
 		var usable bool
 		if ok {
-			sel, usable = s.resolveBackend(b)
+			var selErr error
+			sel, selErr = s.resolveBackend(b)
+			usable = selErr == nil
 		}
 		if !ok || !usable {
 			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))

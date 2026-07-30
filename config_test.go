@@ -397,43 +397,6 @@ func TestConfigResolve(t *testing.T) {
 	})
 }
 
-func TestConfigDefaultModel(t *testing.T) {
-	t.Parallel()
-
-	type test struct {
-		cfg  Config
-		want string
-	}
-
-	tests := testy.NewTable[test]()
-
-	tests.Add("should return the default logical model when a backend is configured", test{
-		cfg: Config{
-			Backends: map[string]BackendSpec{
-				"primary": {
-					ProviderType: "openai",
-					BaseURL:      "https://api.openai.com/v1",
-					APIKey:       "sk-test",
-				},
-			},
-		},
-		want: DefaultLogicalModel,
-	})
-
-	tests.Add("should return no model when no backend is configured", test{
-		cfg:  Config{},
-		want: "",
-	})
-
-	tests.Parallel()
-	tests.Run(t, func(t *testing.T, tt test) {
-		got := tt.cfg.DefaultModel()
-		if d := gocmp.Diff(tt.want, got); d != "" {
-			t.Errorf("DefaultModel() mismatch (-want +got):\n%s", d)
-		}
-	})
-}
-
 // TestRegisteredProvidersPassValidation guards the SSOT coupling: every
 // provider understudy registers by default must be accepted by the
 // provider_type oneof constraint on BackendSpec. Registering a provider

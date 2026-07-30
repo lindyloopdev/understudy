@@ -211,13 +211,3 @@ func (c Config) validate() error {
 	}
 	return nil
 }
-
-// DefaultModel returns the reserved default logical model when at least one
-// backend is configured, or "" when configless (the agent then selects its
-// own model).
-func (c Config) DefaultModel() string {
-	if len(c.Backends) == 0 {
-		return ""
-	}
-	return DefaultLogicalModel
-}
