@@ -32,8 +32,13 @@ import (
 // provider type. New provider types add their own constant alongside this one.
 const ProviderOpenAI = "openai"
 
-// DefaultLogicalModel is the reserved logical model the orchestrator requests when it
-// has no more specific one; understudy resolves it to a concrete target.
+// DefaultLogicalModel is the name [Config.DefaultModel] reports. Routing gives it
+// no special treatment: it resolves like any other name, through a logical model
+// the configuration declares, or not at all.
+//
+// TODO(TODO.d/remove-the-reserved-default-model.md): departs with
+// [Config.DefaultModel], its only remaining user — deciding which model a
+// consumer requests is not understudy's to answer.
 const DefaultLogicalModel = "default"
 
 // openaiProvider implements [providers.Handler] over the openai package.
@@ -1279,18 +1284,6 @@ func (s *server) resolveBackend(b Backend) (selection, error) {
 	return selection{cfg: b.Config, handler: h}, nil
 }
 
-// firstCandidateBackend returns the routable backend that sorts first by name,
-// so a name-only model resolves deterministically rather than by map iteration
-// order. found=false means no configured backend is routable at all.
-func (s *server) firstCandidateBackend(backends map[string]Backend) (name string, sel selection, found bool) {
-	for _, backendName := range slices.Sorted(maps.Keys(backends)) {
-		if sel, err := s.resolveBackend(backends[backendName]); err == nil {
-			return backendName, sel, true
-		}
-	}
-	return "", selection{}, false
-}
-
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
@@ -1530,27 +1523,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			prefix, bare, ok := strings.Cut(model, "/")
 			if !ok {
-				backendName, selected, found := s.firstCandidateBackend(backend.Backends)
-				if !found {
-					// Nothing resolved: parsedBackendName stays empty, which this
-					// function reports as errNoBackendConfigured once rewriteModel
-					// returns.
+				if len(backend.Backends) == 0 {
+					// Nothing is configured to have declared the model, so the absent
+					// configuration is the more useful answer: parsedBackendName stays
+					// empty, which this function reports as errNoBackendConfigured once
+					// rewriteModel returns.
 					upstreamModel = model
 					return model, nil
 				}
-				if requestedModel != DefaultLogicalModel {
-					return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
-				}
-				catalog, cerr := selected.handler.Models(r.Context(), selected.cfg)
-				if cerr != nil {
-					return "", resolveError{cerr}
-				}
-				if len(catalog) == 0 {
-					return "", resolveError{yerrors.WithHTTPStatus(http.StatusBadGateway, fmt.Errorf("backend %q advertises no models", backendName))}
-				}
-				parsedBackendName = backendName
-				upstreamModel = catalog[0].ID
-				return upstreamModel, nil
+				return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
 			}
 			parsedBackendName = prefix
 			upstreamModel = bare

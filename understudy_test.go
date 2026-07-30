@@ -181,28 +181,18 @@ func TestChatCompletionsValidation(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should resolve the default model via the registered provider's catalog", func(t *testing.T) test {
+	tests.AddFunc("should reserve no model name, rejecting default like any other undeclared model", func(t *testing.T) test {
 		decoy := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("no HTTP probe expected: catalog must come from the registered provider")
+			return nil, errors.New("no upstream call expected: no name is reserved, so no catalog is consulted to resolve one")
 		})
 		return test{
 			authHeader: "Bearer user-token",
 			validate: func(context.Context, string) (*BackendConfig, error) {
-				u, err := url.Parse("http://acme.example/v1")
-				if err != nil {
-					t.Fatal(err)
-				}
-				return &BackendConfig{Backends: map[string]Backend{
-					"acme": {ProviderType: "acme", Config: providers.Config{BaseURL: u, APIKey: "sk-acme", HTTPClient: decoy}},
-				}}, nil
+				return openaiBackend(t, "http://backend/v1", "sk-test", decoy), nil
 			},
-			opts: []Option{WithProvider("acme", fakeChatProvider{
-				response: `{"id":"served-by-acme"}`,
-				models:   []providers.Model{{ID: "frobnicator-1"}},
-			})},
 			body:       `{"model":"default","messages":[{"role":"user","content":"hi"}]}`,
-			wantStatus: http.StatusOK,
-			wantBody:   `{"id":"served-by-acme"}`,
+			wantStatus: http.StatusNotFound,
+			wantBody:   `{"error":{"message":"unknown logical model \"default\"","type":"invalid_request_error"}}`,
 		}
 	})
 
@@ -855,6 +845,32 @@ func TestModels(t *testing.T) {
 
 	tests := testy.NewTable[test]()
 
+	tests.AddFunc("should omit a backend whose provider type has no registered handler", func(t *testing.T) test {
+		zeta, err := url.Parse("http://zeta.example/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		alpha, err := url.Parse("http://alpha.example/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return test{
+			validator: &stubValidator{
+				ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+					return &BackendConfig{Backends: map[string]Backend{
+						"alpha": {ProviderType: "unregistered", Config: providers.Config{BaseURL: alpha, APIKey: "sk-a"}},
+						"zeta":  {ProviderType: "acme", Config: providers.Config{BaseURL: zeta, APIKey: "sk-z"}},
+					}}, nil
+				},
+			},
+			opts: []Option{WithProvider("acme", fakeChatProvider{
+				models: []providers.Model{{ID: "zeta-gpt", Created: 1234567890, OwnedBy: "acme"}},
+			})},
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":[{"id":"zeta/zeta-gpt","created":1234567890,"owned_by":"acme"}]}`,
+		}
+	})
+
 	tests.AddFunc("should list models from the provider registered under the backend's provider type", func(t *testing.T) test {
 		decoy := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -1214,126 +1230,6 @@ func TestChatCompletionsForwardedModel(t *testing.T) {
 			check: func() {
 				if got := forwardedModel(t, forwarded); got != "gpt-4" {
 					t.Errorf("forwarded model: got %q, want %q", got, "gpt-4")
-				}
-			},
-		}
-	})
-
-	tests.AddFunc("should resolve the default logical model to the sole backend's first advertised model", func(t *testing.T) test {
-		var forwarded []byte
-		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
-			if strings.HasSuffix(req.URL.Path, "/v1/models") {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"m0"},{"id":"m1"}]}`)),
-					Header:     make(http.Header),
-				}, nil
-			}
-			forwarded, _ = io.ReadAll(req.Body)
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header:     make(http.Header),
-			}, nil
-		})
-		return test{
-			requestModel: "default",
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-			}},
-			check: func() {
-				if got := forwardedModel(t, forwarded); got != "m0" {
-					t.Errorf("forwarded model: got %q, want %q", got, "m0")
-				}
-			},
-		}
-	})
-
-	tests.AddFunc("should resolve the default logical model to the alphabetically-first backend's first model when several are configured", func(t *testing.T) test {
-		var forwarded []byte
-		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
-			switch {
-			case req.URL.Host == "alpha" && strings.HasSuffix(req.URL.Path, "/v1/models"):
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"alpha-gpt"}]}`)),
-					Header:     make(http.Header),
-				}, nil
-			case req.URL.Host == "zeta" && strings.HasSuffix(req.URL.Path, "/v1/models"):
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"zeta-gpt"}]}`)),
-					Header:     make(http.Header),
-				}, nil
-			default:
-				forwarded, _ = io.ReadAll(req.Body)
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{}`)),
-					Header:     make(http.Header),
-				}, nil
-			}
-		})
-		alphaURL, err := url.Parse("http://alpha/v1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		zetaURL, err := url.Parse("http://zeta/v1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return test{
-			requestModel: "default",
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: map[string]Backend{
-					"alpha": {ProviderType: "openai", Config: providers.Config{BaseURL: alphaURL, APIKey: "sk-a", HTTPClient: client}},
-					"zeta":  {ProviderType: "openai", Config: providers.Config{BaseURL: zetaURL, APIKey: "sk-z", HTTPClient: client}},
-				}}, nil
-			}},
-			check: func() {
-				if got := forwardedModel(t, forwarded); got != "alpha-gpt" {
-					t.Errorf("forwarded model: got %q, want %q", got, "alpha-gpt")
-				}
-			},
-		}
-	})
-
-	tests.AddFunc("should skip a backend whose provider type has no registered handler", func(t *testing.T) test {
-		var forwarded []byte
-		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
-			if strings.HasSuffix(req.URL.Path, "/v1/models") {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"zeta-gpt"}]}`)),
-					Header:     make(http.Header),
-				}, nil
-			}
-			forwarded, _ = io.ReadAll(req.Body)
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header:     make(http.Header),
-			}, nil
-		})
-		alphaURL, err := url.Parse("http://alpha/v1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		zetaURL, err := url.Parse("http://zeta/v1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return test{
-			requestModel: "default",
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: map[string]Backend{
-					"alpha": {ProviderType: "unregistered", Config: providers.Config{BaseURL: alphaURL, APIKey: "sk-a", HTTPClient: client}},
-					"zeta":  {ProviderType: "openai", Config: providers.Config{BaseURL: zetaURL, APIKey: "sk-z", HTTPClient: client}},
-				}}, nil
-			}},
-			check: func() {
-				if got := forwardedModel(t, forwarded); got != "zeta-gpt" {
-					t.Errorf("forwarded model: got %q, want %q", got, "zeta-gpt")
 				}
 			},
 		}
@@ -3154,73 +3050,6 @@ func TestWriteJSONError(t *testing.T) {
 		}
 		if d := testy.DiffJSON([]byte(tt.wantBody), rec.Body.Bytes()); d != nil {
 			t.Errorf("unexpected body: %s", d)
-		}
-	})
-}
-
-func TestChatCompletionsLogicalModelResolutionError(t *testing.T) {
-	t.Parallel()
-
-	type test struct {
-		modelsStatus int
-		modelsBody   string
-		wantStatus   int
-		wantLogError string
-	}
-
-	tests := testy.NewTable[test]()
-	tests.Add("should return 502 when the sole backend advertises no models", test{
-		modelsStatus: http.StatusOK,
-		modelsBody:   `{"data":[]}`,
-		wantStatus:   http.StatusBadGateway,
-		wantLogError: `backend "openai" advertises no models`,
-	})
-	tests.Add("should surface the upstream status when the models fetch fails", test{
-		modelsStatus: http.StatusNotFound,
-		modelsBody:   `{"error":{"message":"no such endpoint","type":"invalid_request_error"}}`,
-		wantStatus:   http.StatusNotFound,
-		wantLogError: `upstream returned status 404: no such endpoint`,
-	})
-
-	tests.Parallel()
-	tests.Run(t, func(t *testing.T, tt test) {
-		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
-			if strings.HasSuffix(req.URL.Path, "/v1/models") {
-				return &http.Response{
-					StatusCode: tt.modelsStatus,
-					Body:       io.NopCloser(strings.NewReader(tt.modelsBody)),
-					Header:     make(http.Header),
-				}, nil
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{}`)),
-				Header:     make(http.Header),
-			}, nil
-		})
-		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-		}}
-		srv := New(validator, WithLogger(testLogger(t)))
-
-		body := strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer user-token")
-		req.Header.Set("Content-Type", "application/json")
-
-		ctx := WithLogCtx(req.Context())
-		rr := httptest.NewRecorder()
-		srv.ServeHTTP(rr, req.WithContext(ctx))
-
-		if rr.Code != tt.wantStatus {
-			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
-		}
-
-		if rec, _ := LogRecordFromContext(ctx); rec.Err == nil || rec.Err.Error() != tt.wantLogError {
-			t.Errorf("unexpected recorded error: got %v, want %q", rec.Err, tt.wantLogError)
 		}
 	})
 }
