@@ -318,18 +318,25 @@ its own behavior. This is the first member of a growing category — later
 normalizations (dropping a `temperature` a strict target rejects, downgrading
 `response_format`, renaming `max_tokens`) likewise land with their own behavior.
 
-**The `default` logical model.** `default` is the reserved logical model lindy's
-built-in beats request. Resolution is mode-dependent:
+**understudy never picks a model, and reserves no model name.** Every logical
+model is one the operator declared, and a request resolves to a declared target or
+it fails; there is no name understudy treats specially and no catalog it consults
+to invent one. An OpenAI-compatible `/v1/models` is a flat list of ids carrying no
+capability metadata — embedding, audio, and image models sit in it beside the chat
+models — so an inferred pick can land on a model that cannot serve a chat
+completion at all, and understudy has no way to tell. Choosing between them is the
+quality judgment **Availability, not quality** reserves for the orchestrator, and
+inferring one also spends a live catalog fetch on the request path merely to
+resolve a name. Which of its logical models a consumer requests is the consumer's
+concern, not understudy's.
 
-- **Configless** (no `[gateway]` backends) — understudy is bypassed; opencode uses
-  its keyless free trial (per the credential-broker note above). No logical models.
-- **Configured** (≥1 backend) — `default` resolves to a **configured target**: the
-  operator's explicit `[gateway.models.default]` target list if set, otherwise a
-  fallback to a model from a configured backend's advertised catalog.
-  It **never** silently falls back to the configless free trial — the guarantees a
-  configured operator is paying for (budget caps, audit, kill switch, egress
-  control) must not be silently traded away. If no configured target resolves at
-  all, that is an error, not a free-trial fall.
+This is what makes the configless guarantee structural rather than a rule to
+enforce: routing reaches only declared targets, so a configured understudy has
+nowhere to silently fall back *to* — the budget caps, audit, kill switch, and
+egress control an operator is paying for cannot be traded away by a resolution
+understudy performs. Ease of first run is a **packaging** concern, answered by a
+shipped example configuration that declares its own models, not by understudy
+guessing.
 
 **Rate-limit reject.** A long upstream `Retry-After` (429/5xx) is converted to a
 non-retryable **400** before the agent sees it — opencode honors `Retry-After`

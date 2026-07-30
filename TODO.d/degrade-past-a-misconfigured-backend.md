@@ -33,8 +33,12 @@ Two steps, either shippable alone.
 
 **Skip unusable backends at selection, and retire the blanket pre-flight.** Drop
 the middleware loop, so a request is never failed for a backend it does not
-resolve to. This is the fix: a `default` request against `{broken, good}` reaches
-`good`, and a request resolving to `x/a` survives a malformed `y`.
+resolve to. This is the fix: a logical model with targets `[x/a, y/b, z/a]` serves
+from `x/a` while `y` is unusable, rather than failing at the trust boundary. A
+logical model spanning two backends is the only vehicle for this — the
+default-inference path that would otherwise exercise it is itself being removed by
+[[remove-the-reserved-default-model]], so land that first or the test written here
+tests code about to be deleted.
 
 Two things must land with it, not after:
 
@@ -46,19 +50,16 @@ Two things must land with it, not after:
 - **The chat path must report the real reason.** Once a malformed backend is no
   longer rejected up front, a direct request for `alpha/gpt-4` reaches
   `model references unknown backend "alpha"` — a falsehood the design forbids,
-  since `alpha` *is* configured. So fold `errNoBackendConfigured` into one error
-  naming the unresolvable model and carrying the skip reason where there is one,
-  and distinguish *unknown* from *known but unusable*. Deferring this ships a
+  since `alpha` *is* configured. So distinguish *unknown* from *known but
+  unusable*, and carry the skip reason into the error. Deferring this ships a
   knowingly false error message.
 
 Report the skip to the operator on `s.logger` at ERROR, deduplicated per condition
 the way `noteBackendDown` dedupes a streak — `Validate` runs on every request, so
 an undeduplicated log floods.
 
-Test surface: the `LogRecord` error-attr test pinning `no backend configured`
-(`chatCompletions` is its other consumer, where a name-only model resolved
-nothing), and whatever asserts `model references unknown backend` for a backend
-that is declared rather than absent.
+Test surface: whatever asserts `model references unknown backend`, or a 500 from
+the retired pre-flight, for a backend that is declared rather than absent.
 
 **`/v1/models` answers its own question.** Skip unusable backends and stop
 aborting the listing when a catalog fetch fails — the `models` handler returns
