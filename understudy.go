@@ -1262,16 +1262,21 @@ type selection struct {
 	handler providers.Handler
 }
 
-// resolveBackend reports whether b is a candidate the proxy can route to: its
-// ProviderType has a registered handler. A non-candidate (unregistered type)
-// yields candidate=false, signalling the caller to skip it. Required-field
-// validation (e.g. BaseURL) is owned by the auth boundary, not here.
-func (s *server) resolveBackend(b Backend) (sel selection, candidate bool) {
+// resolveBackend reports whether b is a backend the proxy can route to, and why
+// not when it cannot: a nil error means routable, a non-nil error is the reason a
+// caller skips it. Required-field validation (e.g. BaseURL) is owned by the auth
+// boundary, not here.
+//
+// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no caller reads the reason
+// yet — they skip on any error and report what they reported when this returned a
+// bool. Retiring the auth boundary's pre-flight adds the missing-base-URL reason
+// and the callers that surface both.
+func (s *server) resolveBackend(b Backend) (selection, error) {
 	h, ok := s.providers[b.ProviderType]
 	if !ok {
-		return selection{}, false
+		return selection{}, fmt.Errorf("provider type %q has no registered handler", b.ProviderType)
 	}
-	return selection{cfg: b.Config, handler: h}, true
+	return selection{cfg: b.Config, handler: h}, nil
 }
 
 // firstCandidateBackend returns the routable backend that sorts first by name,
@@ -1279,7 +1284,7 @@ func (s *server) resolveBackend(b Backend) (sel selection, candidate bool) {
 // order. found=false means no configured backend is routable at all.
 func (s *server) firstCandidateBackend(backends map[string]Backend) (name string, sel selection, found bool) {
 	for _, backendName := range slices.Sorted(maps.Keys(backends)) {
-		if sel, ok := s.resolveBackend(backends[backendName]); ok {
+		if sel, err := s.resolveBackend(backends[backendName]); err == nil {
 			return backendName, sel, true
 		}
 	}
@@ -1292,8 +1297,8 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	var all []providers.Model
 	matched := false
 	for name, b := range backend.Backends {
-		sel, candidate := s.resolveBackend(b)
-		if !candidate {
+		sel, err := s.resolveBackend(b)
+		if err != nil {
 			continue
 		}
 		matched = true
@@ -1569,7 +1574,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		var sel selection
 		var usable bool
 		if ok {
-			sel, usable = s.resolveBackend(b)
+			var selErr error
+			sel, selErr = s.resolveBackend(b)
+			usable = selErr == nil
 		}
 		if !ok || !usable {
 			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))
