@@ -211,20 +211,3 @@ func (c Config) validate() error {
 	}
 	return nil
 }
-
-// DefaultModel returns [DefaultLogicalModel] when at least one backend is
-// configured, or "" when configless (the agent then selects its own model).
-// Nothing here checks that a logical model of that name is declared, and routing
-// gives the name no special treatment — a consumer that requests it against a
-// configuration that never declared it is answered like any other unknown
-// logical model.
-//
-// TODO(TODO.d/remove-the-reserved-default-model.md): departs with
-// [DefaultLogicalModel] — which of understudy's logical models a consumer
-// requests is the consumer's to decide, from its own configuration.
-func (c Config) DefaultModel() string {
-	if len(c.Backends) == 0 {
-		return ""
-	}
-	return DefaultLogicalModel
-}

@@ -35,10 +35,7 @@ Two steps, either shippable alone.
 the middleware loop, so a request is never failed for a backend it does not
 resolve to. This is the fix: a logical model with targets `[x/a, y/b, z/a]` serves
 from `x/a` while `y` is unusable, rather than failing at the trust boundary. A
-logical model spanning two backends is the only vehicle for this — the
-default-inference path that would otherwise exercise it is itself being removed by
-[[remove-the-reserved-default-model]], so land that first or the test written here
-tests code about to be deleted.
+logical model whose targets span two backends is the vehicle for the test.
 
 Two things must land with it, not after:
 

@@ -32,15 +32,6 @@ import (
 // provider type. New provider types add their own constant alongside this one.
 const ProviderOpenAI = "openai"
 
-// DefaultLogicalModel is the name [Config.DefaultModel] reports. Routing gives it
-// no special treatment: it resolves like any other name, through a logical model
-// the configuration declares, or not at all.
-//
-// TODO(TODO.d/remove-the-reserved-default-model.md): departs with
-// [Config.DefaultModel], its only remaining user — deciding which model a
-// consumer requests is not understudy's to answer.
-const DefaultLogicalModel = "default"
-
 // openaiProvider implements [providers.Handler] over the openai package.
 type openaiProvider struct{}
 
