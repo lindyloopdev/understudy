@@ -835,6 +835,16 @@ func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
 func TestModels(t *testing.T) {
 	t.Parallel()
 
+	// modelsClient answers any catalog fetch with a one-model list, so a backend a
+	// case declares usable behaves usably without reaching the network.
+	modelsClient := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"object":"list","data":[{"id":"gpt-4","created":1234567890,"owned_by":"openai"}]}`)),
+			Header:     http.Header{"Content-Type": {"application/json"}},
+		}, nil
+	})
+
 	type test struct {
 		authHeader string
 		validator  TokenValidator
@@ -966,7 +976,7 @@ func TestModels(t *testing.T) {
 			validator: &stubValidator{
 				ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 					return &BackendConfig{Backends: map[string]Backend{
-						"usable": {ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: "sk-ok"}},
+						"usable": {ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: "sk-ok", HTTPClient: modelsClient}},
 						"broken": {ProviderType: "openai"}, // nil Config
 					}}, nil
 				},
@@ -985,7 +995,7 @@ func TestModels(t *testing.T) {
 			validator: &stubValidator{
 				ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 					return &BackendConfig{Backends: map[string]Backend{
-						"usable": {ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: "sk-ok"}},
+						"usable": {ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: "sk-ok", HTTPClient: modelsClient}},
 						"broken": {ProviderType: "openai", Config: providers.Config{BaseURL: nil, APIKey: "sk-bad"}},
 					}}, nil
 				},
