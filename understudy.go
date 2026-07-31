@@ -557,7 +557,7 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	for _, t := range targets {
 		// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): exhausting every target
 		// this way falls through to a target that cannot serve.
-		if _, err := s.resolveBackend(backends[t.backend]); err != nil {
+		if _, err := s.resolveBackend(backends, t.backend); err != nil {
 			addLogFailedOver(ctx, t.backend, t.model, 0, err)
 			continue
 		}
@@ -1268,23 +1268,33 @@ type selection struct {
 	handler providers.Handler
 }
 
-// resolveBackend reports whether b is a backend the proxy can route to, and why
-// not when it cannot: a nil error means routable, a non-nil error is the reason a
-// caller skips it. It is the one place a backend is judged usable, for every
-// selection site, so a routable verdict promises a handler and a base URL.
+// errNoSuchBackend is the reason resolveBackend gives when the config declares no
+// backend under the name asked for, as opposed to declaring one understudy cannot
+// use. Callers that phrase the two differently match on it.
+var errNoSuchBackend = errors.New("no such backend")
+
+// resolveBackend reports whether the backend named name is one the proxy can route
+// to, and why not when it cannot: a nil error means routable, a non-nil error is
+// the reason a caller skips it. It is the one place that question is answered, for
+// every selection site, so a routable verdict promises a declared backend with a
+// handler and a base URL.
 //
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): build each reason once
-// rather than per call — pickTarget consults this for every target of every
-// request, so a statically unusable backend pays the construction forever.
-func (s *server) resolveBackend(b Backend) (selection, error) {
-	h, ok := s.providers[b.ProviderType]
-	if !ok {
-		return selection{}, fmt.Errorf("provider type %q has no registered handler", b.ProviderType)
+// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): build the two constructed
+// reasons below once rather than per call — pickTarget consults this for every
+// target of every request, so a statically unusable backend pays it forever.
+func (s *server) resolveBackend(backends map[string]Backend, name string) (selection, error) {
+	backend, declared := backends[name]
+	if !declared {
+		return selection{}, errNoSuchBackend
 	}
-	if b.Config.BaseURL == nil {
+	h, ok := s.providers[backend.ProviderType]
+	if !ok {
+		return selection{}, fmt.Errorf("provider type %q has no registered handler", backend.ProviderType)
+	}
+	if backend.Config.BaseURL == nil {
 		return selection{}, errors.New("must provide base_url")
 	}
-	return selection{cfg: b.Config, handler: h}, nil
+	return selection{cfg: backend.Config, handler: h}, nil
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
@@ -1292,8 +1302,8 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 
 	var all []providers.Model
 	matched := false
-	for name, b := range backend.Backends {
-		sel, err := s.resolveBackend(b)
+	for name := range backend.Backends {
+		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
 			continue
 		}
@@ -1561,13 +1571,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return errNoBackendConfigured
 		}
 
-		b, ok := backend.Backends[parsedBackendName]
-		if !ok {
-			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))
-		}
 		// A configured-but-unusable backend is not an unknown one; the caller gets
 		// the real reason rather than a falsehood about what was declared.
-		sel, err := s.resolveBackend(b)
+		sel, err := s.resolveBackend(backend.Backends, parsedBackendName)
+		if errors.Is(err, errNoSuchBackend) {
+			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))
+		}
 		if err != nil {
 			return notFound(fmt.Errorf("model references unusable backend %q: %w", parsedBackendName, err))
 		}

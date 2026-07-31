@@ -29,22 +29,19 @@ is a valid answer for the listing whatever its cause).
   backends is simply an empty catalog. Test surface: "should return 500 when no
   backend configured".
 
-- **Build the skip reasons once, not per call.** `resolveBackend` constructs a fresh
-  error on each rejection — 145ns/16 B for the nil base URL, 568ns/64 B for an
-  unregistered provider type, against 22ns and zero allocations when the backend is
-  usable. A statically unusable backend never becomes usable, so it pays that on
-  every target evaluation of every request forever. A package-level sentinel covers
-  the base-URL case; the provider-type message interpolates, so it needs an error
-  type carrying the type name. Sentinels also give a consumer `errors.Is` to
-  distinguish a skip from a failed attempt, which the shared `FailedOver` list
-  otherwise leaves to reading the message.
+- **Build the remaining two skip reasons once, not per call.** `resolveBackend`
+  still constructs `must provide base_url` and `provider type %q has no registered
+  handler` fresh on each rejection, and a statically unusable backend pays that on
+  every target evaluation of every request forever, since nothing but a
+  configuration change can stop it recurring. A package-level value covers the
+  base-URL case; the provider-type message interpolates, so it needs an error type
+  carrying the type name.
 
-- **A target naming an absent backend reports a misleading reason.**
-  `backends[t.backend]` yields the zero `Backend`, whose empty `ProviderType` fails
-  the provider lookup, so the consumer reads `provider type "" has no registered
-  handler` when the truth is that no such backend is declared. The skip itself is
-  right; the reason blames the wrong thing, and it now travels to the consumer. No
-  case pins either.
+- **Give a consumer something to match on.** `errNoSuchBackend` is unexported, so a
+  consumer reading `FailedOver` can only tell a skip from a failed attempt by
+  reading the message. Decide whether the skip reasons become exported sentinels —
+  and whether that is a contract worth freezing — or whether the message is all a
+  consumer should rely on.
 
 ## Out of scope
 
