@@ -1523,9 +1523,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		cr := &countingReader{ReadCloser: io.NopCloser(bytes.NewReader(bodyBytes))}
 		body, err := rewriteModel(cr, func(model string) (string, error) {
 			requestedModel = model
+			// Nothing is resolved against a name the request never gave; the
+			// model-is-required check below answers it once the rewrite returns.
+			if model == "" {
+				return model, nil
+			}
 			if lm, ok := backend.Models[model]; ok {
 				if len(lm.Targets) == 0 {
-					return "", resolveError{yerrors.WithHTTPStatus(http.StatusInternalServerError, fmt.Errorf("logical model %q has no targets", model))}
+					return "", resolveError{notFound(fmt.Errorf("logical model %q has no targets", model))}
 				}
 				logicalTargets = lm.Targets
 				// A within-request failover has just demoted the prior target, but
@@ -1541,11 +1546,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if !ok {
 				if len(backend.Backends) == 0 {
 					// Nothing is configured to have declared the model, so the absent
-					// configuration is the more useful answer: parsedBackendName stays
-					// empty, which this function reports as errNoBackendConfigured once
-					// rewriteModel returns.
-					upstreamModel = model
-					return model, nil
+					// configuration is the more useful answer than calling the model
+					// unknown.
+					return "", resolveError{notFound(fmt.Errorf("no backend configured to serve model %q", model))}
 				}
 				return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
 			}

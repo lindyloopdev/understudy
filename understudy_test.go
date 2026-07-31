@@ -506,6 +506,24 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should reject an empty model as a bad request", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{
+				Backends: map[string]Backend{
+					"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a"}},
+				},
+				Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "gpt-4"}}}},
+			}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"model is required","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
 	tests.AddFunc("should return 400 with invalid_request_error when the request omits the model field", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -543,7 +561,28 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should return 500 when a logical model has no targets", func(t *testing.T) test {
+	tests.AddFunc("should tell the caller a model whose every target is unusable cannot be served", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{
+				Backends: map[string]Backend{
+					"broken": {ProviderType: "openai", Config: providers.Config{APIKey: "sk-a"}},
+				},
+				Models: map[string]LogicalModel{"m": {Targets: []Target{
+					{backend: "broken", model: "gpt-4"},
+					{backend: "broken", model: "gpt-4o"},
+				}}},
+			}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusNotFound,
+			wantBody:            `{"error":{"message":"model references unusable backend \"broken\": must provide base_url","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	tests.AddFunc("should tell the caller why a model declaring no targets cannot be served", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{
 				Backends: map[string]Backend{
@@ -555,8 +594,8 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		return test{
 			server:              New(validator, WithLogger(testLogger(t))).(*server),
 			requestBody:         `{"model":"empty","messages":[{"role":"user","content":"hi"}]}`,
-			wantStatus:          http.StatusInternalServerError,
-			wantBody:            `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus:          http.StatusNotFound,
+			wantBody:            `{"error":{"message":"logical model \"empty\" has no targets","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
@@ -668,15 +707,15 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should return 500 when the model has no backend prefix and none is configured", func(t *testing.T) test {
+	tests.AddFunc("should tell the caller no backend is configured to serve the model it named", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: nil}, nil
 		}}
 		return test{
 			server:      New(validator, WithLogger(testLogger(t))).(*server),
 			requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			wantStatus:  http.StatusInternalServerError,
-			wantBody:    `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus:  http.StatusNotFound,
+			wantBody:    `{"error":{"message":"no backend configured to serve model \"gpt-4\"","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{
 				"Content-Type": {"application/json"},
 			},
@@ -1998,7 +2037,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `no backend configured`},
+		want:        map[string]any{"error": `no backend configured to serve model "gpt-4"`},
 	})
 
 	tests.AddFunc("should log upstream_status from successful chat-completions", func(t *testing.T) test {
