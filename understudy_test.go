@@ -506,6 +506,21 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should report an empty backend name as unknown rather than as no backend configured", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a"}},
+			}}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusNotFound,
+			wantBody:            `{"error":{"message":"model references unknown backend \"\"","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
 	tests.AddFunc("should reject an empty model as a bad request", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{

@@ -1566,10 +1566,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return badRequest(errors.New("model is required"))
 		}
 
-		if parsedBackendName == "" {
-			return errNoBackendConfigured
-		}
-
 		// A configured-but-unusable backend is not an unknown one; the caller gets
 		// the real reason rather than a falsehood about what was declared.
 		sel, err := s.resolveBackend(backend.Backends, parsedBackendName)

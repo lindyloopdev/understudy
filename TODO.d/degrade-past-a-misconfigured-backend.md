@@ -10,14 +10,6 @@ the skipping exhausted the candidates), "A list emptied by misconfiguration answ
 targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
 valid answer for the listing whatever its cause).
 
-- **A model reference beginning with `/` answers "no backend configured" when
-  backends are configured.** `strings.Cut("/gpt-4", "/")` yields an empty prefix,
-  which leaves `parsedBackendName` empty and reaches `errNoBackendConfigured` — a
-  500 whose message is false whenever the config declares anything. This is a
-  malformed reference rather than an exhausted candidate list, so the 404 rule above
-  does not settle it: decide what a caller who names a model understudy cannot parse
-  should be told. No case covers it.
-
 - **Surface the first failure, not the last target.** `pickTarget` returns
   `targets[len(targets)-1]` when every target is unusable, so the reason the caller
   reads is whichever backend sorts last rather than what first went wrong. Every
@@ -34,10 +26,8 @@ valid answer for the listing whatever its cause).
   on `!matched`), which reads against "emptiness is a valid answer whatever its
   cause". Settle whether the listing may fail at all, or whether zero usable
   backends is simply an empty catalog. Test surface: "should return 500 when no
-  backend configured". This is the listing's own rule rather than the chat rule
-  above, but it is one of the two remaining uses of `errNoBackendConfigured`: retire
-  both and the error itself goes, along with a doc comment that describes only this
-  one of them.
+  backend configured". It is the sole remaining use of `errNoBackendConfigured`, so
+  retiring it retires the error too.
 
 - **Give a consumer something to match on.** `errNoSuchBackend` is unexported, so a
   consumer reading `FailedOver` can only tell a skip from a failed attempt by
