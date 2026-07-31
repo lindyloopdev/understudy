@@ -29,14 +29,6 @@ is a valid answer for the listing whatever its cause).
   backends is simply an empty catalog. Test surface: "should return 500 when no
   backend configured".
 
-- **Build the remaining two skip reasons once, not per call.** `resolveBackend`
-  still constructs `must provide base_url` and `provider type %q has no registered
-  handler` fresh on each rejection, and a statically unusable backend pays that on
-  every target evaluation of every request forever, since nothing but a
-  configuration change can stop it recurring. A package-level value covers the
-  base-URL case; the provider-type message interpolates, so it needs an error type
-  carrying the type name.
-
 - **Give a consumer something to match on.** `errNoSuchBackend` is unexported, so a
   consumer reading `FailedOver` can only tell a skip from a failed attempt by
   reading the message. Decide whether the skip reasons become exported sentinels —

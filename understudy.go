@@ -1278,10 +1278,6 @@ var errNoSuchBackend = errors.New("no such backend")
 // the reason a caller skips it. It is the one place that question is answered, for
 // every selection site, so a routable verdict promises a declared backend with a
 // handler and a base URL.
-//
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): build the two constructed
-// reasons below once rather than per call — pickTarget consults this for every
-// target of every request, so a statically unusable backend pays it forever.
 func (s *server) resolveBackend(backends map[string]Backend, name string) (selection, error) {
 	backend, declared := backends[name]
 	if !declared {
