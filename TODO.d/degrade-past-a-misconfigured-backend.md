@@ -5,17 +5,24 @@
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Operator and caller
 learn different things" (the skip reason reaches the operator through the request's
 `LogRecord`), "The reason travels with the skip" (the terminal error carries it when
-the skipping exhausted the candidates), and "Two endpoints, two answers" (emptiness
-is a valid answer for the listing whatever its cause).
+the skipping exhausted the candidates), "A list emptied by misconfiguration answers
+404, not 500" (which ending each exhaustion gets, and that the rule is about usable
+targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
+valid answer for the listing whatever its cause).
 
-- **Decide what a request gets when no target is usable.** `pickTarget` returns
-  `targets[len(targets)-1]` when it falls off the end, which is reachable with every
-  target unusable — so the caller's answer comes from whatever that target happens
-  to do rather than from a decision. The design forbids the "unknown backend"
-  falsehood but does not pick the replacement status: a truthful 404 carries the
-  reason to the caller, while a 500 is honest about whose fault it is but has its
-  body rewritten to "Internal Server Error" by `writeJSONError`, so the reason
-  reaches only the log.
+- **A model reference beginning with `/` answers "no backend configured" when
+  backends are configured.** `strings.Cut("/gpt-4", "/")` yields an empty prefix,
+  which leaves `parsedBackendName` empty and reaches `errNoBackendConfigured` — a
+  500 whose message is false whenever the config declares anything. This is a
+  malformed reference rather than an exhausted candidate list, so the 404 rule above
+  does not settle it: decide what a caller who names a model understudy cannot parse
+  should be told. No case covers it.
+
+- **Surface the first failure, not the last target.** `pickTarget` returns
+  `targets[len(targets)-1]` when every target is unusable, so the reason the caller
+  reads is whichever backend sorts last rather than what first went wrong. Every
+  reason is already on `FailedOver`; only the one promoted into the answer is
+  arbitrary. No case pins which one, so nothing has to change alongside.
 
 - **`/v1/models` reports no skip at all.** Its own `resolveBackend` rejection is a
   bare `continue`, so a backend that vanishes from the listing leaves no trace for
@@ -27,7 +34,10 @@ is a valid answer for the listing whatever its cause).
   on `!matched`), which reads against "emptiness is a valid answer whatever its
   cause". Settle whether the listing may fail at all, or whether zero usable
   backends is simply an empty catalog. Test surface: "should return 500 when no
-  backend configured".
+  backend configured". This is the listing's own rule rather than the chat rule
+  above, but it is one of the two remaining uses of `errNoBackendConfigured`: retire
+  both and the error itself goes, along with a doc comment that describes only this
+  one of them.
 
 - **Give a consumer something to match on.** `errNoSuchBackend` is unexported, so a
   consumer reading `FailedOver` can only tell a skip from a failed attempt by

@@ -187,6 +187,28 @@ own errors into falsehoods — a caller told a configured-but-unusable backend i
 whichever answer the request produces: the terminal error when the skipping
 exhausted the candidates, and the operator's diagnostic either way.
 
+**A list emptied by misconfiguration answers 404, not 500.** The two ways a
+candidate list runs out are not the same ending. Emptied by *health*, something is
+still worth attempting — a demoted target can serve again — so the request is made
+and the client receives the upstream's own answer, or the ladder's reject once the
+streak passes the terminal threshold (§Understudy, the Retry-After ladder). Emptied
+by *static unusability*, there is nothing to attempt: no upstream is called, and the
+client is told the model names no backend that can serve it, carrying the reason.
+
+That answer is a 404 even though the fault is the operator's, for three reasons.
+Least degradation already holds that an unusable backend costs that backend and not
+the request, so faults do not sum: if one misconfigured target still serves a
+request from a healthy sibling, three misconfigured targets are still only facts
+about themselves, and what decides the request is that nothing is left. Second, a
+5xx body is rewritten to its bare status text, so a 500 would discard the very
+reason the paragraph above requires to travel — 404 is the only status on which the
+requirement is satisfiable. Third, a model that cannot be served is the condition
+`invalid_request_error` already names, whatever put it in that state.
+
+The rule is about *usable targets*, not about how the list came to be empty. A
+logical model declaring no targets at all is the same condition as one whose every
+target is unusable, and answers the same way.
+
 **Operator and caller learn different things.** The caller gets the best available
 answer to the request it made; the reason a backend was skipped is the *operator's*
 fact, and it reaches the operator through the request's `LogRecord` rather than
