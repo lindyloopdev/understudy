@@ -189,10 +189,26 @@ exhausted the candidates, and the operator's diagnostic either way.
 
 **Operator and caller learn different things.** The caller gets the best available
 answer to the request it made; the reason a backend was skipped is the *operator's*
-fact and goes to understudy's own logger at ERROR — deduplicated per condition, not
-emitted per request, since a `TokenValidator` runs on every one. In an embedded
-deployment the two may be the same person; understudy must not assume it, so a
-caller's request is never failed to deliver an operator's diagnostic.
+fact, and it reaches the operator through the request's `LogRecord` rather than
+understudy's own logger. In an embedded deployment the two may be the same person;
+understudy must not assume it, so a caller's request is never failed to deliver an
+operator's diagnostic.
+
+Reporting the skip rather than logging it is what keeps understudy out of a policy
+it has no standing to set. A `TokenValidator` runs on every request, so a skip
+recurs on every request, and suppressing the repetition means choosing a unit to
+suppress it over — a unit understudy cannot see. Per process is wrong for a proxy
+that runs for weeks; per token assumes a token lifetime understudy is not told and
+which is static in the ordinary case; per elapsed interval is a number invented to
+stand in for a cadence the consumer knows and understudy does not. The consumer
+knows its own unit of work, so the fact is handed to it and it decides whether that
+becomes a log line, a metric, or nothing.
+
+A skip joins `FailedOver`, which already records the targets a request walked past,
+rather than a list of its own: the two differ in why the target did not serve, not
+in what the consumer is being told, and one list preserves the order a request
+actually walked them in — a skip and a failover can interleave, and two lists could
+not say which came first.
 
 **Two endpoints, two answers.** `/v1/models` asks *what can you serve* — emptiness
 is a valid answer whatever its cause, so unusable backends are skipped and a usable

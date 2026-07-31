@@ -533,21 +533,34 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.h.ServeHTTP(w, r)
 }
 
-// pickTarget returns the first target whose failure streak is within the
-// failover threshold (or that has none). A target past the threshold is skipped
+// pickTarget returns the first target that is usable at all and whose failure
+// streak is within the failover threshold (or that has none). A target whose
+// backend resolveBackend rejects is skipped before its health is consulted, and
+// never demoted: only a configuration change can make it usable, so a health
+// entry for it would be one no recovery probe could clear.
+//
+// Among the targets that remain, a target past the threshold is skipped
 // until a recovery interval has elapsed since its last probe, at which point it
 // is offered as a single half-open probe (stamping lastProbe so concurrent
 // requests within the cooldown still skip it). A target demoted with a known
 // re-admission time (readmitAt, from an advertised Retry-After) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
 // health preserved until the probe's outcome) — never half-open-probed early. If every target is past the threshold and not
-// due for a probe, it returns the last so a request always has somewhere to go.
-func (s *server) pickTarget(targets []Target, backends map[string]Backend) Target {
+// due for a probe, or every target was skipped as unusable, it returns the last so
+// a request always has somewhere to go — which means the returned target is itself
+// unusable when nothing was usable.
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) Target {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	s.evictStaleHealth(now)
 	for _, t := range targets {
+		// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): exhausting every target
+		// this way falls through to a target that cannot serve.
+		if _, err := s.resolveBackend(backends[t.backend]); err != nil {
+			addLogFailedOver(ctx, t.backend, t.model, 0, err)
+			continue
+		}
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
@@ -887,27 +900,31 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
-	// FailedOver holds the attempts a failover abandoned before the one the
-	// fields above describe, in the order they were tried. It is empty for a
-	// request that never failed over. A demotion is attributable through it: the
-	// target it demoted is here when the request moved on, and in the fields
-	// above when there was nowhere left to go.
+	// FailedOver holds the targets the request did not serve from, in the order it
+	// walked past them — those a failover abandoned, and those skipped as unusable
+	// before any call was made. It is empty for a request that served from its
+	// first target. A demotion is attributable through it: the target it demoted is
+	// here when the request moved on, and in the fields above when there was
+	// nowhere left to go. A skipped backend appears on every request that routes
+	// around it, since only a configuration change can clear it.
 	FailedOver []Attempt
 }
 
-// Attempt describes one upstream call a request made and abandoned, so a
-// failover leaves a record of the targets it walked past rather than only the
-// one that determined the client's outcome.
+// Attempt describes one target a request walked past, so a failover leaves a
+// record of them rather than only the one that determined the client's outcome.
+// Most were called and abandoned; one understudy could not use at all was never
+// called, and says so through Err with a zero UpstreamStatus.
 type Attempt struct {
 	// Backend is the backend the attempt called.
 	Backend string
 	// ModelUpstream is the upstream model name the attempt requested.
 	ModelUpstream string
 	// UpstreamStatus is the status the attempt answered with, or 0 when it never
-	// produced a response — a pre-header stall, or a transport failure.
+	// produced a response — a pre-header stall, a transport failure, or a backend
+	// skipped without being called.
 	UpstreamStatus int
 	// Err is the error that ended the attempt, carrying the upstream's own
-	// message where it sent one.
+	// message where it sent one, or why the backend could not be used at all.
 	Err error
 }
 
@@ -1002,14 +1019,6 @@ func authMiddleware(v TokenValidator, next http.Handler) http.Handler {
 			writeJSONError(r.Context(), w, err, errTypeServer)
 			return
 		}
-		// A backend with no base URL is malformed validator output; reject it here
-		// at the trust boundary before any handler runs, regardless of map iteration order.
-		for name, b := range backend.Backends {
-			if b.Config.BaseURL == nil {
-				writeJSONError(r.Context(), w, yerrors.WithHTTPStatus(http.StatusInternalServerError, fmt.Errorf("backend %q: must provide base_url", name)), errTypeServer)
-				return
-			}
-		}
 		ctx := context.WithValue(r.Context(), backendKey{}, backend)
 		ctx = context.WithValue(ctx, tokenKey{}, token)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -1064,8 +1073,9 @@ func cause(ctx context.Context, err error) error {
 	return err
 }
 
-// errNoBackendConfigured is returned when no entry in the resolved
-// [BackendConfig] maps to a registered provider type. It carries HTTP 500 so
+// errNoBackendConfigured is returned when no backend in the resolved
+// [BackendConfig] is usable — because it declares none, or because
+// [server.resolveBackend] rejects every one it declares. It carries HTTP 500 so
 // the error seam renders it as Internal Server Error.
 var errNoBackendConfigured = yerrors.WithHTTPStatus(http.StatusInternalServerError, errors.New("no backend configured"))
 
@@ -1260,17 +1270,19 @@ type selection struct {
 
 // resolveBackend reports whether b is a backend the proxy can route to, and why
 // not when it cannot: a nil error means routable, a non-nil error is the reason a
-// caller skips it. Required-field validation (e.g. BaseURL) is owned by the auth
-// boundary, not here.
+// caller skips it. It is the one place a backend is judged usable, for every
+// selection site, so a routable verdict promises a handler and a base URL.
 //
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no caller reads the reason
-// yet — they skip on any error and report what they reported when this returned a
-// bool. Retiring the auth boundary's pre-flight adds the missing-base-URL reason
-// and the callers that surface both.
+// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): build each reason once
+// rather than per call — pickTarget consults this for every target of every
+// request, so a statically unusable backend pays the construction forever.
 func (s *server) resolveBackend(b Backend) (selection, error) {
 	h, ok := s.providers[b.ProviderType]
 	if !ok {
 		return selection{}, fmt.Errorf("provider type %q has no registered handler", b.ProviderType)
+	}
+	if b.Config.BaseURL == nil {
+		return selection{}, errors.New("must provide base_url")
 	}
 	return selection{cfg: b.Config, handler: h}, nil
 }
@@ -1514,7 +1526,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				chosen = s.pickTarget(untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				chosen = s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
 				parsedBackendName = chosen.backend
 				upstreamModel = chosen.model
 				return chosen.model, nil
@@ -1550,15 +1562,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		b, ok := backend.Backends[parsedBackendName]
-		var sel selection
-		var usable bool
-		if ok {
-			var selErr error
-			sel, selErr = s.resolveBackend(b)
-			usable = selErr == nil
-		}
-		if !ok || !usable {
+		if !ok {
 			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))
+		}
+		// A configured-but-unusable backend is not an unknown one; the caller gets
+		// the real reason rather than a falsehood about what was declared.
+		sel, err := s.resolveBackend(b)
+		if err != nil {
+			return notFound(fmt.Errorf("model references unusable backend %q: %w", parsedBackendName, err))
 		}
 		name := parsedBackendName
 		setLogBackendName(r.Context(), name)

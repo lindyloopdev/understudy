@@ -1,72 +1,50 @@
-# Skip an unusable backend instead of failing the request
+# Answer when nothing is usable, and report the skip everywhere
 
 **Tag:** understudy / fallback / ha
 
-**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Least degradation:
-a backend understudy cannot use costs that backend, not the request", and the four
-paragraphs after it (skipped-not-demoted, the reason travels, operator vs caller,
-two endpoints).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Operator and caller
+learn different things" (the skip reason reaches the operator through the request's
+`LogRecord`), "The reason travels with the skip" (the terminal error carries it when
+the skipping exhausted the candidates), and "Two endpoints, two answers" (emptiness
+is a valid answer for the listing whatever its cause).
 
-A backend that reached understudy without a base URL fails **every** request
-against that configuration. `authMiddleware` loops over all backends before any
-handler runs and 500s on the first one missing a base
-URL — deliberately, "regardless of map iteration order", to keep the error
-deterministic. So given a logical model with targets `[x/a, y/b, z/a]` and an
-unusable `y`, a request resolving to `x/a` dies at the trust boundary having never
-needed `y`.
+- **Decide what a request gets when no target is usable.** `pickTarget` returns
+  `targets[len(targets)-1]` when it falls off the end, which is reachable with every
+  target unusable — so the caller's answer comes from whatever that target happens
+  to do rather than from a decision. The design forbids the "unknown backend"
+  falsehood but does not pick the replacement status: a truthful 404 carries the
+  reason to the caller, while a 500 is honest about whose fault it is but has its
+  body rewritten to "Internal Server Error" by `writeJSONError`, so the reason
+  reaches only the log.
 
-This is not reachable from a TOML config: `BackendSpec.BaseURL` carries
-`validate:"required,url"` and `Resolve` applies `Validate` before reading anything,
-so the document fails to load and the operator is told at config time. It is
-reachable when a `TokenValidator` returns a `BackendConfig` it did not build
-through `Config.Resolve` — the embedded and multi-tenant case, where the config
-arrives per-token and there is no load-time gate.
+- **`/v1/models` reports no skip at all.** Its own `resolveBackend` rejection is a
+  bare `continue`, so a backend that vanishes from the listing leaves no trace for
+  the consumer, while the chat path records one on the request's `LogRecord`. The
+  listing has no `LogRecord` convention today, so settle what carries the fact there
+  before building it.
 
-`resolveBackend` decides routability and reports why a backend is not routable;
-its doc comment still disclaims field validation as "owned by the auth boundary".
-That ownership moves here — it becomes the one place a backend is judged usable,
-for every selection site — which means giving it the missing-base-URL reason.
+- **`/v1/models` with nothing configured still answers 500** (`errNoBackendConfigured`
+  on `!matched`), which reads against "emptiness is a valid answer whatever its
+  cause". Settle whether the listing may fail at all, or whether zero usable
+  backends is simply an empty catalog. Test surface: "should return 500 when no
+  backend configured".
 
-## Build path
+- **Build the skip reasons once, not per call.** `resolveBackend` constructs a fresh
+  error on each rejection — 145ns/16 B for the nil base URL, 568ns/64 B for an
+  unregistered provider type, against 22ns and zero allocations when the backend is
+  usable. A statically unusable backend never becomes usable, so it pays that on
+  every target evaluation of every request forever. A package-level sentinel covers
+  the base-URL case; the provider-type message interpolates, so it needs an error
+  type carrying the type name. Sentinels also give a consumer `errors.Is` to
+  distinguish a skip from a failed attempt, which the shared `FailedOver` list
+  otherwise leaves to reading the message.
 
-Two steps, either shippable alone.
-
-**Skip unusable backends at selection, and retire the blanket pre-flight.** Drop
-the middleware loop, so a request is never failed for a backend it does not
-resolve to. This is the fix: a logical model with targets `[x/a, y/b, z/a]` serves
-from `x/a` while `y` is unusable, rather than failing at the trust boundary. A
-logical model whose targets span two backends is the vehicle for the test.
-
-Two things must land with it, not after:
-
-- **The nil base URL must be caught before `canonicalUpstreamKey`**, which
-  `chatCompletions` reaches through `upstreamLimiter` and which dereferences
-  `*baseURL` unconditionally. The middleware check is the only thing preventing
-  that panic, so removing it without the selection-time check trades a 500 for a
-  recovered panic.
-- **The chat path must report the real reason.** Once a malformed backend is no
-  longer rejected up front, a direct request for `alpha/gpt-4` reaches
-  `model references unknown backend "alpha"` — a falsehood the design forbids,
-  since `alpha` *is* configured. So distinguish *unknown* from *known but
-  unusable*, and carry the skip reason into the error. Deferring this ships a
-  knowingly false error message.
-
-Report the skip to the operator on `s.logger` at ERROR, deduplicated per condition
-the way `noteBackendDown` dedupes a streak — `Validate` runs on every request, so
-an undeduplicated log floods.
-
-Test surface: whatever asserts `model references unknown backend`, or a 500 from
-the retired pre-flight, for a backend that is declared rather than absent.
-
-**`/v1/models` answers its own question.** Skip unusable backends in the listing
-too, so a backend understudy cannot use contributes nothing instead of deciding
-the response. Independent of the skip work: the chat path is what couples to it,
-the listing does not.
-
-Test surface: three `/v1/models` cases turn from 500 into 200 — "should return 500
-when no backend configured", the sole nil-`BaseURL` case, and "should return 500
-when any backend has a nil config even if another is usable". The last pins the
-defect itself, so it inverts rather than merely changing status.
+- **A target naming an absent backend reports a misleading reason.**
+  `backends[t.backend]` yields the zero `Backend`, whose empty `ProviderType` fails
+  the provider lookup, so the consumer reads `provider type "" has no registered
+  handler` when the truth is that no such backend is declared. The skip itself is
+  right; the reason blames the wrong thing, and it now travels to the consumer. No
+  case pins either.
 
 ## Out of scope
 

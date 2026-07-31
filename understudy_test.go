@@ -695,7 +695,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should return 500 when the only configured backend has a nil config", func(t *testing.T) test {
+	tests.AddFunc("should return 404 when the model names an absent backend and the only configured one is unusable", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
 				"broken": {ProviderType: "openai"},
@@ -703,8 +703,8 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}}
 		return test{
 			server:     New(validator, WithLogger(testLogger(t))).(*server),
-			wantStatus: http.StatusInternalServerError,
-			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus: http.StatusNotFound,
+			wantBody:   `{"error":{"message":"model references unknown backend \"openai\"","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{
 				"Content-Type": {"application/json"},
 			},
@@ -724,7 +724,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should return 500 when openai backend has nil base URL", func(t *testing.T) test {
+	tests.AddFunc("should name the reason a configured backend is unusable rather than call it unknown", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
 				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: nil, APIKey: "sk-test"}},
@@ -732,12 +732,47 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}}
 		return test{
 			server:     New(validator, WithLogger(testLogger(t))).(*server),
-			wantStatus: http.StatusInternalServerError,
-			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus: http.StatusNotFound,
+			wantBody:   `{"error":{"message":"model references unusable backend \"openai\": must provide base_url","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{
 				"Content-Type": {"application/json"},
 			},
 		}
+	})
+
+	// Any target order must answer from "good", since "broken" can serve nothing.
+	servedByGood := func(t *testing.T, targets ...Target) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-good","choices":[]}`)), Header: http.Header{}}, nil
+		})
+		u, err := url.Parse("http://good/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{
+				Backends: map[string]Backend{
+					"good":   {ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: "sk-good", HTTPClient: client}},
+					"broken": {ProviderType: "openai", Config: providers.Config{BaseURL: nil, APIKey: "sk-bad"}},
+				},
+				Models: map[string]LogicalModel{"m": {Targets: targets}},
+			}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusOK,
+			wantBody:            `{"id":"from-good","choices":[]}`,
+			wantResponseHeaders: http.Header{},
+		}
+	}
+
+	tests.AddFunc("should serve from the next target when the first target's backend has no base URL", func(t *testing.T) test {
+		return servedByGood(t, Target{backend: "broken", model: "gpt-4"}, Target{backend: "good", model: "gpt-4"})
+	})
+
+	tests.AddFunc("should serve from the usable target when a sibling backend has no base URL", func(t *testing.T) test {
+		return servedByGood(t, Target{backend: "good", model: "gpt-4"}, Target{backend: "broken", model: "gpt-4"})
 	})
 
 	tests.Parallel()
@@ -832,6 +867,9 @@ func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
 	})
 }
 
+// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): "should return 500 when no
+// backend configured" is the last case here that fails the listing, which reads
+// against emptiness being a valid answer whatever its cause.
 func TestModels(t *testing.T) {
 	t.Parallel()
 
@@ -967,7 +1005,7 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
 	})
 
-	tests.AddFunc("should return 500 when any backend has a nil config even if another is usable", func(t *testing.T) test {
+	tests.AddFunc("should list the usable backend's models when another backend has a nil config", func(t *testing.T) test {
 		u, err := url.Parse("http://backend/v1")
 		if err != nil {
 			t.Fatal(err)
@@ -981,12 +1019,12 @@ func TestModels(t *testing.T) {
 					}}, nil
 				},
 			},
-			wantStatus: http.StatusInternalServerError,
-			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":[{"id":"usable/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
 		}
 	})
 
-	tests.AddFunc("should return 500 with must-provide-base_url when a backend has a nil base URL even if another is usable", func(t *testing.T) test {
+	tests.AddFunc("should list the usable backend's models when another backend has no base URL", func(t *testing.T) test {
 		u, err := url.Parse("http://backend/v1")
 		if err != nil {
 			t.Fatal(err)
@@ -1000,8 +1038,8 @@ func TestModels(t *testing.T) {
 					}}, nil
 				},
 			},
-			wantStatus: http.StatusInternalServerError,
-			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+			wantStatus: http.StatusOK,
+			wantBody:   `{"object":"list","data":[{"id":"usable/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
 		}
 	})
 
@@ -1091,9 +1129,8 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
 	})
 
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the skip's reason is the
-	// operator's fact and reaches only the logger, so no case here asserts it. Pin
-	// that the skipped backend and its reason are logged at ERROR.
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the failed fetch reaches
+	// the operator only through s.logger, and no case here asserts that line.
 	tests.AddFunc("should list the models of the backends that answer when another backend's catalog fetch fails", func(t *testing.T) test {
 		sick := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2003,7 +2040,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	tests.Add("should log error attr when validator returns a backend with nil base URL", test{
+	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: map[string]Backend{
@@ -2012,7 +2049,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `backend "broken": must provide base_url`},
+		want:        map[string]any{"error": `unknown logical model "gpt-4"`},
 	})
 
 	tests.AddFunc("should log backend_name from chat-completions", func(t *testing.T) test {
@@ -2088,6 +2125,31 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			want: map[string]any{
 				"backend_name": "b",
 				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")}},
+			},
+		}
+	})
+
+	tests.AddFunc("should report the backend it skipped, and why, on the request's log record", func(*testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-good"}`)), Header: http.Header{}}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"broken": {ProviderType: "openai", Config: providers.Config{APIKey: "sk-bad"}},
+						"good":   {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "good", Path: "/v1"}, APIKey: "sk-good", HTTPClient: client}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "broken", model: "gpt-4"},
+						{backend: "good", model: "gpt-4"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"backend_name": "good",
+				"failed_over":  []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
 			},
 		}
 	})
