@@ -555,10 +555,8 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	now := time.Now()
 	s.evictStaleHealth(now)
 	for _, t := range targets {
-		// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): exhausting every target
-		// this way falls through to a target that cannot serve.
 		if _, err := s.resolveBackend(backends, t.backend); err != nil {
-			addLogFailedOver(ctx, t.backend, t.model, 0, err)
+			addLogSkipped(ctx, t.backend, t.model, err)
 			continue
 		}
 		id := healthKey(t, backends)
@@ -585,6 +583,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		}
 		s.noteBackendDown(id, t, h)
 	}
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the last target is an
+	// arbitrary one to hand back when every candidate was excluded — the caller
+	// reads whichever backend sorts last rather than the first that failed.
 	return targets[len(targets)-1]
 }
 
@@ -900,28 +901,36 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
-	// FailedOver holds the targets the request did not serve from, in the order it
-	// walked past them — those a failover abandoned, and those skipped as unusable
-	// before any call was made. It is empty for a request that served from its
-	// first target. A demotion is attributable through it: the target it demoted is
-	// here when the request moved on, and in the fields above when there was
-	// nowhere left to go. A skipped backend appears on every request that routes
-	// around it, since only a configuration change can clear it.
-	FailedOver []Attempt
+	// Excluded holds what the request considered and did not serve from: targets a
+	// failover abandoned, targets excluded as unusable before any call, and the
+	// backends a listing could not use. A listing whose catalog fetch fails is not
+	// here — that reaches understudy's own logger alone. A chat request records
+	// them in the order it walked its candidates, so an exclusion and a failover
+	// interleave as they happened; a listing ranges a map and has no order to
+	// report. It is empty for a request that
+	// served from its first target. A demotion is attributable through it: the
+	// target it demoted is here when the request moved on, and in the fields above
+	// when there was nowhere left to go. A skipped backend appears on every request
+	// that routes around it, since only a configuration change can clear it.
+	Excluded []Attempt
 }
 
-// Attempt describes one target a request walked past, so a failover leaves a
-// record of them rather than only the one that determined the client's outcome.
-// Most were called and abandoned; one understudy could not use at all was never
-// called, and says so through Err with a zero UpstreamStatus.
+// Attempt describes one target or backend a request considered and did not use,
+// so a failover leaves a record of them rather than only the one that determined
+// the client's outcome. Called separates the two ways that happens: understudy
+// called it and abandoned the result, or could not use it and never called.
 type Attempt struct {
-	// Backend is the backend the attempt called.
+	// Backend is the backend considered.
 	Backend string
-	// ModelUpstream is the upstream model name the attempt requested.
+	// Called reports whether understudy issued a request to it. False means the
+	// backend was unusable as configured and Err says why; nothing was sent.
+	Called bool
+	// ModelUpstream is the upstream model name the attempt requested. Empty when
+	// nothing was called, and for a listing, which names no model.
 	ModelUpstream string
 	// UpstreamStatus is the status the attempt answered with, or 0 when it never
 	// produced a response — a pre-header stall, a transport failure, or a backend
-	// skipped without being called.
+	// that was never called.
 	UpstreamStatus int
 	// Err is the error that ended the attempt, carrying the upstream's own
 	// message where it sent one, or why the backend could not be used at all.
@@ -973,9 +982,17 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	}
 }
 
-func addLogFailedOver(ctx context.Context, backend, upstreamModel string, status int, err error) {
+// addLogSkipped records a backend understudy could not use and never called.
+func addLogSkipped(ctx context.Context, backend, upstreamModel string, err error) {
 	if h := logCtxFrom(ctx); h != nil {
-		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel, UpstreamStatus: status, Err: err})
+		h.Excluded = append(h.Excluded, Attempt{Backend: backend, ModelUpstream: upstreamModel, Err: err})
+	}
+}
+
+// addLogCalled records a target understudy called and abandoned the result of.
+func addLogCalled(ctx context.Context, backend, upstreamModel string, status int, err error) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.Excluded = append(h.Excluded, Attempt{Backend: backend, Called: true, ModelUpstream: upstreamModel, UpstreamStatus: status, Err: err})
 	}
 }
 
@@ -1301,6 +1318,7 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	for name := range backend.Backends {
 		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
+			addLogSkipped(r.Context(), name, "", err)
 			continue
 		}
 		matched = true
@@ -1625,7 +1643,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, 0, err)
+					addLogCalled(r.Context(), parsedBackendName, upstreamModel, 0, err)
 					continue
 				}
 			}
@@ -1674,7 +1692,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if logicalTargets != nil && (sig.condition == sustainedRate || isCredentialRefused(err)) {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
+					addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
 					releaseHeld()
 					cancel(nil)
 					continue

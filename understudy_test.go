@@ -2039,6 +2039,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 
 	type test struct {
 		validator   TokenValidator
+		method      string
+		path        string
 		requestBody string
 		want        map[string]any
 	}
@@ -2178,7 +2180,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"backend_name": "b",
-				"failed_over":  []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")}},
+				"excluded":     []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
 			},
 		}
 	})
@@ -2203,7 +2205,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"backend_name": "good",
-				"failed_over":  []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
+				"excluded":     []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
 			},
 		}
 	})
@@ -2227,7 +2229,34 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"backend_name": "good",
-				"failed_over":  []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+				"excluded":     []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+			},
+		}
+	})
+
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no case puts an
+	// exclusion and a failover on one record, which is the ordering claim that
+	// makes them one list. A model whose targets are an unusable backend, a
+	// rate-limited one, and a serving one belongs here.
+	tests.AddFunc("should report the backend a listing left out, and why", func(*testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"object":"list","data":[{"id":"gpt-4","created":1,"owned_by":"openai"}]}`)),
+				Header:     http.Header{"Content-Type": {"application/json"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{Backends: map[string]Backend{
+					"good":   {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "good", Path: "/v1"}, APIKey: "sk-good", HTTPClient: client}},
+					"broken": {ProviderType: "openai", Config: providers.Config{APIKey: "sk-bad"}},
+				}}, nil
+			}},
+			method: http.MethodGet,
+			path:   "/v1/models",
+			want: map[string]any{
+				"excluded": []Attempt{{Backend: "broken", Err: errors.New("must provide base_url")}},
 			},
 		}
 	})
@@ -2236,7 +2265,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := New(tt.validator, WithLogger(testLogger(t)))
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.requestBody))
+		req, err := http.NewRequestWithContext(t.Context(), cmp.Or(tt.method, http.MethodPost), cmp.Or(tt.path, "/v1/chat/completions"), strings.NewReader(tt.requestBody))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2253,7 +2282,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			"model_requested": rec.ModelRequested,
 			"model_upstream":  rec.ModelUpstream,
 			"upstream_status": float64(rec.UpstreamStatus),
-			"failed_over":     rec.FailedOver,
+			"excluded":        rec.Excluded,
 		}
 		for k := range got {
 			if _, present := tt.want[k]; !present {
@@ -2333,10 +2362,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		wantStatus  int
 		wantBody    string
 		wantBackend string
-		// wantFailedOver is the targets the request walked past, asserted only
-		// when non-nil so the cases that are not about the log record stay silent
-		// on it.
-		wantFailedOver []Attempt
+		// wantExcluded is what the request did not serve from, asserted only when
+		// non-nil so the cases that are not about the log record stay silent on it.
+		wantExcluded []Attempt
 		// wantEnvelope is the error response's asserted aspects; a field left zero
 		// is one this case's behavior does not name.
 		wantEnvelope errorEnvelope
@@ -2401,7 +2429,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: errHeaderStall}}},
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: errHeaderStall, Called: true}}},
 		},
 	})
 
@@ -2428,11 +2456,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{
 				Backend:        "a",
 				ModelUpstream:  "ma",
 				UpstreamStatus: http.StatusTooManyRequests,
 				Err:            errors.New("upstream returned status 429: quota gemini-2.5-flash exhausted"),
+				Called:         true,
 			}}},
 		},
 	})
@@ -2450,8 +2479,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantFailedOver: []Attempt{
-				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down")},
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{
+				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 			}},
 		},
 	})
@@ -2805,9 +2834,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				if rr.Code != s.wantStatus {
 					t.Errorf("step %d: status got %d want %d", i, rr.Code, s.wantStatus)
 				}
-				if s.wantFailedOver != nil {
+				if s.wantExcluded != nil {
 					rec, _ := LogRecordFromContext(ctx)
-					if d := gocmp.Diff(s.wantFailedOver, rec.FailedOver, errorText); d != "" {
+					if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText); d != "" {
 						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
 					}
 				}

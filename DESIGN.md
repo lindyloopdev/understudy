@@ -226,11 +226,18 @@ stand in for a cadence the consumer knows and understudy does not. The consumer
 knows its own unit of work, so the fact is handed to it and it decides whether that
 becomes a log line, a metric, or nothing.
 
-A skip joins `FailedOver`, which already records the targets a request walked past,
-rather than a list of its own: the two differ in why the target did not serve, not
-in what the consumer is being told, and one list preserves the order a request
-actually walked them in — a skip and a failover can interleave, and two lists could
-not say which came first.
+Everything a request considered and did not serve from goes on one record,
+`Excluded`, whatever kept it from serving: a target abandoned after a call, a target
+understudy could not use and never called, a backend a listing left out. They differ
+in why they did not serve, not in what the consumer is being told, and one list
+preserves the order a request walked its candidates in — an exclusion and a failover
+interleave, and two lists could not say which came first. `Called` carries the
+distinction the shape no longer does: whether understudy sent anything before
+excluding it.
+
+Order is only meaningful where a walk produced it. A chat request walks an ordered
+candidate list; a listing ranges a map, so its exclusions arrive in whatever order
+the range yields and none is implied.
 
 **Two endpoints, two answers.** `/v1/models` asks *what can you serve* — emptiness
 is a valid answer whatever its cause, so unusable backends are skipped and a usable

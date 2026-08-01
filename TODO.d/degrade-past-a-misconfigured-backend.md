@@ -13,14 +13,20 @@ valid answer for the listing whatever its cause).
 - **Surface the first failure, not the last target.** `pickTarget` returns
   `targets[len(targets)-1]` when every target is unusable, so the reason the caller
   reads is whichever backend sorts last rather than what first went wrong. Every
-  reason is already on `FailedOver`; only the one promoted into the answer is
+  reason is already on `Excluded`; only the one promoted into the answer is
   arbitrary. No case pins which one, so nothing has to change alongside.
 
-- **`/v1/models` reports no skip at all.** Its own `resolveBackend` rejection is a
-  bare `continue`, so a backend that vanishes from the listing leaves no trace for
-  the consumer, while the chat path records one on the request's `LogRecord`. The
-  listing has no `LogRecord` convention today, so settle what carries the fact there
-  before building it.
+- **Nothing shows an exclusion and a failover on one record.** `Excluded` claims to
+  hold both in the order a request walked its candidates, and that claim is why the
+  two are one list rather than two — but every case exercises a single kind per
+  request. A chat request whose targets are an unusable backend, a rate-limited one,
+  and a serving one produces both entries, and pins the order the claim depends on.
+
+- **A listing's failed catalog fetch reaches only the log.** The listing's two
+  omission paths answer a consumer differently: a backend understudy cannot use is
+  recorded on `Excluded`, while one whose catalog fetch fails is written to
+  `s.logger` at ERROR and left off the record. Both are the same fact from the
+  consumer's side — this backend is missing from your listing, and here is why.
 
 - **`/v1/models` with nothing configured still answers 500** (`errNoBackendConfigured`
   on `!matched`), which reads against "emptiness is a valid answer whatever its
@@ -29,11 +35,12 @@ valid answer for the listing whatever its cause).
   backend configured". It is the sole remaining use of `errNoBackendConfigured`, so
   retiring it retires the error too.
 
-- **Give a consumer something to match on.** `errNoSuchBackend` is unexported, so a
-  consumer reading `FailedOver` can only tell a skip from a failed attempt by
-  reading the message. Decide whether the skip reasons become exported sentinels —
-  and whether that is a contract worth freezing — or whether the message is all a
-  consumer should rely on.
+- **Decide whether a consumer needs to tell the skip reasons apart.** `Attempt.Called`
+  separates a backend understudy never called from one it called and abandoned, but
+  the reasons within a skip — no such backend, no registered handler, no base URL —
+  are distinguishable only by reading the message, since each is unexported. Settle
+  whether that distinction is one a consumer acts on, and so whether the reasons
+  become exported sentinels and a frozen contract.
 
 ## Out of scope
 
