@@ -185,7 +185,9 @@ actually chosen, where it is chosen.
 own errors into falsehoods — a caller told a configured-but-unusable backend is
 "unknown", or told "no backend configured" when several are. So the reason reaches
 whichever answer the request produces: the terminal error when the skipping
-exhausted the candidates, and the operator's diagnostic either way.
+exhausted the candidates, and the operator's diagnostic either way. Which reason is
+promoted into that terminal error is not yet the first failure but the last target
+walked — [[degrade-past-a-misconfigured-backend]].
 
 **A list emptied by misconfiguration answers 404, not 500.** The two ways a
 candidate list runs out are not the same ending. Emptied by *health*, something is
@@ -246,7 +248,10 @@ some backend, or every backend, could not be reached. Chat asks understudy to
 *serve this*, and there failure is failure: a request naming a model no usable
 backend can serve is an error carrying the reason. The consequence is deliberate —
 a total upstream outage renders as an empty catalog rather than an error, and the
-operator learns of it from the log rather than the response.
+operator learns of it from the log rather than the response. The listing does not
+yet hold to this: a config resolving to no usable backend still fails, and a
+backend dropped by a failed catalog fetch reaches no consumer —
+[[degrade-past-a-misconfigured-backend]].
 
 A consumer wanting stricter behavior enforces it in its own `TokenValidator`,
 before handing understudy a configuration. Routability as *understudy* defines it
@@ -335,9 +340,13 @@ carrying different body policy.
 That projection is what lets the *same* model appear as distinct profiles across
 logical models — a home a global per-model flag (bakes one behavior in) or a
 logical-model-per-profile (nests logical models) can't provide. The **domain
-rules** — the `thinking` value's semantics — are validated where the config
-**resolves** (`Config.Resolve`), beside the existing backend-reference check,
-never in the decode. An **unrecognized query param is ignored, not rejected**
+rules** — the `thinking` value's semantics — are validated wherever a reference
+is accepted, never in the decode: at `Config.Resolve` beside the existing
+backend-reference check, and again when a request names a `backend/model`
+reference directly, which is a target the caller wrote rather than the operator.
+One reference means one thing however it arrives, so an override the config would
+refuse is refused from a request too — as a `400`, since there it is the caller's
+input that is wrong. An **unrecognized query param is ignored, not rejected**
 (Postel's law): rejecting it would break forward/backward compatibility — an
 older binary would refuse a config carrying a param it hasn't learned yet, so a
 new override couldn't roll out across a fleet ahead of the binary. Only *known*
@@ -473,7 +482,17 @@ while making worst-case detection unbounded — worst precisely when an operator
 just paid and expects work to resume. Jitter, for the same reason the synthesized
 backoff needs it; reset to base on success. A known `readmitAt` **supersedes the
 schedule entirely** — there is nothing to discover, the advertised time is the
-answer.
+answer. A success on a concurrent request deletes the advertised time along with
+the streak today — [[a-success-clears-more-than-its-own-streak]].
+
+**Health belongs to the endpoint, not to the route that reached it.** The key is
+the canonical `(url + key + model)` and nothing else — not the logical model walked
+to get there, not whether the caller named a logical model at all. A request naming
+`<backend>/<model>` directly reaches the same upstream as a logical model whose
+target resolves to it, so it reads and writes the same entry: what one learns about
+an account, all learn. Keying health on how a request was *addressed* would make an
+account's availability depend on spelling, and let a demoted upstream keep serving
+one route while another routes around it.
 
 **Credential rotation needs no probe.** Health is keyed on the canonical
 `(url + key + model)`, so a rotated key is a *different* entry, healthy by

@@ -506,7 +506,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should report an empty backend name as unknown rather than as no backend configured", func(t *testing.T) test {
+	tests.AddFunc("should reject a reference naming no backend rather than reading it as an unknown one", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
 				"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a"}},
@@ -515,8 +515,56 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		return test{
 			server:              New(validator, WithLogger(testLogger(t))).(*server),
 			requestBody:         `{"model":"/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			wantStatus:          http.StatusNotFound,
-			wantBody:            `{"error":{"message":"model references unknown backend \"\"","type":"invalid_request_error"}}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"target \"/gpt-4\" must be <backend>/<model>","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	// TODO(TODO.d/direct-target-reference-drops-query-overrides.md): a non-boolean
+	// override — openai/gpt-4?thinking=banana — is rejected here too, and only the
+	// config path covers that rule.
+	tests.AddFunc("should tell the caller a reserved override is not supported rather than ignoring it", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"openai/gpt-4?thinking=true","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"model \"openai/gpt-4?thinking=true\": thinking=true is reserved: enabling thinking is not yet supported","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	tests.AddFunc("should reject a reference whose query it cannot read rather than forwarding it", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"openai/gpt-4?thinking=%zz","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"invalid URL escape \"%zz\"","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	tests.AddFunc("should reject a reference naming no model rather than asking the upstream for an empty one", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"openai/","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"target \"openai/\" must be <backend>/<model>","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
@@ -1369,6 +1417,55 @@ func TestChatCompletionsForwardedModel(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should serve a reference carrying an override it does not recognize", func(t *testing.T) test {
+		var forwarded []byte
+		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
+			forwarded, _ = io.ReadAll(req.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return test{
+			requestModel: "openai/gpt-4?foo=bar",
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			check: func() {
+				if got := forwardedModel(t, forwarded); got != "gpt-4" {
+					t.Errorf("forwarded model: got %q, want %q", got, "gpt-4")
+				}
+				if bytes.Contains(forwarded, []byte(`"thinking"`)) {
+					t.Errorf("forwarded body injected thinking for an unrecognized override: %s", forwarded)
+				}
+			},
+		}
+	})
+
+	tests.AddFunc("should strip a reference's overrides from the model it forwards", func(t *testing.T) test {
+		var forwarded []byte
+		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
+			forwarded, _ = io.ReadAll(req.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return test{
+			requestModel: "openai/gpt-4?thinking=false",
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			check: func() {
+				if got := forwardedModel(t, forwarded); got != "gpt-4" {
+					t.Errorf("forwarded model: got %q, want %q", got, "gpt-4")
+				}
+			},
+		}
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := New(tt.validator, WithLogger(testLogger(t)))
@@ -1415,6 +1512,11 @@ func TestChatCompletionsThinkingInjection(t *testing.T) {
 	tests.Add("should inject disabled when the request omits thinking and the target disables it", test{
 		requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 		targetQuery: url.Values{"thinking": {"false"}},
+		wantType:    "disabled",
+		wantKeys:    1,
+	})
+	tests.Add("should apply an override carried by a backend/model reference the request names", test{
+		requestBody: `{"model":"zai/glm-5?thinking=false","messages":[{"role":"user","content":"hi"}]}`,
 		wantType:    "disabled",
 		wantKeys:    1,
 	})
@@ -2362,6 +2464,9 @@ var assertedFields = gocmp.FilterPath(func(p gocmp.Path) bool {
 	return want.IsValid() && want.IsZero()
 }, gocmp.Ignore())
 
+// TODO(TODO.d/direct-target-reference-drops-query-overrides.md): every case here
+// drives a logical model, but a directly-named backend/model reference now reaches
+// the same health map — its failures can demote an account other requests share.
 func TestChatCompletionsFailoverRouting(t *testing.T) {
 	t.Parallel()
 
@@ -2391,6 +2496,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	}
 
 	type step struct {
+		// model is what the request names; empty means the logical model "m".
+		model       string
 		advance     time.Duration
 		wantStatus  int
 		wantBody    string
@@ -2430,6 +2537,39 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 		},
 	})
+
+	tests.Add("should route a logical model around an account a directly-named reference demoted", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should reject a directly-named reference on a streak a logical model accrued past the terminal threshold", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				model:        "a/ma",
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+		},
+	})
+
+	// TODO(TODO.d/cover-a-reference-timed-and-immediate-demotions.md): the cases
+	// above drive only the streak. A directly-named reference also benches the
+	// shared account on a 429 carrying a Retry-After, and demotes it outright on a
+	// refused credential; neither is driven that way here.
 
 	tests.Add("should demote a target on a 429 with no Retry-After", test{
 		backends: map[string]backendStub{
@@ -2621,6 +2761,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 		},
 	})
+
+	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): the case above with both
+	// steps naming "a/ma" belongs here — nothing sweeps an entry the walk never
+	// reaches, so it answers a terminal 400 on a day-old streak, not a fresh 502.
 
 	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
 		backends: map[string]backendStub{
@@ -2855,7 +2999,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					time.Sleep(s.advance)
 					synctest.Wait()
 				}
-				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+				body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, cmp.Or(s.model, "m"))
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 				if err != nil {
 					t.Fatal(err)
 				}

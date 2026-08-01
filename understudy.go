@@ -1560,8 +1560,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				upstreamModel = chosen.model
 				return chosen.model, nil
 			}
-			prefix, bare, ok := strings.Cut(model, "/")
-			if !ok {
+			ref, err := ParseTarget(model)
+			if _, notRef := errors.AsType[notAReferenceError](err); notRef {
 				if len(backend.Backends) == 0 {
 					// Nothing is configured to have declared the model, so the absent
 					// configuration is the more useful answer than calling the model
@@ -1570,9 +1570,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				}
 				return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
 			}
-			parsedBackendName = prefix
-			upstreamModel = bare
-			return bare, nil
+			if err != nil {
+				return "", resolveError{badRequest(err)}
+			}
+			if err := ref.validate(); err != nil {
+				return "", resolveError{badRequest(fmt.Errorf("model %q: %w", model, err))}
+			}
+			chosen = ref
+			parsedBackendName = ref.backend
+			upstreamModel = ref.model
+			return ref.model, nil
 		})
 		if err != nil {
 			if re, ok := errors.AsType[resolveError](err); ok {
@@ -1651,8 +1658,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
-		// target, so shrink on a rate-limit 429 even when the request bypassed target
-		// health tracking (a direct backend/model reference has no chosen target).
+		// target, so shrink on a rate-limit 429 even for a request that has no chosen
+		// target to demote.
 		switch {
 		case err == nil:
 			// Demand-gated: a success that never waited for a slot is no evidence
