@@ -16,11 +16,15 @@ valid answer for the listing whatever its cause).
   reason is already on `Excluded`; only the one promoted into the answer is
   arbitrary. No case pins which one, so nothing has to change alongside.
 
-- **Nothing shows an exclusion and a failover on one record.** `Excluded` claims to
-  hold both in the order a request walked its candidates, and that claim is why the
-  two are one list rather than two — but every case exercises a single kind per
-  request. A chat request whose targets are an unusable backend, a rate-limited one,
-  and a serving one produces both entries, and pins the order the claim depends on.
+- **Decide whether re-walking records a target again.** `pickTarget` re-walks the
+  candidate list from the start on every failover, so targets `[broken, limited,
+  good]` where `limited` fails over yield `broken, limited, broken`. The walk-log
+  reading is settled — `DESIGN.md` and the `Excluded` doc both say candidates are
+  recorded in the order they were walked, and a case pins that interleaving — but
+  nothing says whether walking past the same unusable backend twice should record it
+  twice, and no case exercises it. If it should, the field name is the problem:
+  `Excluded` reads as a set, and a set does not repeat. lindy is the only consumer
+  that could settle it, and reads none of this today.
 
 - **A listing's failed catalog fetch reaches only the log.** The listing's two
   omission paths answer a consumer differently: a backend understudy cannot use is

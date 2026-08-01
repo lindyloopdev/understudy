@@ -78,7 +78,7 @@ func TestChatCompletionsValidation(t *testing.T) {
 
 	tests := testy.NewTable[test]()
 
-	tests.AddFunc("validator succeeds with valid context", func(t *testing.T) test {
+	tests.AddFunc("should serve a request whose token the validator accepts", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -96,7 +96,7 @@ func TestChatCompletionsValidation(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("validator respects context cancellation", func(t *testing.T) test {
+	tests.AddFunc("should reject an invalid token even when the request context is already cancelled", func(t *testing.T) test {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		return test{
@@ -2234,10 +2234,43 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no case puts an
-	// exclusion and a failover on one record, which is the ordering claim that
-	// makes them one list. A model whose targets are an unusable backend, a
-	// rate-limited one, and a serving one belongs here.
+	tests.AddFunc("should record an abandoned target and an excluded one in the order it walked them", func(*testing.T) test {
+		limited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serving := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-good"}`)), Header: http.Header{}}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"limited": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "limited", Path: "/v1"}, APIKey: "sk-l", HTTPClient: limited}},
+						"broken":  {ProviderType: "openai", Config: providers.Config{APIKey: "sk-b"}},
+						"good":    {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "good", Path: "/v1"}, APIKey: "sk-g", HTTPClient: serving}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "limited", model: "ml"},
+						{backend: "broken", model: "mb"},
+						{backend: "good", model: "mg"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"backend_name": "good",
+				"excluded": []Attempt{
+					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
+					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
+				},
+			},
+		}
+	})
+
 	tests.AddFunc("should report the backend a listing left out, and why", func(*testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2386,7 +2419,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("fails over to the next target after the threshold", test{
+	tests.Add("should fail over to the next target after the threshold", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
 			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -2533,7 +2566,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("a non-fatal error does not fail over", test{
+	tests.Add("should not fail over on a non-fatal error", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadRequest, `{"error":{"message":"bad request"}}`)},
 			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -2545,7 +2578,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("routes to the last target when all are failing", test{
+	tests.Add("should route to the last target when all are failing", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
 			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
@@ -2643,7 +2676,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("restores a target after it recovers", test{
+	tests.Add("should restore a target after it recovers", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 1 {
@@ -2679,7 +2712,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("preserves the streak start across repeated failures", test{
+	tests.Add("should preserve the streak start across repeated failures", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
 			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -2772,7 +2805,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("surfaces the 429 when every target is rate-limited past the threshold", test{
+	tests.Add("should surface the 429 when every target is rate-limited past the threshold", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
