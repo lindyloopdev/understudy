@@ -17,9 +17,10 @@ asserts what the refusal buys every later caller.
   abandoning it. Its own case, not a step appended to the failover one: that case
   promises this request succeeds, this one promises later requests stay cheap.
 
-- **Should surface the refusal once every candidate has refused.** The walk now
-  spends the whole list before answering, which the single-candidate case cannot
-  show. The client receives 403 — but typed `server_error`, which a refusal is
-  not. Pin the status, and if writing it confirms the type is wrong, leave the
-  correct type as a TODO in the test rather than changing the envelope alongside
-  a new test.
+- **Should tell a client a refused account needs an operator, not a retry.** The
+  walk spends the whole list before answering, which the single-candidate case
+  cannot show. §Understudy makes that verdict `400` `upstream_refused`; today the
+  last candidate's `403` is relayed, typed `server_error`. Write the case against
+  the design and let it stay red until [[understudy-error-envelope-type]] lands,
+  or pin what ships and rewrite it then — but do not let a green test record the
+  relayed shape as intended.

@@ -9,14 +9,14 @@ the Retry-After ladder, and why the failover and terminal thresholds are
 schedule that resets to base on success, and the rule that a known `readmitAt`
 supersedes that schedule entirely.
 
-`clearFailure` deletes the whole health entry on any success. The entry holds five
-things — `failingSince`, `lastProbe`, `readmitAt`, `downLogged`, and `lastTouch` —
-and a success is evidence about only the first. Deleting is right for `lastTouch`,
-which exists for the eviction sweep and has nothing to say once the entry is gone;
-the middle three it erases on the strength of one request. Health is shared per
+`clearFailure` deletes the whole health entry on any success. Ending the streak
+that way is deliberate (§Understudy, "A success clears the streak"), and dropping
+`lastTouch` is right — it exists for the sweep. The entry also holds `readmitAt`,
+which is not a measurement understudy took but an instruction the provider gave,
+and a success is not the provider withdrawing it. Health is shared per
 `(url + key + model)` (§Understudy, "Health belongs to the endpoint"), so the
 success doing the deleting need not be the request, the route, or even the client
-that learned any of what it erases.
+that learned what it erases.
 
 - **Keep an advertised `readmitAt` across a success.** An upstream answers `429
   Retry-After: 300`; a concurrent request to the same account and model returns
@@ -28,24 +28,18 @@ that learned any of what it erases.
   standing until it elapses. Drive it from two concurrent requests to one
   account, not from a sequence — the ordering is the behavior.
 
-- **Settle whether one success should clear a streak many requests accrued.**
-  `failingSince` is set only when no entry exists and any success removes the
-  entry, so crossing the 15s failover threshold requires 15s with *zero*
-  successes on that account. A target failing 30% of the time under load never
-  demotes; the same target at the same rate serving one client might. §Understudy
-  makes the threshold "a *duration* (≈15s), not a failure count" precisely to be
-  volume-independent — the reasoning is spelled out in
-  [[understudy-adaptive-coordinated-backoff]] — and the clear reintroduces the
-  volume dependence behind the threshold's back. It is not obviously wrong: a 70%-healthy
-  target may well beat no target, and reset-on-success is what lets a recovered
-  host snap back ([[understudy-adaptive-coordinated-backoff]]). But the design
-  does not say so, and the ladder's rungs read as though it does not hold. Decide
-  in DESIGN.md what a success is evidence *of* — §Concurrency & Rate Limiting
-  already refuses to move the limiter on a success that met no contention — then
-  build to whatever that settles.
+- **Decide who owns the health state while changing what a write means.** The rule
+  that a recording path must sweep before it writes is stated in prose, not
+  enforced: `s.health` is a plain field any new path can assign to, and each path
+  repeats the `lock, sweep, key` preamble for itself.
+  Extracting a type that owns the map and sweeps inside its only mutating entry
+  point is the version that enforces it, and it splits `s.mu`, which today also
+  guards `upstreamLimiters`. Doing that here rather than separately means one pass
+  over health ownership instead of two, since narrowing `clearFailure` rewrites
+  these same functions.
 
 Neither is a data race: `s.mu` serialises every read and write. Both are about
-what a success means, which no lock answers.
+what a health write means, which no lock answers.
 
 ## Not caused by the reference-parsing work
 

@@ -327,6 +327,17 @@ alternate → ~0 (fail over at once), a pricier one → retry the cheaper target
 longer. A later, larger threshold (≈2m) hard-fails to the terminal reject when no
 alternate remains.
 
+**A success clears the streak, so only a target failing outright is routed
+around.** Any success on an account deletes its failure record, so crossing the
+threshold takes a window in which *nothing* succeeded. A target failing a fraction
+of its requests keeps receiving them, and how fast one demotes depends on how busy
+the account is — the volume dependence the duration threshold otherwise avoids.
+That is accepted, not overlooked: a partly-serving target still beats no target,
+and every rule for netting failures against successes needs a window and a ratio,
+the tuning constants these thresholds exist to do without until cost can derive
+them. Revisit when a partly-failing target is seen hurting a run, which is the
+evidence this trade is missing.
+
 **Session target binding.** Within a session understudy pins one target and
 reuses it — no per-request re-selection. It re-walks the list (from the top,
 first available) **only when the pinned target fails to serve** — having been
@@ -713,6 +724,76 @@ composition root mounts. The boundary splits three ways:
 - **Populating the `/v1` request's telemetry is understudy's** — the per-request facts a
   mount can't see (which backend and model served, the upstream status, and on failure the
   *real* error behind an obfuscated body) understudy records into its own log record.
+
+**One table maps an upstream failure to what the client is told.** A provider reports
+what the upstream *said* — the condition it observed, and any retry boundary it
+recovered — and understudy alone derives the status, envelope `type`, and
+`Retry-After` from it. Relaying a provider's own type string would make understudy's
+contract the union of every vendor's vocabulary and leak a name one vendor invented
+(`RegionError`) into the field a consumer dispatches on; it would also misdescribe a
+response understudy has already reshaped, since by the time a client sees an error the
+status may be normalized, the body obfuscated, the backoff synthesized, and the target
+a different one than was asked for. The table is **documented for library users**, not
+left to be read out of the code, because a consumer classifies on it. It is not
+caller-overridable, for the same reason error rendering is not: a hook would let a
+caller break the contract its consumers depend on. Should a real need for one appear,
+it is a later addition, not a reason to build the seam now.
+
+**Upstream failures.** Status is retry-control, `type` is the reason, and the body is
+obfuscated for `5xx`/`401`/`403` per the rule above. These are a request's **final**
+disposition: a refusal, a stall, and a `429` past the demotion threshold each fail
+over first, so a client is told one of these only once no untried candidate remains.
+
+| what the upstream did | client status | envelope `type` | retry delay |
+| --- | --- | --- | --- |
+| `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
+| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none; only an operator clears it |
+| `429` advertising under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
+| `429` advertising nothing | `429` | `rate_limit_error` | synthesized |
+| `5xx`, or a transport failure that never answered | `502` | `server_error` | synthesized — [[understudy-adaptive-coordinated-backoff]] |
+| overloaded (`529` and kin) | `502` | *open* | as `5xx` |
+| every candidate stalled before its header | `504` | `server_error` | — |
+| failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+
+**A walk that runs out of candidates answers for the request, not for its last
+target.** Relaying the final failure makes the answer depend on list order: with
+`[a: 500, b: 401]` a caller is told it is forbidden, when `a` was merely broken and
+will be back. The verdict is instead the **most optimistic** disposition among the
+candidates tried — if any one of them is time-bound, the request is retryable, and
+the delay is the soonest of them, since that is the earliest it could succeed. Only
+when every candidate needs an operator is the answer stop.
+
+Optimism is the cheaper error. Guessing retryable when nothing will recover costs
+one more failed request; guessing terminal when something would have recovered
+strands work that could have run. The individual reasons are not lost — every
+attempt is on `LogRecord.Excluded` with the status it answered, which is where an
+operator reads what actually happened. The walk relays its last candidate's error
+today — [[understudy-error-envelope-type]].
+
+A relayed failure carries its delay in a `Retry-After` **header** — retry-control
+aimed at the agent, which sleeps and retries on its own. A **reject** carries it as
+a top-level `retry_after_ms` (milliseconds, rounded to the second) beside the
+`error` object, and sends no header at all. Both would reach lindy either way: the
+agent publishes an error event carrying the response body *and* its headers. The
+header is withheld because `Retry-After` **is** an instruction to sleep, and a
+reject exists to make the agent stop — so the delay is put where only the
+orchestrator above it will read it. understudy is speaking past the agent to
+lindy, which schedules the retry itself.
+
+An upstream's own `type` string is still relayed ahead of this table today —
+[[understudy-error-envelope-type]].
+
+**understudy's own refusals**, which reach no upstream:
+
+| condition | status | envelope `type` |
+| --- | --- | --- |
+| session token absent or rejected | `401` | `authentication_error` |
+| model undeclared, backend unknown, or a model with no targets | `404` | `invalid_request_error` |
+| malformed body, malformed reference, or a rejected override | `400` | `invalid_request_error` |
+| client disconnected | `499` | — |
+| request deadline exceeded | `504` | — |
 
 **understudy owns its telemetry record; what a consumer does with it is the consumer's.**
 understudy's telemetry is understudy's, so its log record — the **`LogRecord`** value type —

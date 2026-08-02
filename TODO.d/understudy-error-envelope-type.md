@@ -1,27 +1,39 @@
-# Error envelope `type` — finish the carried-type contract
+# Move the failure-translation table to the handler boundary
 
-**Tag:** understudy / quick
+**Tag:** understudy / api
 
-**Design:** [DESIGN.md §understudy](../DESIGN.md#understudy).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "One table maps an
+upstream failure to what the client is told", the status/`type` split the
+rate-limit reject rests on, and the `5xx/401/403` body obfuscation the table has
+to keep.
 
-Errors carry their OpenAI envelope `type` via an `ErrorType() string` method;
-the response seam reads it (`errorType(err)` via `errors.AsType`) and falls back
-to `server_error` only when no error in the chain carries one. The type is set
-by whoever has the most context: the openai provider classifies upstream errors
-(`errorFromResponse`: the upstream's `type`, else `typeForStatus(status)`), and
-understudy tags its own errors at construction (`typedError`). 401 is
-`authentication_error` via `authMiddleware`.
+The mapping lives in the provider today (`typeForStatus` in `providers/openai`),
+and whatever `type` the upstream named is relayed ahead of it. Both contradict
+[`providers/providers.go`](../providers/providers.go) — "what the client is shown
+is derived at the handler boundary, never set by a provider" — so extending the
+provider's table would deepen the split rather than close it.
 
-## Remaining work
+- Give the provider an interface that reports the **condition** it observed
+  rather than an envelope type. `ErrorTyper` asks for the answer; a provider can
+  only honestly supply the observation.
+- Move the mapping to the handler boundary as one table over condition and health
+  state, deriving status, `type`, and `Retry-After` together — they are decided by
+  the same facts and currently diverge across three sites.
+- Answer for the request, not for its last candidate. The walk hands the client
+  whichever error came last, so `[a: 500, b: 401]` reports forbidden; §Understudy
+  now requires the most-optimistic verdict over the attempts on `Excluded`.
+  Refusals become `400` `upstream_refused`, which nothing emits today.
+- Settle the row still open: what an overloaded upstream carries once
+  `overloaded_error` stops arriving by passthrough, and whether it stays
+  distinguishable from a faulted one.
+- Publish it. There is no user-facing doc yet — see [[documentation]], whose
+  README and library-doc restructure are where a consumer reads this.
 
-- **Extend the provider's status→type table.** `typeForStatus` maps
-  `429 -> rate_limit_error` and `400`/`404 -> invalid_request_error` so far;
-  other statuses default to `server_error`. Add remaining OpenAI conventions
-  (403 -> permission_error, …) as behaviors drive them. `401` is deliberately
-  deferred: for a proxy an upstream 401 means
-  understudy's *configured* backend key is bad, not the client's token, so
-  `authentication_error` would mislead the client — it stays `server_error`
-  until that semantics is decided.
+Nothing depends on passthrough today: live lindy dispatches on envelope `type`
+nowhere, and [[understudy-ratelimit-firewall]]'s planned dispatch already expects
+understudy-derived types. That window closes when the firewall lands.
+
+## Also here
 
 - **De-duplicate the type wrapper.** `typedError` (understudy) and `errorTypeError`
   (openai) are the same shape in two packages; extract to a shared spot once a

@@ -16,6 +16,9 @@
 - `examples/free-tiers.toml` — the killer demo (failover depth in 5 minutes at
   zero cost, where a single-provider demo hides it). The file itself is
   [[free-tier-drop-in-config]]; the README must link and explain it.
+- The failure-translation table ([[understudy-error-envelope-type]]) — status,
+  envelope `type`, and `Retry-After` per upstream condition. A consumer dispatches
+  on it, so it belongs in the library doc rather than only in the code.
 - `providers-tested.md` matrix: provider · OpenAI-compat endpoint · free-tier
   limit shape · last-verified date · quirks. Re-verify monthly (free tiers rot;
   Cerebras has paused theirs before).

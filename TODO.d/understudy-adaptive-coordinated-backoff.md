@@ -13,6 +13,13 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
+- **Synthesize for a 5xx at all.** Both `Retry-After` branches in the response path
+  are gated on `sig.isRateLimit`, which is `status == 429`, so a `5xx` — a plain
+  `503`, a transport failure, an Anthropic `529` — reaches the client as a bare
+  `502` with no backoff signal. §Understudy names "a 429 without the header, **or a
+  5xx**" as the case this mechanism exists for, so this is the coverage gap under
+  the graduated-interval work below, not a separate feature.
+
 - **Graduated injected backoff.** understudy still injects only a **fixed** 60s
   `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
   `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
