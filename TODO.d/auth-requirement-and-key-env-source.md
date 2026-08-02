@@ -25,12 +25,14 @@ Build the `auth` declaration: what kind of fact an absent credential is.
   rewritten, no model emptied.
 - Under `auth = "required"`, an empty key is a validation error naming both the
   backend and the source that should have supplied it.
-- Under `auth = "none"`, exclude the backend from credential-refusal failover: a
-  `401` from it reaches the client instead of demoting the target and replaying
-  onto a sibling. `isCredentialRefused` currently fires on every `401`, which is
-  unobservable only while no config can declare `auth = "none"` — landing the
-  vocabulary makes the divergence real, so the two must ship together. Needs the
-  `auth` value at the failover decision, which `Backend` does not carry today.
+- Under `auth = "none"`, exclude the backend from access-refusal failover **for
+  the `401` arm only**: a `401` from it reaches the client instead of demoting the
+  target and replaying onto a sibling, while its `402` and `403` still fail over —
+  neither says anything about a declaration. `isAccessRefused` currently fires on
+  every `401`, which is unobservable only while no config can declare
+  `auth = "none"` — landing the vocabulary makes the divergence real, so the two
+  must ship together. Needs the `auth` value at the failover decision, which
+  `Backend` does not carry today.
 
 Depends on [[resolve-validate-split]] for the stage that runs these rules; the
 `api_key_env` source itself is built.

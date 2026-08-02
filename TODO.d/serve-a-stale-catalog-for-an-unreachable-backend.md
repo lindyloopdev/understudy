@@ -18,7 +18,7 @@ Least degradation is what makes this attractive and also what bounds it: a stale
 entry must never make understudy advertise a model it cannot route to, so decide
 what the cache is allowed to outlive.
 
-- **What invalidates an entry.** A refused credential and a removed backend are
+- **What invalidates an entry.** Refused access and a removed backend are
   facts a stale catalog would lie about, unlike a 429 or a 5xx. Distinguishing
   them means the listing reads the failure's kind, which the endpoint deliberately
   does not do today ("whatever its cause").

@@ -759,11 +759,13 @@ func isFatalUpstream(err error) bool {
 	return yerrors.HTTPStatus(err) >= 500
 }
 
-// isCredentialRefused reports whether the upstream refused the target's
-// credential (401: rejected, 402: out of funds).
-func isCredentialRefused(err error) bool {
+// isAccessRefused reports whether the upstream refused the account the target
+// (401: identity rejected, 402: out of funds, 403: not permitted). Each is a
+// standing property of the account, not of the request, so retrying the same
+// target only refuses again.
+func isAccessRefused(err error) bool {
 	switch yerrors.HTTPStatus(err) {
-	case http.StatusUnauthorized, http.StatusPaymentRequired:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
 		return true
 	}
 	return false
@@ -1685,7 +1687,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.clearFailure(chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(chosen, sig.retryAfter, backend.Backends)
-			case demote || isCredentialRefused(err):
+			case demote || isAccessRefused(err):
 				s.recordImmediateFailure(chosen, backend.Backends)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
@@ -1693,10 +1695,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		if err != nil {
-			// A sustainedRate 429 or a refused credential has just demoted chosen
+			// A sustainedRate 429 or refused access has just demoted chosen
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
-			if logicalTargets != nil && (sig.condition == sustainedRate || isCredentialRefused(err)) {
+			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
 					addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)

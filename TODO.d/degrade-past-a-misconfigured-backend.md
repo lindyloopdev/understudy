@@ -48,7 +48,7 @@ valid answer for the listing whatever its cause).
 
 ## Out of scope
 
-- **Failover for a target unusable at runtime.** A refused credential or an
+- **Failover for a target unusable at runtime.** Refused access or an
   unreachable host still demotes and is walked past; only *static* unusability is
   a skip. See [[fail-over-in-place-from-a-demoted-target]].
 - **An unset credential under `auth = "auto"`.** The document is correct and the

@@ -2569,7 +2569,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// TODO(TODO.d/cover-a-reference-timed-and-immediate-demotions.md): the cases
 	// above drive only the streak. A directly-named reference also benches the
 	// shared account on a 429 carrying a Retry-After, and demotes it outright on a
-	// refused credential; neither is driven that way here.
+	// refused access; neither is driven that way here.
 
 	tests.Add("should demote a target on a 429 with no Retry-After", test{
 		backends: map[string]backendStub{
@@ -2909,6 +2909,22 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should fail over within the request when a target forbids the request", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	// TODO(TODO.d/specify-what-a-refusal-promises.md): the case above pins only
+	// that this request gets an answer. A second case belongs here for what the
+	// demotion buys the next one — a request a second later serving from "b" with
+	// "a" never called, its Excluded empty because the walk skips it.
+
 	tests.Add("should fail over across requests when a recurring 429's Retry-After is below the demotion threshold", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
@@ -2948,6 +2964,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"model":"mb","messages":[{"role":"user","content":"hi"}]}`, wantBackend: "b"},
 		},
 	})
+
+	// TODO(TODO.d/specify-what-a-refusal-promises.md): the refusal's counterpart to
+	// the case below belongs here — every candidate answering 403, the walk
+	// spending the list, and the client receiving that refusal.
+	//
+	// TODO(TODO.d/envelope-type-for-a-relayed-refusal.md): that case will observe
+	// the refusal typed server_error, which it is not. Pin what ships and leave the
+	// type to its own change rather than correcting it under a new test.
 
 	tests.Add("should surface the 429 when every target is rate-limited past the threshold", test{
 		backends: map[string]backendStub{

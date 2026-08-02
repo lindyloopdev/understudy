@@ -83,9 +83,10 @@ is** — a defect in the document, or a fact about the world:
   nothing to be absent. Naming a key source is a config error, since it could
   never be read. If the upstream turns out to demand a credential after all, its
   `401` is the diagnostic and reaches the client — the one exception to the
-  credential-refusal failover below. A `401` here contradicts the *declaration*,
-  not an account, so no sibling can serve in its place; routing around it would
-  hide a wrong config behind a paid backend.
+  access-refusal failover below, and that exception covers the `401` alone. A
+  `401` here contradicts the *declaration*, not an account, so no sibling can
+  serve in its place; routing around it would hide a wrong config behind a paid
+  backend.
 - `optional` — **reserved, rejected.** Send a credential when one loads, stay
   available when none does. Its name is held so that `auto` does not drift into
   meaning it.
@@ -154,24 +155,49 @@ understudy routes each request to the first target not currently
 failing past a threshold, tracking a failing-since per canonical `(url + key + model)` and
 classifying a 502/connection error as an availability failure. understudy **walks** the list,
 advancing to the next target when an attempt is **classified an availability
-failure** — a hard error (502/connection), a rate-limited target, or a **refused
-credential**: a `401` (rejected) or `402` (out of funds) from a backend that
-supplies one. A refused credential is an availability fact about the one account
-called, not a client error — a cost-ordered candidate list reaches an exhausted
-balance in the ordinary course — so the target is demoted at once and the request
-continues on a sibling instead of the refusal reaching the client. A backend
-declaring `auth = none` is excluded: it supplies no credential to refuse, so its
-`401` is a config diagnostic and passes through (see §LLM API Keys via Understudy).
+failure** — a hard error (502/connection), a rate-limited target, or **refused
+access**: a `401` (identity rejected), `402` (out of funds), or `403` (not
+permitted). Refused access is an availability fact about the one account called,
+not a client error — a cost-ordered candidate list reaches an exhausted balance in
+the ordinary course, and an account is routinely entitled to one backend's model
+and not another's — so the target is demoted at once and the request continues on
+a sibling instead of the refusal reaching the client. The three differ only in why
+the account may not use the target, never in what understudy can do about it
+within the request.
+
+A backend declaring `auth = none` is excluded **from the `401` arm only**: it
+supplies no credential to refuse, so its `401` is a config diagnostic and passes
+through (see §LLM API Keys via Understudy). That argument is about credentials, so
+it does not reach `402` or `403`, which say nothing about a declaration.
+
+**Every `403` is account-scoped, so this arm needs no request-scoped guard.** That
+is a finding about what providers send, not an assumption drawn from the status. A
+refusal the *request* earned arrives one of two ways: as a `4xx` naming the request
+itself as the defect, or as a **successful** response the model declined, which
+understudy relays untouched. Neither is classified here. A `403` means the account
+may not use the target — an unsupported region, a permission its key lacks — and
+even where a safety system answers `403`, it is aggregated over the account's
+traffic and clears on its own, which is account-scoped and temporary: exactly what
+demotion and recovery already handle.
+
+The guard is therefore unbuilt on purpose, and the damage it would prevent is
+unreachable until that finding stops holding. Were a provider to answer `403` for
+one request's content, understudy would replay it across every candidate, be
+refused identically at each, and demote them all on the way — benching targets
+that serve other requests fine, on the strength of one request. That is the signal
+to stop the walk and keep such a refusal out of the health map, since a fact about
+one request is not evidence about an account. Until a provider sends that shape,
+there is nothing for a guard to distinguish.
 
 **Least degradation: a backend understudy cannot use costs that backend, not the
-request.** The refused-credential rule generalizes past runtime faults. A backend
+request.** The refused-access rule generalizes past runtime faults. A backend
 may also be unusable *statically* — its `provider_type` has no registered handler,
 or it reached understudy without a base URL — and that is still a fact about one
 backend, which the candidate list exists precisely so one fact cannot decide the
 request. So an unusable backend is **skipped where a target is chosen**, and a
 request that resolves to a usable sibling never pays for it.
 
-Skipped, not demoted. A refused credential is a fact about the world that can
+Skipped, not demoted. Refused access is a fact about the world that can
 change on its own, so it belongs in the health state the failover walk consults; a
 statically unusable backend cannot become usable without a configuration change, so
 demoting it would seed a health entry no recovery probe can ever clear

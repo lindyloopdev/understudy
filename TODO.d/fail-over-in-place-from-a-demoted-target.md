@@ -10,12 +10,12 @@ threshold"); also the failover walk and the per-target health it reads.
 probe that decides when a demoted target is offered a request at all).
 
 A 5xx from a target already past the failover threshold is surfaced to the client
-even when an untried alternate is healthy: only `sustainedRate` and a refused
-credential replay onto the next target today. So a demoted target's request ends
-in a 502 the candidate list could have routed around.
+even when an untried alternate is healthy: only `sustainedRate` and refused access
+replay onto the next target today. So a demoted target's request ends in a 502 the
+candidate list could have routed around.
 
 - Widen the within-request replay condition (the
-  `sustainedRate || isCredentialRefused` branch in `chatCompletions`) to include a
+  `sustainedRate || isAccessRefused` branch in `chatCompletions`) to include a
   failure from a target whose streak is past the failover threshold.
 - Keep the blip exemption: a target *within* the threshold is still retried in
   place, not failed over.

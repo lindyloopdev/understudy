@@ -17,7 +17,7 @@ through all three paths, but only the streak-accruing one (`recordFailure`, from
   on the same account dial elsewhere before the advertised time elapses. This is
   the shape a streak cannot stand in for: `recordRateLimited` writes `readmitAt`,
   which supersedes the schedule rather than accruing against a threshold.
-- **A refused credential demotes at once.** Name `a/ma` directly, answer 401 or
+- **Refused access demotes at once.** Name `a/ma` directly, answer 401 or
   402, and show the very next logical-model request routing around the account
   with no interval elapsing.
 
