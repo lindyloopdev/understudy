@@ -1107,14 +1107,15 @@ func cause(ctx context.Context, err error) error {
 var errNoBackendConfigured = yerrors.WithHTTPStatus(http.StatusInternalServerError, errors.New("no backend configured"))
 
 // Error envelope `type` values. The first three are OpenAI-spec, written by
-// [writeJSONError]; the upstream_* values are understudy-specific, written by
-// [writeRetryAfterReject].
+// [writeJSONError]; the upstream_* values are understudy's own, written by the
+// rejects that end a request rather than relay it.
 const (
 	errTypeAuth                = "authentication_error"
 	errTypeServer              = "server_error"
 	errTypeInvalidRequest      = "invalid_request_error"
 	errTypeUpstreamRateLimited = "upstream_rate_limited"
 	errTypeUpstreamUnavailable = "upstream_unavailable"
+	errTypeUpstreamRefused     = "upstream_refused"
 )
 
 // maxPassthroughRetryAfter is the longest Retry-After delay understudy
@@ -1174,19 +1175,42 @@ var sensitiveResponseHeaders = []string{"Authorization", "Set-Cookie"}
 // internal error detail, and 401/403 to avoid revealing which auth check
 // failed. The real error is always logged.
 func writeJSONError(ctx context.Context, w http.ResponseWriter, err error, errType string) {
-	setLogError(ctx, err)
 	status := yerrors.HTTPStatus(err)
 	msg := err.Error()
 	if status >= 500 || status == http.StatusUnauthorized || status == http.StatusForbidden {
 		msg = http.StatusText(status)
 	}
+	writeErrorEnvelope(ctx, w, err, status, msg, errType, 0)
+}
+
+// errorBody is the shape every failure answer takes on the wire, so the format has
+// one declaration rather than a literal at each writer. retryAfter is understudy's
+// own decision — sometimes what an upstream advertised, sometimes a value it
+// synthesized — so it arrives as a duration and is rendered in milliseconds here,
+// where the wire encoding belongs.
+type errorBody struct {
+	Error        apiError `json:"error"`
+	RetryAfterMS int64    `json:"retry_after_ms,omitempty"`
+}
+
+type apiError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+// writeErrorEnvelope writes the error body every failure answer shares. The real
+// error reaches the log whatever the client is shown. A zero retryAfter carries no
+// delay at all; a rounded one is how far off the client is told to come back.
+func writeErrorEnvelope(ctx context.Context, w http.ResponseWriter, err error, status int, message, errType string, retryAfter time.Duration) {
+	setLogError(ctx, err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"message": msg,
-			"type":    errType,
-		},
+	// TODO(TODO.d/record-a-client-that-left-before-the-answer.md): a client that
+	// disconnects between the header and the body leaves no trace here, where the
+	// streaming path logs the same event.
+	_ = json.NewEncoder(w).Encode(errorBody{
+		Error:        apiError{Message: message, Type: errType},
+		RetryAfterMS: retryAfter.Round(time.Second).Milliseconds(),
 	})
 }
 
@@ -1244,6 +1268,10 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 					return
 				}
 			}
+			if isAccessRefused(err) {
+				writeRefusal(r.Context(), w, err)
+				return
+			}
 			// Forward the upstream backoff so the client waits before retrying.
 			if sig.isRateLimit && sig.hasRetryAfter {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
@@ -1257,19 +1285,22 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 	}
 }
 
+// writeRefusal writes the 400 reject for a request no configured target will
+// serve. It does not route through [writeJSONError]: that obfuscates on status
+// (>=500, 401, 403), so a 400 escapes it and would carry the upstream's own words.
+// No delay rides with it either, because no delay clears a refusal. What a client
+// may be told is §Understudy's to say, not this function's.
+func writeRefusal(ctx context.Context, w http.ResponseWriter, err error) {
+	writeErrorEnvelope(ctx, w, err, http.StatusBadRequest,
+		"no configured target could serve this request", errTypeUpstreamRefused, 0)
+}
+
 // writeRetryAfterReject writes a 400 reject envelope carrying errType and
 // message plus a top-level retry_after_ms. remaining is rounded to the nearest
 // second to absorb the few ms of processing lag between when the provider
 // parsed Retry-After and when we emit the response.
 func writeRetryAfterReject(ctx context.Context, w http.ResponseWriter, err error, remaining time.Duration, errType, message string) {
-	setLogError(ctx, err)
-	retryAfterMS := remaining.Round(time.Second).Milliseconds()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":          map[string]any{"message": message, "type": errType},
-		"retry_after_ms": retryAfterMS,
-	})
+	writeErrorEnvelope(ctx, w, err, http.StatusBadRequest, message, errType, remaining)
 }
 
 // responseStatus classifies an error into an HTTP status. A status-less

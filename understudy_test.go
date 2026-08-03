@@ -2789,10 +2789,11 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// a size a consumer can read.
 	//
 	// TODO(TODO.d/understudy-error-envelope-type.md): the refusal path takes the same
-	// sweep and re-stamp, and no case drives it across the window because none can —
-	// a refused reference answers 401 whatever its streak's age, the reject switch
-	// covering only 429 and 502. Write the pair once a refusal answers 400
-	// upstream_refused and the age starts to show.
+	// sweep and re-stamp, and still no case drives it across the window, because a
+	// refusal's answer does not vary with age: writeRefusal renders before any streak
+	// is consulted, so 0h, 23h and 48h all give 400 upstream_refused. Whether that
+	// should change is the open question — only an operator clears a refusal, so a
+	// streak may have nothing to say about one.
 
 	tests.Add("should start a fresh streak once a directly-named reference's demotion has gone untouched past the eviction window", test{
 		backends: map[string]backendStub{
@@ -2976,6 +2977,30 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should tell a client a refused request is terminal without repeating what the upstream said", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{
+				model:      "a/ma",
+				wantStatus: http.StatusBadRequest,
+				wantBody:   `{"error":{"message":"no configured target could serve this request","type":"upstream_refused"}}`,
+			},
+		},
+	})
+
+	// TODO(TODO.d/understudy-error-envelope-type.md): the case above pins the half
+	// of the disclosure rule that hides. Nothing pins the half that tells: a case
+	// belongs here reading LogRecordFromContext after a refusal and asserting Err
+	// carries the upstream's own words, so the operator keeps what the client loses.
+	//
+	// TODO(TODO.d/understudy-error-envelope-type.md): and nothing yet drives a mixed
+	// walk. `[a: 429 for 60s, b: 401]` answers upstream_refused on b, telling a
+	// client to escalate while a is merely throttled and will serve. Write it when
+	// the verdict reads the attempts on Excluded rather than the last error.
+
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)},
@@ -3033,12 +3058,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	})
 
 	// TODO(TODO.d/specify-what-a-refusal-promises.md): the refusal's counterpart to
-	// the case below belongs here — every candidate answering 403, the walk
-	// spending the list, and the client receiving that refusal.
-	//
-	// TODO(TODO.d/envelope-type-for-a-relayed-refusal.md): that case will observe
-	// the refusal typed server_error, which it is not. Pin what ships and leave the
-	// type to its own change rather than correcting it under a new test.
+	// the case below belongs here. A whole list refusing answers the same 400
+	// upstream_refused a single target does, so the status cannot tell them apart —
+	// the walk shows only on Excluded, with every candidate called and refused.
 
 	tests.Add("should surface the 429 when every target is rate-limited past the threshold", test{
 		backends: map[string]backendStub{

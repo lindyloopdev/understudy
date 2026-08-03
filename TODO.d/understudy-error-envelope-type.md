@@ -19,10 +19,11 @@ provider's table would deepen the split rather than close it.
 - Move the mapping to the handler boundary as one table over condition and health
   state, deriving status, `type`, and `Retry-After` together — they are decided by
   the same facts and currently diverge across three sites.
-- Answer for the request, not for its last candidate. The walk hands the client
-  whichever error came last, so `[a: 500, b: 401]` reports forbidden; §Understudy
-  now requires the most-optimistic verdict over the attempts on `Excluded`.
-  Refusals become `400` `upstream_refused`, which nothing emits today.
+- Answer for the request, not for its last candidate. The walk still renders
+  whichever error came last, so `[a: 429 for 60s, b: 401]` answers
+  `upstream_refused` on `b` while `a` is merely throttled and will serve once its
+  delay elapses. §Understudy requires the most-optimistic verdict over the
+  attempts already on `Excluded`.
 - Settle the row still open: what an overloaded upstream carries once
   `overloaded_error` stops arriving by passthrough, and whether it stays
   distinguishable from a faulted one.

@@ -759,11 +759,14 @@ over first, so a client is told one of these only once no untried candidate rema
 
 **A walk that runs out of candidates answers for the request, not for its last
 target.** Relaying the final failure makes the answer depend on list order: with
-`[a: 500, b: 401]` a caller is told it is forbidden, when `a` was merely broken and
-will be back. The verdict is instead the **most optimistic** disposition among the
-candidates tried — if any one of them is time-bound, the request is retryable, and
-the delay is the soonest of them, since that is the earliest it could succeed. Only
-when every candidate needs an operator is the answer stop.
+`[a: 429 for 60s, b: 401]` a caller is told to escalate a standing refusal, when
+`a` is merely throttled and will serve once its delay elapses. Only a sustained
+`429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
+falls — so the last candidate is the one whose answer a client sees. The verdict is
+instead the **most optimistic** disposition among the candidates tried — if any one
+of them is time-bound, the request is retryable, and the delay is the soonest of
+them, since that is the earliest it could succeed. Only when every candidate needs
+an operator is the answer stop.
 
 Optimism is the cheaper error. Guessing retryable when nothing will recover costs
 one more failed request; guessing terminal when something would have recovered
@@ -782,8 +785,20 @@ reject exists to make the agent stop — so the delay is put where only the
 orchestrator above it will read it. understudy is speaking past the agent to
 lindy, which schedules the retry itself.
 
-An upstream's own `type` string is still relayed ahead of this table today —
-[[understudy-error-envelope-type]].
+An upstream's own `type` string is still relayed ahead of this table today, except
+on the refusal row — [[understudy-error-envelope-type]].
+
+**A failure the caller cannot act on says so and no more.** Where a request fails
+on understudy's own arrangements with a provider — a credential rejected, a balance
+spent, a resource the account was never granted — the client is told the request
+cannot be served, and never which of those it was. It can pay no bill, rotate no
+key, and opt no account into a region, so the cause is not help to it; and
+understudy's client is a party the operator has already decided not to trust with
+secrets (§LLM API Keys via Understudy), which makes the operator's commercial
+standing not understudy's to disclose either. The cause goes to the log, where the
+operator reads it. The envelope `type` still separates a refusal from an
+outage, because a consumer has to tell *wait* from *escalate* — that much is
+remediation, not narration.
 
 **understudy's own refusals**, which reach no upstream:
 
