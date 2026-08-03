@@ -763,10 +763,28 @@ target.** Relaying the final failure makes the answer depend on list order: with
 `a` is merely throttled and will serve once its delay elapses. Only a sustained
 `429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
 falls — so the last candidate is the one whose answer a client sees. The verdict is
-instead the **most optimistic** disposition among the candidates tried — if any one
-of them is time-bound, the request is retryable, and the delay is the soonest of
-them, since that is the earliest it could succeed. Only when every candidate needs
-an operator is the answer stop.
+instead the **most optimistic** disposition among the candidates the request had —
+including one it declined to call, because a target benched until a known time is
+as time-bound as a disposition gets.
+
+Every candidate contributes a delay or contributes nothing, so there is no tie to
+break by judgement:
+
+| what the candidate did | contributes |
+| --- | --- |
+| advertised a `Retry-After` | what remains of it |
+| answered a retryable failure advertising none — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
+| stalled before its header | the synthesized stall backoff |
+| was benched and never called | its `readmitAt`, less now |
+| refused — `401`, `402`, `403` | nothing; only an operator clears it |
+| answered a `5xx` no retry can help — `501`, `505` | nothing |
+| was unusable as configured | nothing; only a config change clears it |
+
+The verdict is the **soonest** contribution, answered in the shape of the candidate
+that made it: a bench earned by a rate limit answers as a rate limit, carrying that
+bench's remaining time. Answering in the shape of whichever failure happened to end
+the walk would tell a client to stop and to retry in the same breath. A verdict with
+no contribution at all is the stop.
 
 Optimism is the cheaper error. Guessing retryable when nothing will recover costs
 one more failed request; guessing terminal when something would have recovered
