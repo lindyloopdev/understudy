@@ -1,6 +1,6 @@
-# Sweep health entries a target walk never reaches
+# Bound the health map against a caller minting keys
 
-**Tag:** understudy / ha / bug
+**Tag:** understudy / ha
 
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — per-target health
 and the failover walk that reads it.
@@ -8,25 +8,22 @@ and the failover walk that reads it.
 — health keying on `(url + key + model)`, of which the model half is whatever the
 caller named.
 
-`evictStaleHealth` runs from one place, `pickTarget`, which only a logical model
-reaches. A request naming `<backend>/<model>` directly records health without ever
-walking a candidate list, so an understudy driven only by references — or by a
-caller cycling model names against a declared backend — grows `s.health` with
-entries nothing sweeps. The key's model half is caller-supplied, so the ceiling is
-whatever a client cares to type.
+A request naming `<backend>/<model>` directly puts a caller-supplied string in the
+health key, so the set of entries a client can mint is whatever it cares to type.
 
-- Sweep from the write paths (`recordFailure`, `recordImmediateFailure`,
-  `recordRateLimited`) rather than from the walk, so an entry is reclaimed by the
-  same event that minted it.
 - Decide whether a TTL alone is the bound. It answers the idle case but not a
   caller minting fresh keys faster than `healthTTL` retires them; a size cap
-  answers that and needs an eviction order to go with it.
-- State the policy in DESIGN.md. The health map's eviction window is a constant in
-  the code with no design section governing it — unlike the tenant registry's,
-  which §Daemon idle eviction settles.
-
-The test belongs beside "should start a fresh streak once a demotion has gone
-untouched past the eviction window" in `TestChatCompletionsFailoverRouting`: the
-same two steps, both naming `a/ma` directly. Measured today, that pair answers a
-terminal 400 `upstream_unavailable` on a day-old streak where the logical-model
-case gets a fresh 502 `server_error`.
+  answers that and needs an eviction order to go with it. The sweep is O(n) and
+  now runs on every health write, so a map a caller has inflated makes each
+  subsequent write costlier under the lock — the cap bounds latency, not just
+  memory.
+- Give the map an observable size before specifying the cap. Nothing reports how
+  many entries `s.health` holds — no metric, no control-plane read — so neither
+  the bound nor the sweep that feeds it can be stated as a behavior anyone can
+  check. A cap phrased as "evict the least-recently-touched entry once the map
+  exceeds a bound" cannot be tested against a map no consumer can see, and the
+  reason the sweep on the refusal path is untestable is the same absence.
+- State the policy in DESIGN.md, including that the sweep reclaims the whole map
+  rather than the key being written — the property the bound rests on. The
+  eviction window is a constant in the code with no design section governing it,
+  unlike the tenant registry's, which §Daemon idle eviction settles.

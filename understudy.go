@@ -552,8 +552,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) Target {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	s.evictStaleHealth(now)
+	now := s.evictStaleHealth()
 	for _, t := range targets {
 		if _, err := s.resolveBackend(backends, t.backend); err != nil {
 			addLogSkipped(ctx, t.backend, t.model, err)
@@ -621,15 +620,37 @@ func (s *server) noteBackendDown(id string, t Target, h targetHealth) {
 	s.health[id] = h
 }
 
-// evictStaleHealth drops every entry untouched for healthTTL — the ones no live
-// target can reach any more, since a reachable demotion is re-stamped by the
-// probes and failures that keep measuring it. Caller holds s.mu.
-func (s *server) evictStaleHealth(now time.Time) {
+// evictStaleHealth drops every entry untouched for healthTTL and returns the
+// sweep time, so a caller's own write agrees with the eviction. Caller holds s.mu.
+func (s *server) evictStaleHealth() time.Time {
+	now := time.Now()
 	for id, h := range s.health {
 		if now.Sub(h.lastTouch) >= healthTTL {
 			delete(s.health, id)
 		}
 	}
+	return now
+}
+
+// writeHealth stores t's health under s.mu. It sweeps first — the only thing that
+// reclaims an entry named directly and so never walked past — then stamps the
+// entry with the sweep's own clock, so a write cannot be aged out by the sweep
+// that preceded it. mint builds an entry for a key the map does not hold; update,
+// when non-nil, revises one it does.
+func (s *server) writeHealth(t Target, backends map[string]Backend, mint func(now time.Time) targetHealth, update func(now time.Time, h targetHealth) targetHealth) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.evictStaleHealth()
+	id := healthKey(t, backends)
+	h, ok := s.health[id]
+	switch {
+	case !ok:
+		h = mint(now)
+	case update != nil:
+		h = update(now, h)
+	}
+	h.lastTouch = now
+	s.health[id] = h
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
@@ -638,13 +659,9 @@ func (s *server) evictStaleHealth(now time.Time) {
 // threshold), so the first half-open probe waits a full recovery interval after
 // the target is actually routed around, not from its first failure.
 func (s *server) recordFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if _, ok := s.health[id]; !ok {
-		now := time.Now()
-		s.health[id] = targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold), lastTouch: now}
-	}
+	s.writeHealth(t, backends, func(now time.Time) targetHealth {
+		return targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold)}
+	}, nil)
 }
 
 // demotedHealth builds the health of a target demoted at once: the streak is
@@ -659,12 +676,9 @@ func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
 // the very next request rather than tolerating it for a failover threshold.
 func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if _, ok := s.health[id]; !ok {
-		s.health[id] = s.demotedHealth(time.Now(), time.Time{})
-	}
+	s.writeHealth(t, backends, func(now time.Time) targetHealth {
+		return s.demotedHealth(now, time.Time{})
+	}, nil)
 }
 
 // recordRateLimited demotes t at once like recordImmediateFailure, but records a
@@ -673,18 +687,12 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 // the recovery interval, so a target under a timed backoff is not re-admitted
 // before the backoff it advertised has elapsed.
 func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	now := time.Now()
-	h, ok := s.health[id]
-	if !ok {
-		h = s.demotedHealth(now, now.Add(retryAfter))
-	} else {
-		h.readmitAt = now.Add(retryAfter)
-		h.lastTouch = now
-	}
-	s.health[id] = h
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(retryAfter)) },
+		func(now time.Time, h targetHealth) targetHealth {
+			h.readmitAt = now.Add(retryAfter)
+			return h
+		})
 }
 
 // failingFor reports how long t's current failure streak has run, or zero when

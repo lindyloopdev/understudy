@@ -2762,9 +2762,76 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): the case above with both
-	// steps naming "a/ma" belongs here — nothing sweeps an entry the walk never
-	// reaches, so it answers a terminal 400 on a day-old streak, not a fresh 502.
+	tests.Add("should hold a demotion open while a directly-named reference keeps failing across the eviction window", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				model:        "a/ma",
+				advance:      23 * time.Hour,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+			{
+				model:        "a/ma",
+				advance:      2 * time.Hour,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+		},
+	})
+
+	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): these cases pin what the
+	// window reclaims; nothing pins what it cannot until the map has a size cap and
+	// a size a consumer can read.
+	//
+	// TODO(TODO.d/understudy-error-envelope-type.md): the refusal path takes the same
+	// sweep and re-stamp, and no case drives it across the window because none can —
+	// a refused reference answers 401 whatever its streak's age, the reject switch
+	// covering only 429 and 502. Write the pair once a refusal answers 400
+	// upstream_refused and the age starts to show.
+
+	tests.Add("should start a fresh streak once a directly-named reference's demotion has gone untouched past the eviction window", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				model:        "a/ma",
+				advance:      24*time.Hour + time.Second,
+				wantStatus:   http.StatusBadGateway,
+				wantBody:     badGateway502,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+			},
+		},
+	})
+
+	tests.Add("should start a fresh streak once a rate-limited reference's demotion has gone untouched past the eviction window", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{
+				model:      "a/ma",
+				advance:    24*time.Hour + time.Second,
+				wantStatus: http.StatusTooManyRequests,
+				wantBody:   rateLimit429,
+			},
+		},
+	})
 
 	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
 		backends: map[string]backendStub{
