@@ -491,6 +491,26 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	// TODO(TODO.d/treat-an-elapsed-retry-after-as-none.md): the delay's sign is
+	// unpinned. An upstream naming a moment already past yields a negative remaining
+	// delay, which reaches the client as Retry-After: -649568026 here and as a
+	// negative retry_after_ms in the reject body. A case belongs beside this one.
+
+	tests.AddFunc("should relay a 503's advertised Retry-After on the 502 it answers with", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"back shortly"}}`)),
+					Header:     http.Header{"Retry-After": {"30"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"30"}},
+		}
+	})
+
 	tests.AddFunc("should synthesize a Retry-After for a 429 that lacks one", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -2830,6 +2850,26 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				advance:    24*time.Hour + time.Second,
 				wantStatus: http.StatusTooManyRequests,
 				wantBody:   rateLimit429,
+			},
+		},
+	})
+
+	// TODO(TODO.d/pin-a-never-retryable-that-advertised-a-delay.md): this reaches the
+	// never-retryable clear through shouldReject only. A 501 that also named a delay
+	// takes the other branch, and no case sends one. Those belong beside this.
+
+	tests.Add("should not invent a delay for a target no retry can help, however long it has failed", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadGateway,
+				wantBody:     badGateway502,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
 			},
 		},
 	})

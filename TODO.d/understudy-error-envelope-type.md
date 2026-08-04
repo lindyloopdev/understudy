@@ -26,6 +26,11 @@ provider's table would deepen the split rather than close it.
   candidate the request had, benched ones included — so it cannot be read off
   `LogRecord.Excluded`, which is telemetry a caller need not install and which a
   bench never reaches at all.
+- Extend the never-retryable class to health accounting. What a client is told
+  keys on `neverRetryable`, but the health map still keys on `isFatalUpstream` —
+  `status >= 500` — so a `501` accrues a streak, demotes, and is re-probed forever
+  like a `503`. §Understudy calls those statuses a standing fact, the treatment a
+  refusal already gets: nothing time can clear should be waiting on time.
 - Settle the row still open: what an overloaded upstream carries once
   `overloaded_error` stops arriving by passthrough, and whether it stays
   distinguishable from a faulted one.

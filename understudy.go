@@ -292,6 +292,13 @@ func (l *upstreamLimiter) tryAcquire() bool {
 	return false
 }
 
+// neverRetryableError lets the response path recognize a failure no delay can
+// clear, after clientFacing has flattened the upstream status to 502 and taken the
+// evidence with it.
+type neverRetryableError struct{ error }
+
+func (e neverRetryableError) Unwrap() error { return e.error }
+
 func (l *upstreamLimiter) release() {
 	l.mu.Lock()
 	l.inflight--
@@ -754,7 +761,11 @@ func clientFacing(ctx context.Context, err error) error {
 	if errors.Is(err, context.Cause(ctx)) {
 		return err
 	}
-	if yerrors.HTTPStatus(err) >= 500 {
+	if status := yerrors.HTTPStatus(err); status >= 500 {
+		// §Understudy's "a 5xx no retry can help", enumerated.
+		if status == http.StatusNotImplemented {
+			err = neverRetryableError{err}
+		}
 		return yerrors.WithHTTPStatus(http.StatusBadGateway, err)
 	}
 	return err
@@ -849,6 +860,8 @@ func classifyLimit(err error) limitClassification {
 		error
 		RetryAfter() time.Time
 	}](err); ok {
+		// TODO(TODO.d/treat-an-elapsed-retry-after-as-none.md): an elapsed advertisement
+		// is no advertisement — this keeps it, negative.
 		sig.hasRetryAfter = true
 		sig.retryAfter = time.Until(ra.RetryAfter())
 	}
@@ -862,6 +875,14 @@ func classifyLimit(err error) limitClassification {
 		if !sig.hasRetryAfter {
 			sig.retryAfter = maxPassthroughRetryAfter
 		}
+	}
+	// A failure no retry can help offers no delay, in either form one takes: not a
+	// relayed header, not a reject's retry_after_ms. Clearing it here rather than at
+	// each exit keeps the two from drifting apart.
+	if _, never := errors.AsType[neverRetryableError](err); never {
+		sig.hasRetryAfter = false
+		sig.shouldReject = false
+		sig.retryAfter = 0
 	}
 	switch {
 	case !sig.isRateLimit:
@@ -1272,8 +1293,11 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 				writeRefusal(r.Context(), w, err)
 				return
 			}
-			// Forward the upstream backoff so the client waits before retrying.
-			if sig.isRateLimit && sig.hasRetryAfter {
+			// Any retryable failure carries its advertised backoff, not just a rate
+			// limit — a 503 that named its own return is worth relaying. A request the
+			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
+			// means nothing.
+			if sig.hasRetryAfter && (sig.isRateLimit || isFatalUpstream(err)) {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
 			}
 			// A rate limit the upstream left unbounded still needs a client backoff.

@@ -150,7 +150,12 @@ not here.
   selector; the name is the whole interface.
 
 **Availability failover.** A logical model resolves to a **priority-ordered
-candidate list** (`BackendConfig.Models`) that understudy **fails over** across.
+candidate list** (`BackendConfig.Models`) that understudy **fails over** across. A
+request naming a `<backend>/<model>` reference instead resolves to that one target
+and is not failed over — a logical model *is* the declaration of which substitutes
+are acceptable and in what order, so a reference, declaring none, leaves understudy
+nothing it is authorized to try. Both forms are otherwise identical: everything
+below keys on the canonical endpoint, never on how a request spelled it.
 understudy routes each request to the first target not currently
 failing past a threshold, tracking a failing-since per canonical `(url + key + model)` and
 classifying a 502/connection error as an availability failure. understudy **walks** the list,
@@ -429,7 +434,8 @@ understudy performs. Ease of first run is a **packaging** concern, answered by a
 shipped example configuration that declares its own models, not by understudy
 guessing.
 
-**Rate-limit reject.** A long upstream `Retry-After` (429/5xx) is converted to a
+**Rate-limit reject.** A long upstream `Retry-After` on a retryable failure — a
+`429`, or a `5xx` outside the never-retryable class — is converted to a
 non-retryable **400** before the agent sees it — opencode honors `Retry-After`
 with no ceiling (~24.8 days) and lindy can't detect the situation from the event
 stream, so the reject must live in the proxy. The response splits status (400 =
@@ -441,8 +447,10 @@ failure carrying **no** `Retry-After` — a 429 without the header, or a 5xx —
 not relayed raw either. Unhandled, opencode hammers rapid retries at a failing
 upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** a
 `Retry-After` and injects it while preserving the retryable status, so opencode
-backs off *understudy's* interval instead of its flat 30s. The interval grows
-exponentially per backend, is jittered, and resets on success; its ceiling **is
+backs off *understudy's* interval instead of its flat 30s. Only the `429` half is
+built: a `5xx` advertising nothing still reaches the client bare, and the injected
+interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
+interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is
 the rate-limit-reject threshold**, so on crossing it the response becomes that
 same terminal 400 — one threshold caps both paths. This makes understudy an
 active backoff *controller*, not a pure header relay — still an availability
@@ -744,6 +752,11 @@ obfuscated for `5xx`/`401`/`403` per the rule above. These are a request's **fin
 disposition: a refusal, a stall, and a `429` past the demotion threshold each fail
 over first, so a client is told one of these only once no untried candidate remains.
 
+A **`5xx` no retry can help** is `501`: the operation is not implemented, and no
+delay changes that. It is a standing fact like a refusal, not the transient fault
+the rest of the range describes. The tables below name the class rather than the
+status, so a row reads as the rule it follows.
+
 | what the upstream did | client status | envelope `type` | retry delay |
 | --- | --- | --- | --- |
 | `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
@@ -752,7 +765,10 @@ over first, so a client is told one of these only once no untried candidate rema
 | `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
 | `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
 | `429` advertising nothing | `429` | `rate_limit_error` | synthesized |
-| `5xx`, or a transport failure that never answered | `502` | `server_error` | synthesized — [[understudy-adaptive-coordinated-backoff]] |
+| a `5xx` no retry can help | `502` | `server_error` | none, whatever it advertised |
+| any other `5xx` advertising up to the passthrough ceiling (≈2m) | `502` | `server_error` | the delay still outstanding |
+| any other `5xx` advertising beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+| any other `5xx` advertising nothing, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
 | overloaded (`529` and kin) | `502` | *open* | as `5xx` |
 | every candidate stalled before its header | `504` | `server_error` | — |
 | failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
@@ -777,7 +793,7 @@ break by judgement:
 | stalled before its header | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
 | refused — `401`, `402`, `403` | nothing; only an operator clears it |
-| answered a `5xx` no retry can help — `501`, `505` | nothing |
+| answered a `5xx` no retry can help | nothing |
 | was unusable as configured | nothing; only a config change clears it |
 
 The verdict is the **soonest** contribution, answered in the shape of the candidate
@@ -818,6 +834,14 @@ operator reads it. The envelope `type` still separates a refusal from an
 outage, because a consumer has to tell *wait* from *escalate* — that much is
 remediation, not narration.
 
+**A `500` is understudy's own fault, never an upstream's.** Every upstream `5xx`
+is flattened to `502` — which one a backend chose is not the client's business —
+and `500` is reserved for understudy failing: a panic it recovered, a configuration
+it cannot serve from. That reservation is why the flattening happens where a
+failure is known to be a relay, rather than where every error is rendered: by then
+understudy's own `500` and a backend's are indistinguishable, and the reservation
+would be lost.
+
 **understudy's own refusals**, which reach no upstream:
 
 | condition | status | envelope `type` |
@@ -827,6 +851,7 @@ remediation, not narration.
 | malformed body, malformed reference, or a rejected override | `400` | `invalid_request_error` |
 | client disconnected | `499` | — |
 | request deadline exceeded | `504` | — |
+| understudy panicked, or cannot serve from its own configuration | `500` | `server_error` |
 
 **understudy owns its telemetry record; what a consumer does with it is the consumer's.**
 understudy's telemetry is understudy's, so its log record — the **`LogRecord`** value type —
