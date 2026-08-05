@@ -775,10 +775,10 @@ status, so a row reads as the rule it follows.
 
 **A walk that runs out of candidates answers for the request, not for its last
 target.** Relaying the final failure makes the answer depend on list order: with
-`[a: 429 for 60s, b: 401]` a caller is told to escalate a standing refusal, when
-`a` is merely throttled and will serve once its delay elapses. Only a sustained
+`[a: 429 for 60s, b: 401]` a caller would be told to escalate a standing refusal,
+when `a` is merely throttled and will serve once its delay elapses. Only a sustained
 `429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
-falls — so the last candidate is the one whose answer a client sees. The verdict is
+falls — so it would be the last candidate whose answer a client sees. The verdict is
 instead the **most optimistic** disposition among the candidates the request had —
 including one it declined to call, because a target benched until a known time is
 as time-bound as a disposition gets.
@@ -806,8 +806,9 @@ Optimism is the cheaper error. Guessing retryable when nothing will recover cost
 one more failed request; guessing terminal when something would have recovered
 strands work that could have run. The individual reasons are not lost — every
 attempt is on `LogRecord.Excluded` with the status it answered, which is where an
-operator reads what actually happened. The walk relays its last candidate's error
-today — [[understudy-error-envelope-type]].
+operator reads what actually happened. Today only one contribution is weighed: an earlier
+candidate's timed backoff answers for a walk a refusal ended. Every other walk
+relays its last candidate's error — [[weigh-every-candidates-contribution]].
 
 A relayed failure carries its delay in a `Retry-After` **header** — retry-control
 aimed at the agent, which sleeps and retries on its own. A **reject** carries it as

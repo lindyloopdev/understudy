@@ -1601,6 +1601,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
+	// throttledErr is the error of a candidate the walk replayed past under a timed
+	// backoff, and throttledTarget the candidate that raised it — the answer is judged
+	// against whichever target it came from.
+	// TODO(TODO.d/weigh-every-candidates-contribution.md)
+	var throttledErr error
+	var throttledTarget Target
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
@@ -1765,6 +1771,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
 			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
+				if throttledErr == nil && sig.condition == sustainedRate && sig.hasRetryAfter {
+					throttledErr, throttledTarget = err, chosen
+				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
 					addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
@@ -1777,7 +1786,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			releaseHeld()
 			cancel(nil)
 			remaining := untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
-			return s.terminalFailure(chosen, remaining, backend.Backends, clientFacing(ctx, err))
+			answering := chosen
+			if throttledErr != nil && isAccessRefused(err) {
+				// The answer is an earlier candidate's, so this one is a target the
+				// request did not serve from — and the only record of why it refused.
+				addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
+				err, answering = throttledErr, throttledTarget
+			}
+			return s.terminalFailure(answering, remaining, backend.Backends, clientFacing(ctx, err))
 		}
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 

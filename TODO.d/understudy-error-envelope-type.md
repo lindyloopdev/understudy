@@ -19,13 +19,10 @@ provider's table would deepen the split rather than close it.
 - Move the mapping to the handler boundary as one table over condition and health
   state, deriving status, `type`, and `Retry-After` together — they are decided by
   the same facts and currently diverge across three sites.
-- Answer for the request, not for its last candidate. The walk still renders
-  whichever error came last, so `[a: 429 for 60s, b: 401]` answers
-  `upstream_refused` on `b` while `a` is merely throttled and will serve once its
-  delay elapses. §Understudy requires the most-optimistic verdict over every
-  candidate the request had, benched ones included — so it cannot be read off
-  `LogRecord.Excluded`, which is telemetry a caller need not install and which a
-  bench never reaches at all.
+- Answer for the request, not for its last candidate —
+  [[weigh-every-candidates-contribution]]. The verdict cannot be read off
+  `LogRecord.Excluded`: that is telemetry a caller need not install, and a bench
+  never reaches it at all.
 - Extend the never-retryable class to health accounting. What a client is told
   keys on `neverRetryable`, but the health map still keys on `isFatalUpstream` —
   `status >= 500` — so a `501` accrues a streak, demotes, and is re-probed forever

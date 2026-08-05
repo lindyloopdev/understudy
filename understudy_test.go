@@ -3049,11 +3049,68 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// of the disclosure rule that hides. Nothing pins the half that tells: a case
 	// belongs here reading LogRecordFromContext after a refusal and asserting Err
 	// carries the upstream's own words, so the operator keeps what the client loses.
-	//
-	// TODO(TODO.d/understudy-error-envelope-type.md): and nothing yet drives a mixed
-	// walk. `[a: 429 for 60s, b: 401]` answers upstream_refused on b, telling a
-	// client to escalate while a is merely throttled and will serve. Write it when
-	// the verdict reads the attempts on Excluded rather than the last error.
+
+	tests.Add("should answer with an earlier candidate's throttle rather than the refusal that ended the walk", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+		},
+	})
+
+	tests.Add("should record the refused target a request did not serve from when an earlier throttle answers for it", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantExcluded: []Attempt{
+				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
+				{Backend: "b", ModelUpstream: "mb", UpstreamStatus: http.StatusUnauthorized, Err: errors.New("upstream returned status 401: invalid api key"), Called: true},
+			}},
+		},
+	})
+
+	tests.Add("should keep answering with an earlier candidate's throttle once the target that refused has been failing past the terminal threshold", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 2 {
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-a"}`)), Header: http.Header{}}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"60"}},
+				}, nil
+			}},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 61 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
+			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+		},
+	})
+
+	// TODO(TODO.d/weigh-every-candidates-contribution.md): the cases that entry names
+	// belong beside these.
 
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{
