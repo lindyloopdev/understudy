@@ -491,10 +491,24 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/treat-an-elapsed-retry-after-as-none.md): the delay's sign is
-	// unpinned. An upstream naming a moment already past yields a negative remaining
-	// delay, which reaches the client as Retry-After: -649568026 here and as a
-	// negative retry_after_ms in the reject body. A case belongs beside this one.
+	tests.AddFunc("should synthesize a backoff for a 429 whose Retry-After has already elapsed", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					Header:     http.Header{"Retry-After": {"Mon, 02 Jan 2006 15:04:05 GMT"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusTooManyRequests,
+			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+		}
+	})
+
+	// TODO(TODO.d/pin-a-5xx-whose-advertisement-elapsed.md): the case above pins the
+	// 429 leg of an elapsed advertisement. A 5xx takes the other arm of the relay and
+	// answers with no header at all; nothing drives it.
 
 	tests.AddFunc("should relay a 503's advertised Retry-After on the 502 it answers with", func(t *testing.T) test {
 		return test{

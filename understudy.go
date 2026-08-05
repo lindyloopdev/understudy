@@ -835,7 +835,8 @@ type limitClassification struct {
 	status int
 	// isRateLimit reports status == 429 Too Many Requests.
 	isRateLimit bool
-	// hasRetryAfter reports that the upstream advertised a Retry-After.
+	// hasRetryAfter reports that the upstream advertised a Retry-After still
+	// outstanding; one that has elapsed counts as no advertisement.
 	hasRetryAfter bool
 	// retryAfter is the remaining Retry-After delay (valid when hasRetryAfter).
 	retryAfter time.Duration
@@ -860,10 +861,12 @@ func classifyLimit(err error) limitClassification {
 		error
 		RetryAfter() time.Time
 	}](err); ok {
-		// TODO(TODO.d/treat-an-elapsed-retry-after-as-none.md): an elapsed advertisement
-		// is no advertisement — this keeps it, negative.
-		sig.hasRetryAfter = true
-		sig.retryAfter = time.Until(ra.RetryAfter())
+		// An elapsed advertisement leaves nothing to relay, so the failure falls to
+		// the synthesized path rather than handing every reader a negative delay.
+		if remaining := time.Until(ra.RetryAfter()); remaining > 0 {
+			sig.hasRetryAfter = true
+			sig.retryAfter = remaining
+		}
 	}
 	sig.shouldReject = sig.hasRetryAfter && sig.retryAfter > maxPassthroughRetryAfter
 	// A failure the walk gave up on rejects on its own terms: the streak, not an
