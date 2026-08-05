@@ -1771,7 +1771,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
 			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
-				if throttledErr == nil && sig.condition == sustainedRate && sig.hasRetryAfter {
+				// The verdict is the soonest return on offer, so a later candidate
+				// displaces the incumbent when it comes back first. The incumbent's
+				// delay is re-derived rather than remembered, so both are what remains
+				// as of now.
+				if sig.condition == sustainedRate && sig.hasRetryAfter &&
+					(throttledErr == nil || sig.retryAfter < classifyLimit(throttledErr).retryAfter) {
 					throttledErr, throttledTarget = err, chosen
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))

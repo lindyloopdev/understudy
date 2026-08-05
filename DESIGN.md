@@ -800,15 +800,14 @@ The verdict is the **soonest** contribution, answered in the shape of the candid
 that made it: a bench earned by a rate limit answers as a rate limit, carrying that
 bench's remaining time. Answering in the shape of whichever failure happened to end
 the walk would tell a client to stop and to retry in the same breath. A verdict with
-no contribution at all is the stop.
+no contribution at all is the stop. Not every row is weighed yet —
+[[weigh-every-candidates-contribution]].
 
 Optimism is the cheaper error. Guessing retryable when nothing will recover costs
 one more failed request; guessing terminal when something would have recovered
 strands work that could have run. The individual reasons are not lost — every
 attempt is on `LogRecord.Excluded` with the status it answered, which is where an
-operator reads what actually happened. Today only one contribution is weighed: an earlier
-candidate's timed backoff answers for a walk a refusal ended. Every other walk
-relays its last candidate's error — [[weigh-every-candidates-contribution]].
+operator reads what actually happened.
 
 A relayed failure carries its delay in a `Retry-After` **header** — retry-control
 aimed at the agent, which sleeps and retries on its own. A **reject** carries it as

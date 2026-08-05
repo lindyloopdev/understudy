@@ -7,19 +7,18 @@ out of candidates answers for the request, not for its last target", the
 contribution table beneath it (what each disposition offers), and "the verdict is
 the soonest contribution, answered in the shape of the candidate that made it".
 
-The walk keeps one candidate's error and prefers it only over a refusal, so two
-measured cases answer worse than the design requires:
+Nothing pins that the comparison weighs what *remains* of each offer rather than
+what each advertised: every case compares candidates at one virtual instant, so a
+remembered delay and a re-derived one agree. A walk where time passes between calls
+tells them apart — `a` advertising 40s, `b` taking 15s to answer and advertising
+30s, ending on a refusal: the client is owed `a`'s remaining 25s, not `b`'s 30s.
+The stub's sleep has to stay under the 20s header-stall gate.
 
-- **First-wins, not soonest.** `[a: 429/30m, b: 429/60s, c: 401]` answers `400`
-  `upstream_rate_limited` with `retry_after_ms: 1800000` — `a` is captured and
-  `b` discarded, and 30m past the passthrough ceiling turns the answer terminal.
-  The client is told to stop for half an hour while `b` would serve in a minute.
-  Each contribution has to be weighed against the incumbent; the walk keeps the
-  first it sees.
-- **Only a refusal yields.** `[a: 429/60s, b: 401, c: 501]` answers a bare `502`,
-  discarding `a`'s 60s because the walk ended on a `501` rather than a refusal.
-  Every zero-contribution ending should yield — a never-retryable `5xx`, an
-  unusable target, a plain `5xx` that ends the walk where it falls.
+The walk weighs the timed backoffs it replays past, but only a refusal yields to
+them: `[a: 429/60s, b: 401, c: 501]` answers a bare `502`, discarding `a`'s 60s
+because the walk ended on a `501`. Every zero-contribution ending should yield — a
+never-retryable `5xx`, an unusable target, a plain `5xx` that ends the walk where
+it falls.
 
 The remaining contribution rows are unbuilt too: a benched candidate's
 `readmitAt`, a stall's synthesized backoff, and a retryable failure advertising

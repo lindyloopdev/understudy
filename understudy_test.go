@@ -2517,6 +2517,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	always := func(status int, body string) func(*http.Request, int) (*http.Response, error) {
 		return func(*http.Request, int) (*http.Response, error) { return resp(status, body), nil }
 	}
+	// throttling answers 429 with a Retry-After, so a case reads as the return each
+	// candidate offered rather than as four near-identical response literals.
+	throttling := func(retryAfter, message string) func(*http.Request, int) (*http.Response, error) {
+		return func(*http.Request, int) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"error":{"type":"rate_limit_error","message":%q}}`, message))),
+				Header:     http.Header{"Retry-After": {retryAfter}},
+			}, nil
+		}
+	}
 	// stall never returns a response header, blocking until its request context is
 	// cancelled — a pre-header stall. The long fallback keeps a broken gate surfacing
 	// as an assertion failure rather than a hang.
@@ -3108,6 +3119,23 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
 		},
 	})
+
+	tests.Add("should answer with the soonest throttle among the candidates it walked past", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: throttling("1800", "back in half an hour")},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: throttling("60", "back in a minute")},
+			"c": {baseURL: "http://c/v1", apiKey: "sk-c", resp: throttling("900", "back in fifteen minutes")},
+			"d": {baseURL: "http://d/v1", apiKey: "sk-d", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}, {backend: "d", model: "md"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+		},
+	})
+
+	// TODO(TODO.d/weigh-every-candidates-contribution.md): every case here compares
+	// candidates at one instant, so nothing tells a remembered delay from a re-derived
+	// one. The walk that does belongs beside this.
 
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): the cases that entry names
 	// belong beside these.
