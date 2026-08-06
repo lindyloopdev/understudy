@@ -1,4 +1,4 @@
-# Weigh every candidate's contribution, not the first throttle
+# Tell a client when something will serve, whatever turned it away
 
 **Tag:** understudy / bug
 
@@ -7,24 +7,43 @@ out of candidates answers for the request, not for its last target", the
 contribution table beneath it (what each disposition offers), and "the verdict is
 the soonest contribution, answered in the shape of the candidate that made it".
 
-Nothing pins that the comparison weighs what *remains* of each offer rather than
-what each advertised: every case compares candidates at one virtual instant, so a
-remembered delay and a re-derived one agree. A walk where time passes between calls
-tells them apart — `a` advertising 40s, `b` taking 15s to answer and advertising
-30s, ending on a refusal: the client is owed `a`'s remaining 25s, not `b`'s 30s.
-The stub's sleep has to stay under the 20s header-stall gate.
+When nothing can serve a request now, the client should be told when something
+will. Two dispositions deliver on that today — a timed backoff the walk replayed
+past, weighed against every other, yielding to a refusal or an unimplemented
+operation. The rest of the table does not, so which promise a client gets still
+depends on what happened to end its walk.
 
-A walk ending on a target unusable as configured still discards an earlier
-throttle; a refusal and a `5xx` no retry can help both yield to one.
+**This is one behavior, not a row per disposition.** The verdict is a comparison,
+so a contributor is only worth building when everything it can be compared against
+is also computable. The rows below are blocked on each other, not independent:
 
-The remaining contribution rows are unbuilt too: a benched candidate's
-`readmitAt`, a stall's synthesized backoff, and a retryable failure advertising
-nothing (which needs [[understudy-adaptive-coordinated-backoff]] to have an
-interval to offer).
+- A **benched candidate** offers its `readmitAt`. Only reachable when the walk ends
+  without replaying — a plain `5xx` or a transient `429` — because `untriedTargets`
+  ignores health, so any replay calls the benched candidate anyway. Measured: with
+  `[a benched, b: 401]` the walk calls `a`, so "declined to call" is far rarer than
+  §Understudy implies.
+- A **plain `5xx`** and a **`429` advertising nothing** offer that endpoint's
+  synthesized interval, which does not exist — [[understudy-adaptive-coordinated-backoff]].
+  This blocks the bench row: the walk that leaves a bench uncalled usually ends on a
+  `5xx`, so the comparison has nothing to weigh the bench against.
+- A **stall** offers the synthesized stall backoff.
+- A walk ending on a target **unusable as configured** still discards an earlier
+  throttle. Reachability unverified: `pickTarget` skips such targets rather than
+  ending a walk with their error.
 
-**Open first:** whether a candidate left untried because the walk stopped
-contributes at all. §Understudy names benched candidates as the ones counted
-beyond those tried; a transient `429` ends the walk with later targets never
-called, and nothing says whether they are the request's candidates for this
-purpose. It decides what the comparison ranges over, so settle it before building
-the comparison.
+So the order is the synthesized interval first, then the rest of the table
+together. Building the bench row alone would honor the promise in one corner and
+break it in the common case, which is worse than breaking it everywhere.
+
+**Also open:** whether a candidate left untried because the walk stopped
+contributes at all. §Understudy counts benched candidates beyond those tried; a
+transient `429` ends a walk with later targets never called, and nothing says
+whether those are the request's candidates. It decides what the comparison ranges
+over.
+
+**Uncovered in what does work:** nothing pins that the comparison weighs what
+*remains* of each offer rather than what each advertised — every case compares
+candidates at one virtual instant, so a remembered delay and a re-derived one
+agree. A walk where time passes tells them apart: `a` advertising 40s, `b` taking
+15s to answer and advertising 30s, ending on a refusal, the client owed `a`'s
+remaining 25s. The stub's sleep must stay under the 20s header-stall gate.

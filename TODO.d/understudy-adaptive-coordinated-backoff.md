@@ -136,3 +136,7 @@ Shares one per-host health-state substrate with failover (go elsewhere) and the
 circuit breaker (the binary degenerate of this backoff). Together they are the
 post-v1 **per-host availability layer**, all capped by the same threshold the
 stateless reject uses.
+
+The interval is also what a `5xx` or a signal-less `429` contributes to a walk's
+verdict, so the rest of that comparison waits on this —
+[[weigh-every-candidates-contribution]].
