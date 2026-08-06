@@ -762,7 +762,6 @@ func clientFacing(ctx context.Context, err error) error {
 		return err
 	}
 	if status := yerrors.HTTPStatus(err); status >= 500 {
-		// §Understudy's "a 5xx no retry can help", enumerated.
 		if status == http.StatusNotImplemented {
 			err = neverRetryableError{err}
 		}
@@ -1792,9 +1791,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			cancel(nil)
 			remaining := untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			answering := chosen
-			if throttledErr != nil && isAccessRefused(err) {
+			// A refusal contributes nothing to the verdict, and neither does an
+			// operation the upstream does not implement.
+			if throttledErr != nil &&
+				(isAccessRefused(err) || yerrors.HTTPStatus(err) == http.StatusNotImplemented) {
 				// The answer is an earlier candidate's, so this one is a target the
-				// request did not serve from — and the only record of why it refused.
+				// request did not serve from — and the only record of why.
 				addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
 				err, answering = throttledErr, throttledTarget
 			}

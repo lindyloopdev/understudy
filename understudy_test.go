@@ -3133,6 +3133,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should answer with an earlier candidate's throttle rather than a failure no retry can help", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: throttling("60", "back in a minute")},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+		},
+	})
+
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): every case here compares
 	// candidates at one instant, so nothing tells a remembered delay from a re-derived
 	// one. The walk that does belongs beside this.

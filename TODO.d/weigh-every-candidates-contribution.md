@@ -14,11 +14,8 @@ tells them apart — `a` advertising 40s, `b` taking 15s to answer and advertisi
 30s, ending on a refusal: the client is owed `a`'s remaining 25s, not `b`'s 30s.
 The stub's sleep has to stay under the 20s header-stall gate.
 
-The walk weighs the timed backoffs it replays past, but only a refusal yields to
-them: `[a: 429/60s, b: 401, c: 501]` answers a bare `502`, discarding `a`'s 60s
-because the walk ended on a `501`. Every zero-contribution ending should yield — a
-never-retryable `5xx`, an unusable target, a plain `5xx` that ends the walk where
-it falls.
+A walk ending on a target unusable as configured still discards an earlier
+throttle; a refusal and a `5xx` no retry can help both yield to one.
 
 The remaining contribution rows are unbuilt too: a benched candidate's
 `readmitAt`, a stall's synthesized backoff, and a retryable failure advertising
