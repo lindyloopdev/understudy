@@ -2641,10 +2641,47 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/cover-a-reference-timed-and-immediate-demotions.md): the cases
-	// above drive only the streak. A directly-named reference also benches the
-	// shared account on a 429 carrying a Retry-After, and demotes it outright on a
-	// refused access; neither is driven that way here.
+	// A recovering "a" is what makes these cases discriminate: were the account
+	// merely accruing a streak, it would be re-probed and serve, so an answer from
+	// "b" is proof understudy did not call it.
+	recovering := func(fail func(*http.Request, int) (*http.Response, error)) func(*http.Request, int) (*http.Response, error) {
+		return func(r *http.Request, call int) (*http.Response, error) {
+			if call > 1 {
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}
+			return fail(r, call)
+		}
+	}
+
+	tests.Add("should route a logical model around an account a directly-named reference benched, until the advertised time elapses", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(throttling("60", "slow down"))},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{advance: 46 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{advance: 15 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
+		},
+	})
+
+	tests.Add("should route a logical model around an account a directly-named reference was refused by, with no interval elapsing", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`))},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				model:        "a/ma",
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamRefused}},
+				wantBackend:  "a",
+			},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
 
 	tests.Add("should demote a target on a 429 with no Retry-After", test{
 		backends: map[string]backendStub{
