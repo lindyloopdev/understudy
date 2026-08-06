@@ -604,10 +604,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:      New(validator, WithLogger(testLogger(t))).(*server),
-			requestBody: `{"model":"openai/gpt-4?thinking=banana","messages":[{"role":"user","content":"hi"}]}`,
-			wantStatus:  http.StatusBadRequest,
-			// TODO(TODO.d/direct-target-reference-drops-query-overrides.md)
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"openai/gpt-4?thinking=banana","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
 			wantBodyContains:    []string{`"type":"invalid_request_error"`, `openai/gpt-4?thinking=banana`},
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
