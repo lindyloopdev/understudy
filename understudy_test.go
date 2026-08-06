@@ -2616,16 +2616,25 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		}
 	}
 
+	// loggedAnswer is the part of a LogRecord that names the candidate a request
+	// answered from, so a case can assert it without the walk's Excluded list.
+	type loggedAnswer struct {
+		Backend        string
+		ModelUpstream  string
+		UpstreamStatus int
+		Err            error
+	}
 	type step struct {
 		// model is what the request names; empty means the logical model "m".
-		model       string
-		advance     time.Duration
-		wantStatus  int
-		wantBody    string
-		wantBackend string
-		// wantExcluded is what the request did not serve from, asserted only when
-		// non-nil so the cases that are not about the log record stay silent on it.
+		model        string
+		advance      time.Duration
+		wantStatus   int
+		wantBody     string
+		wantBackend  string
 		wantExcluded []Attempt
+		// wantLogged is the log record's own account of the candidate the request
+		// answered from, asserted field by field wherever a case sets one.
+		wantLogged loggedAnswer
 		// wantEnvelope is the error response's asserted aspects; a field left zero
 		// is one this case's behavior does not name.
 		wantEnvelope errorEnvelope
@@ -3318,14 +3327,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/specify-what-a-refusal-promises.md): the case below pins only the
-	// Excluded half. Nothing reads the record's own fields for a multi-candidate walk,
-	// so the other half of §Understudy's claim — that they identify the candidate the
-	// request answered from, by backend, status and the upstream's words — rests on
-	// a single-target case. A case belongs beside this one; the step harness reads no
-	// field but Excluded today.
-
-	tests.Add("should record on Excluded the candidates a refused request moved on from", test{
+	tests.Add("should name the candidate a refused request answered from, with the ones it moved past on Excluded", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusForbidden, `{"error":{"message":"not permitted"}}`)},
@@ -3336,10 +3338,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				advance:      0,
 				wantStatus:   http.StatusBadRequest,
 				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamRefused}},
-				// "b" ended the walk, so its refusal rides the record's own fields
-				// rather than this list — see LogRecord.Excluded's doc.
 				wantExcluded: []Attempt{
 					{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusUnauthorized, Err: errors.New("upstream returned status 401: invalid api key"), Called: true},
+				},
+				wantLogged: loggedAnswer{
+					Backend:        "b",
+					ModelUpstream:  "mb",
+					UpstreamStatus: http.StatusForbidden,
+					Err:            errors.New("upstream returned status 403: not permitted"),
 				},
 			},
 		},
@@ -3408,11 +3414,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				if rr.Code != s.wantStatus {
 					t.Errorf("step %d: status got %d want %d", i, rr.Code, s.wantStatus)
 				}
-				if s.wantExcluded != nil {
-					rec, _ := LogRecordFromContext(ctx)
-					if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty()); d != "" {
-						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
-					}
+				rec, _ := LogRecordFromContext(ctx)
+				if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty(), assertedFields); d != "" {
+					t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
+				}
+				answered := loggedAnswer{Backend: rec.BackendName, ModelUpstream: rec.ModelUpstream, UpstreamStatus: rec.UpstreamStatus, Err: rec.Err}
+				if d := gocmp.Diff(s.wantLogged, answered, errorText, assertedFields); d != "" {
+					t.Errorf("step %d log record (-want +got):\n%s", i, d)
 				}
 				if s.wantBody != "" {
 					if d := testy.DiffJSON([]byte(s.wantBody), rr.Body.Bytes()); d != nil {

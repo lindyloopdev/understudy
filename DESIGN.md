@@ -763,7 +763,7 @@ status, so a row reads as the rule it follows.
 | what the upstream did | client status | envelope `type` | retry delay |
 | --- | --- | --- | --- |
 | `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
-| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none — [[specify-what-a-refusal-promises]] |
+| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none; the account's own recovery clears it |
 | `429` advertising under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
 | `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
 | `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
@@ -795,7 +795,7 @@ break by judgement:
 | answered a retryable failure advertising none — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
 | stalled before its header | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
-| refused — `401`, `402`, `403` | nothing — [[specify-what-a-refusal-promises]] |
+| refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
 | answered a `5xx` no retry can help | nothing |
 | was unusable as configured | nothing; only a config change clears it |
 
