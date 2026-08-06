@@ -259,9 +259,12 @@ stand in for a cadence the consumer knows and understudy does not. The consumer
 knows its own unit of work, so the fact is handed to it and it decides whether that
 becomes a log line, a metric, or nothing.
 
-Everything a request considered and did not serve from goes on one record,
-`Excluded`, whatever kept it from serving: a target abandoned after a call, a target
-understudy could not use and never called, a backend a listing left out. They differ
+Everything a request moved on from goes on one record, `Excluded`, whatever kept it
+from serving: a target abandoned after a call, a target understudy could not use and
+never called, a backend a listing left out. The candidate that *ended* a walk is
+carried in the record's own fields when it is what the request answered from; when
+an earlier candidate answers for the request instead, it joins `Excluded` like any
+other the walk moved past. They differ
 in why they did not serve, not in what the consumer is being told, and one list
 preserves the order a request walked its candidates in — an exclusion and a failover
 interleave, and two lists could not say which came first. `Called` carries the
@@ -760,7 +763,7 @@ status, so a row reads as the rule it follows.
 | what the upstream did | client status | envelope `type` | retry delay |
 | --- | --- | --- | --- |
 | `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
-| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none; only an operator clears it |
+| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none — [[specify-what-a-refusal-promises]] |
 | `429` advertising under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
 | `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
 | `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
@@ -792,7 +795,7 @@ break by judgement:
 | answered a retryable failure advertising none — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
 | stalled before its header | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
-| refused — `401`, `402`, `403` | nothing; only an operator clears it |
+| refused — `401`, `402`, `403` | nothing — [[specify-what-a-refusal-promises]] |
 | answered a `5xx` no retry can help | nothing |
 | was unusable as configured | nothing; only a config change clears it |
 
@@ -806,8 +809,9 @@ no contribution at all is the stop. Not every row is weighed yet —
 Optimism is the cheaper error. Guessing retryable when nothing will recover costs
 one more failed request; guessing terminal when something would have recovered
 strands work that could have run. The individual reasons are not lost — every
-attempt is on `LogRecord.Excluded` with the status it answered, which is where an
-operator reads what actually happened.
+candidate the walk moved on from is on `LogRecord.Excluded` with the status it
+answered, and the one the request answered from is in the record's own fields,
+which together are where an operator reads what actually happened.
 
 A relayed failure carries its delay in a `Retry-After` **header** — retry-control
 aimed at the agent, which sleeps and retries on its own. A **reject** carries it as

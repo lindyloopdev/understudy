@@ -320,6 +320,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		server              *server
 		wantStatus          int
 		wantBody            string
+		wantBodyContains    []string
 		wantResponseHeaders http.Header
 	}
 
@@ -536,9 +537,20 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/pin-a-5xx-whose-advertisement-elapsed.md): the case above pins the
-	// 429 leg of an elapsed advertisement. A 5xx takes the other arm of the relay and
-	// answers with no header at all; nothing drives it.
+	tests.AddFunc("should not relay a 5xx's Retry-After once the moment it named has passed", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"back shortly"}}`)),
+					Header:     http.Header{"Retry-After": {"Mon, 02 Jan 2006 15:04:05 GMT"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
 
 	tests.AddFunc("should relay a 503's advertised Retry-After on the 502 it answers with", func(t *testing.T) test {
 		return test{
@@ -585,9 +597,22 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/direct-target-reference-drops-query-overrides.md): a non-boolean
-	// override — openai/gpt-4?thinking=banana — is rejected here too, and only the
-	// config path covers that rule.
+	tests.AddFunc("should tell the caller an override it cannot read is not a value it may send", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:      New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody: `{"model":"openai/gpt-4?thinking=banana","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:  http.StatusBadRequest,
+			// TODO(TODO.d/direct-target-reference-drops-query-overrides.md)
+			wantBodyContains:    []string{`"type":"invalid_request_error"`, `openai/gpt-4?thinking=banana`},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
 	tests.AddFunc("should tell the caller a reserved override is not supported rather than ignoring it", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
@@ -963,8 +988,15 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		if rr.Code != tt.wantStatus {
 			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
 		}
-		if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
-			t.Errorf("unexpected body: %s", d)
+		if tt.wantBody != "" {
+			if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
+				t.Errorf("unexpected body: %s", d)
+			}
+		}
+		for _, want := range tt.wantBodyContains {
+			if !strings.Contains(rr.Body.String(), want) {
+				t.Errorf("body does not mention %q: %s", want, rr.Body.String())
+			}
 		}
 		if d := gocmp.Diff(tt.wantResponseHeaders, rr.Header()); d != "" {
 			t.Errorf("unexpected response headers: %s", d)
@@ -2460,6 +2492,23 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the upstream's own words for a refusal the client is not told", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"invalid api key"}}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want:        map[string]any{"error": "upstream returned status 401: invalid api key"},
+		}
+	})
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := New(tt.validator, WithLogger(testLogger(t)))
@@ -2528,9 +2577,6 @@ var assertedFields = gocmp.FilterPath(func(p gocmp.Path) bool {
 	return want.IsValid() && want.IsZero()
 }, gocmp.Ignore())
 
-// TODO(TODO.d/direct-target-reference-drops-query-overrides.md): every case here
-// drives a logical model, but a directly-named backend/model reference now reaches
-// the same health map — its failures can demote an account other requests share.
 func TestChatCompletionsFailoverRouting(t *testing.T) {
 	t.Parallel()
 
@@ -3119,11 +3165,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/understudy-error-envelope-type.md): the case above pins the half
-	// of the disclosure rule that hides. Nothing pins the half that tells: a case
-	// belongs here reading LogRecordFromContext after a refusal and asserting Err
-	// carries the upstream's own words, so the operator keeps what the client loses.
-
 	tests.Add("should answer with an earlier candidate's throttle rather than the refusal that ended the walk", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
@@ -3225,10 +3266,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/specify-what-a-refusal-promises.md): the case above pins only
-	// that this request gets an answer. A second case belongs here for what the
-	// demotion buys the next one — a request a second later serving from "b" with
-	// "a" never called, its Excluded empty because the walk skips it.
+	tests.Add("should not call again, on the next request, a target that refused the account", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`))},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b", wantExcluded: []Attempt{}},
+		},
+	})
 
 	tests.Add("should fail over across requests when a recurring 429's Retry-After is below the demotion threshold", test{
 		backends: map[string]backendStub{
@@ -3270,10 +3318,32 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/specify-what-a-refusal-promises.md): the refusal's counterpart to
-	// the case below belongs here. A whole list refusing answers the same 400
-	// upstream_refused a single target does, so the status cannot tell them apart —
-	// the walk shows only on Excluded, with every candidate called and refused.
+	// TODO(TODO.d/specify-what-a-refusal-promises.md): the case below pins only the
+	// Excluded half. Nothing reads the record's own fields for a multi-candidate walk,
+	// so the other half of §Understudy's claim — that they identify the candidate the
+	// request answered from, by backend, status and the upstream's words — rests on
+	// a single-target case. A case belongs beside this one; the step harness reads no
+	// field but Excluded today.
+
+	tests.Add("should record on Excluded the candidates a refused request moved on from", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusForbidden, `{"error":{"message":"not permitted"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				advance:      0,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamRefused}},
+				// "b" ended the walk, so its refusal rides the record's own fields
+				// rather than this list — see LogRecord.Excluded's doc.
+				wantExcluded: []Attempt{
+					{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusUnauthorized, Err: errors.New("upstream returned status 401: invalid api key"), Called: true},
+				},
+			},
+		},
+	})
 
 	tests.Add("should surface the 429 when every target is rate-limited past the threshold", test{
 		backends: map[string]backendStub{
@@ -3340,7 +3410,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				}
 				if s.wantExcluded != nil {
 					rec, _ := LogRecordFromContext(ctx)
-					if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText); d != "" {
+					if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty()); d != "" {
 						t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
 					}
 				}
