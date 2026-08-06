@@ -506,6 +506,36 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should not relay a delay advertised by a failure no retry can help", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotImplemented,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not implemented"}}`)),
+					Header:     http.Header{"Retry-After": {"30"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	tests.AddFunc("should not reject on a long delay advertised by a failure no retry can help", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotImplemented,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not implemented"}}`)),
+					Header:     http.Header{"Retry-After": {"600"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
 	// TODO(TODO.d/pin-a-5xx-whose-advertisement-elapsed.md): the case above pins the
 	// 429 leg of an elapsed advertisement. A 5xx takes the other arm of the relay and
 	// answers with no header at all; nothing drives it.
@@ -2878,10 +2908,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 		},
 	})
-
-	// TODO(TODO.d/pin-a-never-retryable-that-advertised-a-delay.md): this reaches the
-	// never-retryable clear through shouldReject only. A 501 that also named a delay
-	// takes the other branch, and no case sends one. Those belong beside this.
 
 	tests.Add("should not invent a delay for a target no retry can help, however long it has failed", test{
 		backends: map[string]backendStub{
