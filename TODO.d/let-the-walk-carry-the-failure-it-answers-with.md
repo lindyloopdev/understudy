@@ -45,14 +45,9 @@ the model that has nothing to serve it.
   `err` and answer with it after the loop while still holding the old `ctx` and that
   is exactly what happens.
 
-  The reading is guarded — "should surface a bare cancellation cause as 5xx" and
-  "should surface a cancellation cause's own HTTP status" both fail if it is removed
-  — but only for a single hop, where in-iteration and after-the-loop are the same
-  moment. The missing guard is a shutdown-style cause during a multi-target walk.
-
-  A client disconnect needs no guard: `responseStatus` matches `context.Canceled`
-  before it reads any status, so that request answers `499` either way — verified by
-  disabling the reading, which leaves the mid-walk disconnect case byte-identical.
+  A client disconnect is not the case to watch: `responseStatus` matches
+  `context.Canceled` before it reads any status, so that request answers `499`
+  whether or not the reading fires.
 - With the error pre-classified, only `terminalFailure` is left to run at the stop,
   needing `answering` and `remaining`. That is much smaller than recomputing the
   terminal block, which is what "answer with the failure that got there" sounds like.
@@ -60,11 +55,10 @@ the model that has nothing to serve it.
   today. Firing it per attempt looks equivalent — later attempts overwrite earlier
   ones, and the success path overwrites with the response's status — but that was
   reasoned, not measured. Measure it before relying on it.
-- Four cases are the guard, and none should need to change: each replay arm with an
+- Six cases are the guard, and none should need to change: each replay arm with an
   unusable candidate left untried — a sustained `429`, a refusal, a pre-header stall
-  — and a target failing past the terminal threshold with only an unusable one left.
-  A case that needs editing is the signal this changed behavior rather than shape.
-  The guard the reading needs is a host-supplied cause — a `503` shutdown, say —
-  arriving during a walk that has more than one candidate, so that in-iteration and
-  after-the-loop classification give different answers. The mid-walk disconnect case
-  cannot see that difference.
+  — a target failing past the terminal threshold with only an unusable one left, a
+  client that goes away mid-walk, and a host's own cancellation cause raised mid-walk.
+  The last is the one that sees where classification happens: substituting a dead
+  context at the classification point turns its `503` into a `502`. A case that needs
+  editing is the signal this changed behavior rather than shape.

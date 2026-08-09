@@ -2792,6 +2792,26 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		}
 	})
 
+	// A status-bearing cause is how a consumer renders e.g. shutdown, with no
+	// shutdown concept inside understudy.
+	tests.AddFunc("should surface the host's own cancellation cause raised mid-walk", func(t *testing.T) test {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		return test{
+			ctx: ctx,
+			backends: map[string]backendStub{
+				"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("60", "slow down")},
+				"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, _ int) (*http.Response, error) {
+					cancel(yerrors.WithHTTPStatus(http.StatusServiceUnavailable, errors.New("lindyd: shutting down")))
+					return nil, context.Cause(r.Context())
+				}},
+			},
+			targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+			steps: []step{
+				{advance: 0, wantStatus: http.StatusServiceUnavailable},
+			},
+		}
+	})
+
 	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
