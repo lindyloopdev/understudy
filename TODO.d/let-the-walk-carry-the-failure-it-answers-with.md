@@ -18,12 +18,40 @@ Fail over until it cannot instead, and answer with the failure that got there. O
 a walk that never attempted anything — the first pick finding nothing callable — is
 the model that has nothing to serve it.
 
-- The walk has to carry its last failure across iterations, as it already carries
-  `throttledErr` and `tried`. Today it cannot: the pick happens inside the
-  `rewriteModel` closure at the top of each iteration, where the previous
-  iteration's error is out of scope. That closure exists to rewrite a JSON body and
-  has accumulated the walk's state; moving the pick out of it is the substance of
-  this work.
+- **Move the pick out of the `rewriteModel` closure first.** The walk has to carry
+  its last failure across iterations, as it already carries `throttledErr` and
+  `tried`, and today it cannot: the pick happens inside a closure whose job is to
+  rewrite a JSON body, where the previous iteration's error is out of scope.
+
+  Two attempts at inverting the control flow in place have failed, each ruling out a
+  shape. Both are worth knowing before a third.
+
+  **Carrying a bare error does not work.** The throttle swap decides the *final*
+  answer, so it belongs at the stop; left per-hop it fires on every failing
+  candidate. It cannot simply move to the stop either: it tests the **raw** error
+  (`isAccessRefused`, `HTTPStatus == 501`) while what must be carried is the
+  **classified** one, and `clientFacing` rewrites a `501` into a `502` wrapped in
+  `neverRetryableError`, so the test cannot be made on the carried value.
+
+  **Carrying both, bundled, does not work either — and the reason is `Excluded`.**
+  A bundle (raw, classified, target, log fields) fixes the swap, but moves the
+  question to *when* a candidate is recorded as one the request did not serve from.
+  Record on **departure**, as today, and a walk that turns out to have nowhere left
+  to go has already recorded the candidate whose failure then answers — the request
+  is logged as not having served from the thing it answered with. Record on
+  **arrival**, once the next pick succeeds, and the ordering breaks: `pickTarget`
+  logs the skips it walks past *during* that pick, so the abandoned candidate lands
+  after them, against §Understudy's "recorded in the order they were walked".
+
+  Departure-ordering and arrival-correctness conflict while the pick is inside the
+  closure, because the walk cannot see its own sequence from there. That is what
+  makes moving the pick out the prerequisite rather than a tidy-up.
+
+  Guards that caught these: "should name the candidate a refused request answered
+  from", "should serve from a benched candidate rather than answer for an unusable
+  one that sorts after it", "should record the refused target a request did not serve
+  from when an earlier throttle answers for it", and "should record an abandoned
+  target and an excluded one in the order it walked them".
 - `canFailOver` and both its call sites then delete, and with them the recording
   they do: `pickTarget` logs each skip as it walks, so a walk that reaches the end
   records the remainder itself.
