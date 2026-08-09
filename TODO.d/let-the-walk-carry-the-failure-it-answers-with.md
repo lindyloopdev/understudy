@@ -27,14 +27,32 @@ the model that has nothing to serve it.
 - `canFailOver` and both its call sites then delete, and with them the recording
   they do: `pickTarget` logs each skip as it walks, so a walk that reaches the end
   records the remainder itself.
-- **Carry the client-facing error, not the raw one.** `clientFacing(ctx, err)` opens
-  with `errors.Is(err, context.Cause(ctx))`, which asks whether this attempt failed
-  because *this attempt's* context was cancelled — the client hanging up, or
-  understudy's own stall gate. Each iteration builds its own `ctx` and cancels it
-  before continuing, so asking later is not merely riskier, it is unanswerable: the
-  cause that identified it is gone, and a dead context reports `context.Canceled`
-  for every carried error. §Understudy already requires the reading, since the status
-  is a property of the error. Classify in the iteration that failed; carry the result.
+- **Do not classify a carried error against a dead context.** `clientFacing(ctx, err)`
+  opens with `errors.Is(err, context.Cause(ctx))`, which passes an error through
+  untouched when it *is* the cancellation, instead of flattening it to `502`. The
+  cause that matters is not always `context.Canceled`: a host cancels the *request*
+  context with its own — `WithHTTPStatus(503, "lindyd: shutting down")` is how a
+  consumer renders shutdown without understudy knowing what shutdown is, and a
+  deadline gives `DeadlineExceeded`. Measured at the single call site: two cases
+  reach it with a cause that is neither.
+
+  Those causes live on the **request** context, which outlives every hop, and each
+  hop's child inherits them. `cancel(nil)` overwrites a child's cause with
+  `context.Canceled` only when the parent has none. So classifying in the iteration
+  that failed is correct, and so is classifying later against a *fresh* child — but
+  classifying against the **dead** child of an earlier hop is not: its cause has been
+  overwritten, the reading stops matching, and a host's `503` becomes a `502`. Stash
+  `err` and answer with it after the loop while still holding the old `ctx` and that
+  is exactly what happens.
+
+  The reading is guarded — "should surface a bare cancellation cause as 5xx" and
+  "should surface a cancellation cause's own HTTP status" both fail if it is removed
+  — but only for a single hop, where in-iteration and after-the-loop are the same
+  moment. The missing guard is a shutdown-style cause during a multi-target walk.
+
+  A client disconnect needs no guard: `responseStatus` matches `context.Canceled`
+  before it reads any status, so that request answers `499` either way — verified by
+  disabling the reading, which leaves the mid-walk disconnect case byte-identical.
 - With the error pre-classified, only `terminalFailure` is left to run at the stop,
   needing `answering` and `remaining`. That is much smaller than recomputing the
   terminal block, which is what "answer with the failure that got there" sounds like.
@@ -46,5 +64,7 @@ the model that has nothing to serve it.
   unusable candidate left untried — a sustained `429`, a refusal, a pre-header stall
   — and a target failing past the terminal threshold with only an unusable one left.
   A case that needs editing is the signal this changed behavior rather than shape.
-  None of them involves a client that disconnects mid-walk, so the reading above is
-  unguarded — a case for it belongs with the work.
+  The guard the reading needs is a host-supplied cause — a `503` shutdown, say —
+  arriving during a walk that has more than one candidate, so that in-iteration and
+  after-the-loop classification give different answers. The mid-walk disconnect case
+  cannot see that difference.
