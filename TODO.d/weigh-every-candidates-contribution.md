@@ -40,10 +40,3 @@ contributes at all. §Understudy counts benched candidates beyond those tried; a
 transient `429` ends a walk with later targets never called, and nothing says
 whether those are the request's candidates. It decides what the comparison ranges
 over.
-
-**Uncovered in what does work:** nothing pins that the comparison weighs what
-*remains* of each offer rather than what each advertised — every case compares
-candidates at one virtual instant, so a remembered delay and a re-derived one
-agree. A walk where time passes tells them apart: `a` advertising 40s, `b` taking
-15s to answer and advertising 30s, ending on a refusal, the client owed `a`'s
-remaining 25s. The stub's sleep must stay under the 20s header-stall gate.

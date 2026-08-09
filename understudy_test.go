@@ -1084,6 +1084,7 @@ func TestModels(t *testing.T) {
 		authHeader string
 		validator  TokenValidator
 		opts       []Option
+		wantLogged []map[string]any
 		wantStatus int
 		wantBody   string
 	}
@@ -1326,8 +1327,6 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
 	})
 
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the failed fetch reaches
-	// the operator only through s.logger, and no case here asserts that line.
 	tests.AddFunc("should list the models of the backends that answer when another backend's catalog fetch fails", func(t *testing.T) test {
 		sick := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -1355,12 +1354,19 @@ func TestModels(t *testing.T) {
 			},
 			wantStatus: http.StatusOK,
 			wantBody:   `{"object":"list","data":[{"id":"good/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
+			// The listing does not fail, so the operator is the only one who learns
+			// the catalog fetch did.
+			wantLogged: []map[string]any{{
+				"level":   "ERROR",
+				"backend": "down",
+			}},
 		}
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
+		var logged bytes.Buffer
+		srv := New(tt.validator, append([]Option{WithLogger(slog.New(slog.NewJSONHandler(io.MultiWriter(&logged, t.Output()), nil)))}, tt.opts...)...)
 
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/models", nil)
 		if err != nil {
@@ -1376,6 +1382,11 @@ func TestModels(t *testing.T) {
 		}
 		if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
 			t.Errorf("unexpected body: %s", d)
+		}
+		for _, want := range tt.wantLogged {
+			if !slogdiff.JSONContains(logged.Bytes(), want) {
+				t.Errorf("operator was not told %v, logged:\n%s", want, logged.String())
+			}
 		}
 	})
 }
@@ -3340,12 +3351,27 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/weigh-every-candidates-contribution.md): every case here compares
-	// candidates at one instant, so nothing tells a remembered delay from a re-derived
-	// one. The walk that does belongs beside this.
+	tests.Add("should weigh what remains of each throttle, not what each advertised", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("40", "back in forty")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, call int) (*http.Response, error) {
+				// Under the 20s header-stall gate, so the walk goes on to c rather than
+				// treating this as a stall — but long enough that a's 40s has 25s left
+				// when b's 30s is weighed against it.
+				time.Sleep(15 * time.Second)
+				return throttling("30", "back in thirty")(r, call)
+			}},
+			"c": {baseURL: mustParseURL(t, "http://c/v1"), apiKey: "sk-c", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in forty","type":"rate_limit_error"}}`},
+		},
+	})
 
-	// TODO(TODO.d/weigh-every-candidates-contribution.md): the cases that entry names
-	// belong beside these.
+	// TODO(TODO.d/weigh-every-candidates-contribution.md): the rows that entry leaves
+	// unbuilt — a bench, a stall, a synthesized interval — belong beside these once
+	// there is something to weigh them against.
 
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{
