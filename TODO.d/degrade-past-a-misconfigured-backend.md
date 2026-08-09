@@ -4,17 +4,18 @@
 
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Operator and caller
 learn different things" (the skip reason reaches the operator through the request's
-`LogRecord`), "The reason travels with the skip" (the terminal error carries it when
-the skipping exhausted the candidates), "A list emptied by misconfiguration answers
+`LogRecord`), "The reason travels with the skip" (each reason reaches the
+operator through `Excluded`, never the client), "A list emptied by misconfiguration answers
 404, not 500" (which ending each exhaustion gets, and that the rule is about usable
 targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
 valid answer for the listing whatever its cause).
 
-- **Surface the first failure, not the last target.** `pickTarget` returns
-  `targets[len(targets)-1]` when every target is unusable, so the reason the caller
-  reads is whichever backend sorts last rather than what first went wrong. Every
-  reason is already on `Excluded`; only the one promoted into the answer is
-  arbitrary. No case pins which one, so nothing has to change alongside.
+- **Drive the other two triggers that stop replaying onto an unusable remainder.**
+  A walk replays on a sustained `429`, a refusal, or a pre-header stall, and only
+  the `429` is driven with an unusable candidate left untried. `[a stalls, b: no
+  base_url]` should answer `504` without dialing `b`, and `[a: 401, b: no base_url]`
+  should answer the refusal's own `400` `upstream_refused` — each was a `404` before
+  the remainder was filtered, so each pins a different arm of the same rule.
 
 - **Decide whether re-walking records a target again.** `pickTarget` re-walks the
   candidate list from the start on every failover, so targets `[broken, limited,

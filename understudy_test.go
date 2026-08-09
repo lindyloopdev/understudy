@@ -712,7 +712,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should tell the caller a model whose every target is unusable cannot be served", func(t *testing.T) test {
+	tests.AddFunc("should answer a model whose every target is unusable as one declaring no targets", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{
 				Backends: map[string]Backend{
@@ -728,7 +728,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			server:              New(validator, WithLogger(testLogger(t))).(*server),
 			requestBody:         `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusNotFound,
-			wantBody:            `{"error":{"message":"model references unusable backend \"broken\": must provide base_url","type":"invalid_request_error"}}`,
+			wantBody:            `{"error":{"message":"logical model \"m\" has no targets","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
@@ -2491,6 +2491,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should record why each backend was unusable when a model has nothing left to serve it", func(*testing.T) test {
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"a": {ProviderType: "openai"},
+						"b": {ProviderType: "nosuchprovider", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b"}}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"excluded": []Attempt{
+					{Backend: "a", ModelUpstream: "ma", Err: errors.New("must provide base_url")},
+					{Backend: "b", ModelUpstream: "mb", Err: errors.New(`provider type "nosuchprovider" has no registered handler`)},
+				},
+			},
+		}
+	})
+
 	tests.AddFunc("should log the upstream's own words for a refusal the client is not told", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2643,7 +2664,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// returns the upstream response, or blocks (a stall) until the request context
 	// is cancelled.
 	type backendStub struct {
-		baseURL string
+		// baseURL nil is how a case declares a backend understudy cannot use, however
+		// healthy its sibling targets are.
+		baseURL *url.URL
 		apiKey  string
 		resp    func(r *http.Request, call int) (*http.Response, error)
 	}
@@ -2657,8 +2680,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over to the next target after the threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2669,8 +2692,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should route a logical model around an account a directly-named reference demoted", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2681,7 +2704,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should reject a directly-named reference on a streak a logical model accrued past the terminal threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2709,8 +2732,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should route a logical model around an account a directly-named reference benched, until the advertised time elapses", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(throttling("60", "slow down"))},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: recovering(throttling("60", "slow down"))},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2722,8 +2745,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should route a logical model around an account a directly-named reference was refused by, with no interval elapsing", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`))},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: recovering(always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`))},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2737,10 +2760,46 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// The case below pins the fallback serving a target before the moment its upstream
+	// named — TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md) — and only
+	// the sustained-429 arm of the replay filter —
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md).
+
+	tests.Add("should serve from a benched candidate rather than answer for an unusable one that sorts after it", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: recovering(throttling("60", "slow down"))},
+			"b": {apiKey: "sk-b"},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a",
+				wantExcluded: []Attempt{{Backend: "b", ModelUpstream: "mb", Err: errors.New("must provide base_url")}},
+			},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
+		},
+	})
+
+	tests.Add("should reject once a target has been failing past the terminal threshold, though an unusable candidate is still untried", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"b": {apiKey: "sk-b"},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+		},
+	})
+
 	tests.Add("should demote a target on a 429 with no Retry-After", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2751,8 +2810,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over within the request when a target stalls before its response header", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: stall},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2763,8 +2822,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should name the stalled target an operator would otherwise not see", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: stall},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2774,7 +2833,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should show the client 502 for an upstream 5xx", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2784,14 +2843,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should carry the upstream's own words for why a target was walked past", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"quota gemini-2.5-flash exhausted"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2807,14 +2866,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should show the status the walked-past target answered with", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2826,8 +2885,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should surface a 504 when every target stalls and the replay walk is exhausted", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: stall},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: stall},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: stall},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2837,9 +2896,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should bench a sibling backend sharing an account and model when one is demoted", test{
 		backends: map[string]backendStub{
-			"acct-a": {baseURL: "http://shared/v1", apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
-			"acct-b": {baseURL: "http://shared/v1", apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
-			"acct-c": {baseURL: "http://other/v1", apiKey: "sk-other", resp: always(http.StatusOK, `{"id":"from-c"}`)},
+			"acct-a": {baseURL: mustParseURL(t, "http://shared/v1"), apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"acct-b": {baseURL: mustParseURL(t, "http://shared/v1"), apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"acct-c": {baseURL: mustParseURL(t, "http://other/v1"), apiKey: "sk-other", resp: always(http.StatusOK, `{"id":"from-c"}`)},
 		},
 		targets: []Target{
 			{backend: "acct-a", model: "glm"},
@@ -2856,14 +2915,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should not demote a target on a 429 whose Retry-After is within the threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"10"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2874,8 +2933,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should not fail over on a non-fatal error", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadRequest, `{"error":{"message":"bad request"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadRequest, `{"error":{"message":"bad request"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2886,8 +2945,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should route to the last target when all are failing", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -2899,7 +2958,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should reject as non-retryable once a target has been failing past the terminal threshold with nowhere to fail over", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2914,7 +2973,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should start a fresh streak once a demotion has gone untouched past the eviction window", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2930,7 +2989,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should hold a demotion open while a directly-named reference keeps failing across the eviction window", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2963,7 +3022,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should start a fresh streak once a directly-named reference's demotion has gone untouched past the eviction window", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -2980,7 +3039,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should start a fresh streak once a rate-limited reference's demotion has gone untouched past the eviction window", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
@@ -3002,7 +3061,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should not invent a delay for a target no retry can help, however long it has failed", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -3018,7 +3077,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -3033,8 +3092,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should keep relaying the upstream failure when a long-dead target is probed but an alternate remains untried", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3051,7 +3110,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should advertise the upstream's own backoff when the reject is terminal", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
@@ -3072,13 +3131,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should restore a target after it recovers", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 1 {
 					return resp(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`), nil
 				}
 				return resp(http.StatusOK, `{"id":"from-a"}`), nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3090,13 +3149,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should re-probe and restore a demoted target after the recovery interval", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 1 {
 					return resp(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`), nil
 				}
 				return resp(http.StatusOK, `{"id":"from-a"}`), nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3108,8 +3167,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should preserve the streak start across repeated failures", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3121,14 +3180,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over within the request when a target returns a sustainedRate 429", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3139,8 +3198,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over within the request when a target's credential is out of funds", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusPaymentRequired, `{"error":{"message":"Insufficient Balance"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusPaymentRequired, `{"error":{"message":"Insufficient Balance"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3150,8 +3209,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over within the request when a target's credential is rejected", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3161,7 +3220,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should tell a client a refused request is terminal without repeating what the upstream said", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
@@ -3175,14 +3234,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should answer with an earlier candidate's throttle rather than the refusal that ended the walk", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3192,14 +3251,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should record the refused target a request did not serve from when an earlier throttle answers for it", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3212,7 +3271,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should keep answering with an earlier candidate's throttle once the target that refused has been failing past the terminal threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 2 {
 					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-a"}`)), Header: http.Header{}}, nil
 				}
@@ -3222,7 +3281,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3234,10 +3293,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should answer with the soonest throttle among the candidates it walked past", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: throttling("1800", "back in half an hour")},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: throttling("60", "back in a minute")},
-			"c": {baseURL: "http://c/v1", apiKey: "sk-c", resp: throttling("900", "back in fifteen minutes")},
-			"d": {baseURL: "http://d/v1", apiKey: "sk-d", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("1800", "back in half an hour")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: throttling("60", "back in a minute")},
+			"c": {baseURL: mustParseURL(t, "http://c/v1"), apiKey: "sk-c", resp: throttling("900", "back in fifteen minutes")},
+			"d": {baseURL: mustParseURL(t, "http://d/v1"), apiKey: "sk-d", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}, {backend: "d", model: "md"}},
 		steps: []step{
@@ -3247,8 +3306,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should answer with an earlier candidate's throttle rather than a failure no retry can help", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: throttling("60", "back in a minute")},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("60", "back in a minute")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusNotImplemented, `{"error":{"message":"not implemented"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3265,8 +3324,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3276,8 +3335,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should not call again, on the next request, a target that refused the account", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: recovering(always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`))},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: recovering(always(http.StatusForbidden, `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`))},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3288,14 +3347,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should fail over across requests when a recurring 429's Retry-After is below the demotion threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"10"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3308,14 +3367,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// request payload (with the model rewritten for that target) survived the replay.
 	tests.Add("should replay the full request body to the fallback target", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: func(r *http.Request, _ int) (*http.Response, error) {
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, _ int) (*http.Response, error) {
 				body, _ := io.ReadAll(r.Body)
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
 			}},
@@ -3328,8 +3387,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should name the candidate a refused request answered from, with the ones it moved past on Excluded", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: always(http.StatusForbidden, `{"error":{"message":"not permitted"}}`)},
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusForbidden, `{"error":{"message":"not permitted"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
@@ -3352,14 +3411,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should surface the 429 when every target is rate-limited past the threshold", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
 					Header:     http.Header{"Retry-After": {"60"}},
 				}, nil
 			}},
-			"b": {baseURL: "http://b/v1", apiKey: "sk-b", resp: func(*http.Request, int) (*http.Response, error) {
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
@@ -3384,11 +3443,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					lastDialed = name
 					return bs.resp(r, calls)
 				})
-				u, err := url.Parse(bs.baseURL)
-				if err != nil {
-					t.Fatalf("backend %q base URL %q: %v", name, bs.baseURL, err)
-				}
-				backends[name] = Backend{ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: bs.apiKey, HTTPClient: client}}
+				backends[name] = Backend{ProviderType: "openai", Config: providers.Config{BaseURL: bs.baseURL, APIKey: bs.apiKey, HTTPClient: client}}
 			}
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil

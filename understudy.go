@@ -552,11 +552,20 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // requests within the cooldown still skip it). A target demoted with a known
 // re-admission time (readmitAt, from an advertised Retry-After) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
-// health preserved until the probe's outcome) — never half-open-probed early. If every target is past the threshold and not
-// due for a probe, or every target was skipped as unusable, it returns the last so
-// a request always has somewhere to go — which means the returned target is itself
-// unusable when nothing was usable.
-func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) Target {
+// health preserved until the probe's outcome) — never half-open-probed early while
+// any other candidate remains. If every target is past the threshold and not due
+// for a probe, it returns the last one it could call so a request always has
+// somewhere to go.
+//
+// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): that fallback
+// returns a target benched until a moment that has not arrived, against the rule
+// above.
+//
+// It reports false when every candidate named a backend understudy cannot use,
+// which leaves the request the list a model declaring no targets has. Each reason
+// is on the request's Excluded by then; only the caller can name the model the
+// client is answered with.
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) (Target, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictStaleHealth()
@@ -568,7 +577,7 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
-			return t
+			return t, true
 		}
 		if !h.readmitAt.IsZero() {
 			if now.Before(h.readmitAt) {
@@ -579,20 +588,55 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 			h.lastProbe = now
 			h.lastTouch = now
 			s.health[id] = h
-			return t
+			return t, true
 		}
 		if now.Sub(h.lastProbe) >= s.recoveryInterval {
 			h.lastProbe = now
 			h.lastTouch = now
 			s.health[id] = h
-			return t
+			return t, true
 		}
 		s.noteBackendDown(id, t, h)
 	}
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the last target is an
-	// arbitrary one to hand back when every candidate was excluded — the caller
-	// reads whichever backend sorts last rather than the first that failed.
-	return targets[len(targets)-1]
+	// Nothing was healthy, but a target health kept back is still worth attempting.
+	last, ok, _ := s.lastCallableTarget(targets, backends)
+	return last, ok
+}
+
+// canFailOver reports whether any untried target names a backend understudy could
+// call, recording why it rejected the others when none does — nothing else reaches
+// them once the walk stops.
+//
+// TODO(TODO.d/let-the-walk-carry-the-failure-it-answers-with.md): a walk that
+// carried its own failure would not need this lookahead.
+func (s *server) canFailOver(ctx context.Context, logicalTargets []Target, tried []string, backends map[string]Backend) bool {
+	_, ok, rejected := s.lastCallableTarget(untriedTargets(logicalTargets, tried, backends), backends)
+	if ok {
+		return true
+	}
+	for _, a := range rejected {
+		addLogSkipped(ctx, a.Backend, a.ModelUpstream, a.Err)
+	}
+	return false
+}
+
+// lastCallableTarget returns the last target understudy could call at all, and the
+// ones it could not with the reason each was rejected. A backend understudy cannot
+// call subtracts itself rather than deciding for the list, so what remains is what
+// the request has. The rejected are returned rather than recorded: a caller that
+// walks on leaves that to pickTarget, and only a caller that stops here has to.
+func (s *server) lastCallableTarget(targets []Target, backends map[string]Backend) (Target, bool, []Attempt) {
+	var last Target
+	var found bool
+	var rejected []Attempt
+	for _, t := range targets {
+		if _, err := s.resolveBackend(backends, t.backend); err != nil {
+			rejected = append(rejected, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
+			continue
+		}
+		last, found = t, true
+	}
+	return last, found, rejected
 }
 
 // untriedTargets returns the targets whose availability key is absent from
@@ -715,12 +759,19 @@ func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration
 }
 
 // terminalFailure marks err terminal — the response path rejects it as
-// non-retryable rather than relaying it — when remaining is empty and t's
-// streak has crossed the terminal threshold. Both are required: a long streak
-// on a target the list can still route around is a demoted target, not an
-// exhausted list.
+// non-retryable rather than relaying it — when remaining holds nothing understudy
+// could call, whether because it is empty or because every candidate in it names a
+// backend understudy cannot use, and t has been failing past the terminal
+// threshold. Both are required: a long failure on a target the list can still route
+// around is a demoted target, not an exhausted list.
 func (s *server) terminalFailure(t Target, remaining []Target, backends map[string]Backend, err error) error {
-	if t.backend == "" || len(remaining) > 0 || s.failingFor(t, backends) < s.terminalThreshold {
+	if t.backend == "" || s.failingFor(t, backends) < s.terminalThreshold {
+		return err
+	}
+	// A candidate understudy cannot call is not somewhere left to go, so it cannot
+	// hold the ladder's last rung open — the same reading the walk uses to decide
+	// whether to fail over at all.
+	if _, ok, _ := s.lastCallableTarget(remaining, backends); ok {
 		return err
 	}
 	return terminalError{err}
@@ -1352,6 +1403,13 @@ type selection struct {
 	handler providers.Handler
 }
 
+// noTargetsError is what a client is told about a model nothing can serve, whether it
+// declared no targets or every target it declared named a backend understudy cannot
+// call. The two are one condition to a caller, so they are one sentence.
+func noTargetsError(model string) error {
+	return notFound(fmt.Errorf("logical model %q has no targets", model))
+}
+
 // errNoSuchBackend is the reason resolveBackend gives when the config declares no
 // backend under the name asked for, as opposed to declaring one understudy cannot
 // use. Callers that phrase the two differently match on it.
@@ -1600,7 +1658,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
-	// throttledErr is the error of a candidate the walk replayed past under a timed
+	// throttledErr is the error of a candidate the walk failed over from under a timed
 	// backoff, and throttledTarget the candidate that raised it — the answer is judged
 	// against whichever target it came from.
 	// TODO(TODO.d/weigh-every-candidates-contribution.md)
@@ -1621,14 +1679,18 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			if lm, ok := backend.Models[model]; ok {
 				if len(lm.Targets) == 0 {
-					return "", resolveError{notFound(fmt.Errorf("logical model %q has no targets", model))}
+					return "", resolveError{noTargetsError(model)}
 				}
 				logicalTargets = lm.Targets
 				// A within-request failover has just demoted the prior target, but
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				chosen = s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				picked, ok := s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				if !ok {
+					return "", resolveError{noTargetsError(model)}
+				}
+				chosen = picked
 				parsedBackendName = chosen.backend
 				upstreamModel = chosen.model
 				return chosen.model, nil
@@ -1722,7 +1784,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			releaseHeld()
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
-				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+				if s.canFailOver(r.Context(), logicalTargets, tried, backend.Backends) {
 					addLogCalled(r.Context(), parsedBackendName, upstreamModel, 0, err)
 					continue
 				}
@@ -1779,7 +1841,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					throttledErr, throttledTarget = err, chosen
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
-				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+				if s.canFailOver(r.Context(), logicalTargets, tried, backend.Backends) {
 					addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
 					releaseHeld()
 					cancel(nil)

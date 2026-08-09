@@ -214,11 +214,11 @@ actually chosen, where it is chosen.
 
 **The reason travels with the skip.** A skip that discards *why* turns understudy's
 own errors into falsehoods — a caller told a configured-but-unusable backend is
-"unknown", or told "no backend configured" when several are. So the reason reaches
-whichever answer the request produces: the terminal error when the skipping
-exhausted the candidates, and the operator's diagnostic either way. Which reason is
-promoted into that terminal error is not yet the first failure but the last target
-walked — [[degrade-past-a-misconfigured-backend]].
+"unknown", or told "no backend configured" when several are. So every reason reaches
+the operator, through the request's `Excluded`. It does not reach the client: a
+caller told a backend "must provide base_url" has been handed a diagnostic it cannot
+act on about a deployment it never named, so it is answered in understudy's own
+words instead.
 
 **A list emptied by misconfiguration answers 404, not 500.** The two ways a
 candidate list runs out are not the same ending. Emptied by *health*, something is
@@ -226,7 +226,8 @@ still worth attempting — a demoted target can serve again — so the request i
 and the client receives the upstream's own answer, or the ladder's reject once the
 streak passes the terminal threshold (§Understudy, the Retry-After ladder). Emptied
 by *static unusability*, there is nothing to attempt: no upstream is called, and the
-client is told the model names no backend that can serve it, carrying the reason.
+client is told the model has nothing to serve it, while why each backend was skipped
+goes to the operator.
 
 That answer is a 404 even though the fault is the operator's, for three reasons.
 Least degradation already holds that an unusable backend costs that backend and not
@@ -240,7 +241,7 @@ requirement is satisfiable. Third, a model that cannot be served is the conditio
 
 The rule is about *usable targets*, not about how the list came to be empty. A
 logical model declaring no targets at all is the same condition as one whose every
-target is unusable, and answers the same way.
+target is unusable, and answers the same way, in the same words.
 
 **Operator and caller learn different things.** The caller gets the best available
 answer to the request it made; the reason a backend was skipped is the *operator's*
@@ -280,7 +281,8 @@ is a valid answer whatever its cause, so unusable backends are skipped and a usa
 backend advertising nothing contributes nothing; the listing does not fail because
 some backend, or every backend, could not be reached. Chat asks understudy to
 *serve this*, and there failure is failure: a request naming a model no usable
-backend can serve is an error carrying the reason. The consequence is deliberate —
+backend can serve is an error, and why each backend was skipped goes to the
+operator with it. The consequence is deliberate —
 a total upstream outage renders as an empty catalog rather than an error, and the
 operator learns of it from the log rather than the response. The listing does not
 yet hold to this: a config resolving to no usable backend still fails, and a
