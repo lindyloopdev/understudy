@@ -2682,6 +2682,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		resp    func(r *http.Request, call int) (*http.Response, error)
 	}
 	type test struct {
+		// ctx overrides the request context (defaults to t.Context()); set it to
+		// exercise a client that goes away mid-walk.
+		ctx      context.Context
 		backends map[string]backendStub
 		targets  []Target
 		steps    []step
@@ -2769,6 +2772,24 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
+	})
+
+	tests.AddFunc("should answer for the client that went away, not the target it was walking to", func(t *testing.T) test {
+		ctx, cancel := context.WithCancel(t.Context())
+		return test{
+			ctx: ctx,
+			backends: map[string]backendStub{
+				"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("60", "slow down")},
+				"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, _ int) (*http.Response, error) {
+					cancel()
+					return nil, context.Cause(r.Context())
+				}},
+			},
+			targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+			steps: []step{
+				{advance: 0, wantStatus: statusClientClosedRequest},
+			},
+		}
 	})
 
 	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
@@ -3507,7 +3528,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					synctest.Wait()
 				}
 				body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, cmp.Or(s.model, "m"))
-				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+				req, err := http.NewRequestWithContext(cmp.Or(tt.ctx, t.Context()), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 				if err != nil {
 					t.Fatal(err)
 				}
