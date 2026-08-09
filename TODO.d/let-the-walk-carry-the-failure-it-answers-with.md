@@ -25,8 +25,7 @@ the model that has nothing to serve it.
 - `canFailOver` and both its call sites then delete, and with them the recording
   they do: `pickTarget` logs each skip as it walks, so a walk that reaches the end
   records the remainder itself.
-- Two cases are the guard, and neither should need to change: the sustained-`429`
-  arm with an unusable candidate left untried, and a target failing past the
-  terminal threshold with only an unusable one left. The stall and refusal arms of
-  the same rule are not covered — [[degrade-past-a-misconfigured-backend]] — so this
-  is a strict refactor only as far as those two reach.
+- Four cases are the guard, and none should need to change: each replay arm with an
+  unusable candidate left untried — a sustained `429`, a refusal, a pre-header stall
+  — and a target failing past the terminal threshold with only an unusable one left.
+  A case that needs editing is the signal this changed behavior rather than shape.

@@ -2760,10 +2760,35 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// The case below pins the fallback serving a target before the moment its upstream
-	// named — TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md) — and only
-	// the sustained-429 arm of the replay filter —
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md).
+	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
+			"b": {apiKey: "sk-b"},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a"},
+		},
+	})
+
+	tests.Add("should answer a refusal itself when the only candidate left is unusable", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
+			"b": {apiKey: "sk-b"},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				advance:      0,
+				wantStatus:   http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamRefused}},
+				wantBackend:  "a",
+			},
+		},
+	})
+
+	// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): the case below
+	// pins the fallback serving a target before the moment its upstream named.
 
 	tests.Add("should serve from a benched candidate rather than answer for an unusable one that sorts after it", test{
 		backends: map[string]backendStub{

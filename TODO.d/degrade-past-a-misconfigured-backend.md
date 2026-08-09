@@ -10,13 +10,6 @@ operator through `Excluded`, never the client), "A list emptied by misconfigurat
 targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
 valid answer for the listing whatever its cause).
 
-- **Drive the other two triggers that stop replaying onto an unusable remainder.**
-  A walk replays on a sustained `429`, a refusal, or a pre-header stall, and only
-  the `429` is driven with an unusable candidate left untried. `[a stalls, b: no
-  base_url]` should answer `504` without dialing `b`, and `[a: 401, b: no base_url]`
-  should answer the refusal's own `400` `upstream_refused` — each was a `404` before
-  the remainder was filtered, so each pins a different arm of the same rule.
-
 - **Decide whether re-walking records a target again.** `pickTarget` re-walks the
   candidate list from the start on every failover, so targets `[broken, limited,
   good]` where `limited` fails over yield `broken, limited, broken`. The walk-log
