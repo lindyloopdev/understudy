@@ -4,28 +4,33 @@
 
 **Design:** [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing) — an
 advertised `readmitAt` supersedes the schedule, and a target carrying one is never
-half-open-probed early. [DESIGN.md §Understudy](../DESIGN.md#understudy) — "emptied
-by *health*, something is still worth attempting", which is what the fallback
-exists to serve.
+half-open-probed early. [DESIGN.md §Understudy](../DESIGN.md#understudy) — the
+contribution table's "was benched and never called | its `readmitAt`, less now",
+which is what such a list owes its client.
 
 `pickTarget`'s exhausted-list fallback returns the last target its backend could
 resolve, whatever its health — including one benched until an advertised moment that
 has not arrived. Measured: a lone target demoted with `Retry-After: 60` is called
 again one second later. That contradicts `pickTarget`'s own doc ("routed around
 until that time … never half-open-probed early") and `recordRateLimited`'s promise
-("not re-admitted before the backoff it advertised has elapsed").
+("not re-admitted before the backoff it advertised has elapsed"). The call is spent
+to be told what understudy already knows.
 
-The two rules disagree about what an exhausted list means. "Something is still worth
-attempting" holds for a target the *schedule* is holding back — it may serve now.
-It does not hold for one the upstream itself said would refuse until a stated time:
-calling it early spends a request to be told what understudy already knows.
+**Blocked, and the blocking is the point.** Removing the early call is a one-line
+change that makes the answer worse. Measured today: that request answers `429`
+carrying the upstream's own delay, because understudy calls the target and relays
+what it says. With the target excluded from the fallback the list has nothing to
+attempt and answers `404` "logical model has no targets" — a model that has targets,
+all of them due back at a known time, told it has none.
 
-- Exclude a target under an unexpired `readmitAt` from the fallback, so the fallback
-  offers only what health kept back on its own schedule.
-- A list whose every candidate is benched until a known time then has nothing to
-  attempt, and answers as one declaring no targets — the same ending unusability
-  already gets.
-- The case belongs beside "should serve from a benched candidate rather than answer
-  for an unusable one that sorts after it", which today pins the permissive answer:
-  it demotes with a `Retry-After`, so switching it to a bench with none keeps it
-  driving the fallback it means to.
+The answer a benched list owes is the bench itself: a `429` carrying the soonest
+`readmitAt`, less now. That is the contribution row in
+[[weigh-every-candidates-contribution]], which waits on
+[[understudy-adaptive-coordinated-backoff]] for something to weigh a bench against.
+So this lands with that row, not before it.
+
+Until then the early call stands, and the case beside it —
+"should serve from a benched candidate rather than answer for an unusable one that
+sorts after it" — pins it, because that case demotes with a `Retry-After`. When the
+bench row lands, that case should demote *without* one, so it keeps driving the
+schedule-held fallback it means to rather than the advertised bench.
