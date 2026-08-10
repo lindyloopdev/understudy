@@ -2247,6 +2247,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 
 	type test struct {
 		validator   TokenValidator
+		opts        []Option
 		method      string
 		path        string
 		requestBody string
@@ -2523,6 +2524,38 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the case below pins what a
+	// stall the walk moved past records. A walk of nothing but stalls reports through
+	// the record's own fields instead, and nothing drives that.
+
+	tests.AddFunc("should record a stalled attempt as having answered nothing", func(t *testing.T) test {
+		stalling := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		})
+		serving := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: http.Header{}}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"a": {ProviderType: "openai", Config: providers.Config{BaseURL: mustParseURL(t, "http://a/v1"), APIKey: "sk-a", HTTPClient: stalling}},
+						"b": {ProviderType: "openai", Config: providers.Config{BaseURL: mustParseURL(t, "http://b/v1"), APIKey: "sk-b", HTTPClient: serving}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}},
+				}, nil
+			}},
+			opts:        []Option{func(s *server) { s.headerStallGate = 10 * time.Millisecond }},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"excluded": []Attempt{
+					{Backend: "a", ModelUpstream: "ma", UpstreamStatus: 0, Err: errHeaderStall, Called: true},
+				},
+			},
+		}
+	})
+
 	tests.AddFunc("should log the upstream's own words for a refusal the client is not told", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2542,7 +2575,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		srv := New(tt.validator, WithLogger(testLogger(t)))
+		srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
 
 		req, err := http.NewRequestWithContext(t.Context(), cmp.Or(tt.method, http.MethodPost), cmp.Or(tt.path, "/v1/chat/completions"), strings.NewReader(tt.requestBody))
 		if err != nil {
@@ -2811,10 +2844,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 		}
 	})
-
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the stall cases assert the
-	// client's answer, not what the attempt recorded. A stall answers with no status,
-	// and nothing here would notice one being invented.
 
 	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
 		backends: map[string]backendStub{
