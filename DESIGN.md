@@ -260,6 +260,42 @@ stand in for a cadence the consumer knows and understudy does not. The consumer
 knows its own unit of work, so the fact is handed to it and it decides whether that
 becomes a log line, a metric, or nothing.
 
+**A target's health transitions are understudy's own to log.** The rule above sends
+an operator's facts through the request's `LogRecord`, because understudy cannot know
+the unit over which a recurring fact should be suppressed. A health transition is the
+exception, and the reason is that it does not recur: it is an edge, and the unit is
+understudy's own — a failure streak it began and will end. Suppressing a transition
+per streak invents nothing about the consumer's work.
+
+The other half of the reason is that a recovery has no request to ride on. A target
+coming back excludes nothing and fails nothing; no walk moves past it, so `Excluded`
+cannot carry it, and a consumer assembling health from request records alone would
+watch targets go down and never come back — reading a permanently degraded fleet.
+Degradations are worth knowing, and knowing them without recoveries is worse than
+knowing neither. Both directions are logged, or neither is.
+
+The exception is narrow. It covers the transition — this target is out, this target
+is back — and not the per-request fact that a walk routed around it. That fact is a
+skip like any other and belongs on `Excluded`, on every request that routes around
+the target, exactly as the rule above requires.
+[[record-a-benched-target-the-walk-routed-around]]
+
+**A transition is logged when it happens.** The demotion is the event: the request
+that was refused, stalled, or told to back off holds the failure, knows what the
+upstream answered, and knows the moment. Logging instead at the next walk that routes
+around the target dates the record to when someone tripped over it, drops the cause,
+and says nothing at all when no one trips. What such a record owes an operator — the
+target, why it is out, when it will be tried again, and whether that moment is the
+upstream's terms or a bench understudy chose — is in scope at the demotion and none
+of it is at the walk.
+
+One shape has no such moment. A target whose streak merely ages past the failover
+threshold is routed around from the instant the threshold elapses, and nothing runs
+then; the crossing is computed by whichever walk next weighs the streak against it.
+Where a further failure does the crossing, that failure is the event. Where the
+streak ages in silence, the walk that discovers it is the earliest knowable moment,
+and the record answers for that by dating the streak rather than the discovery.
+
 Everything a request moved on from goes on one record, `Excluded`, whatever kept it
 from serving: a target abandoned after a call, a target understudy could not use and
 never called, a backend a listing left out. The candidate that *ended* a walk is
