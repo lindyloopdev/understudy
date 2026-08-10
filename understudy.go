@@ -676,8 +676,6 @@ func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h ta
 	h.downLogged = true
 	h.lastTouch = time.Now()
 	s.health[id] = h
-	// TODO(TODO.d/give-the-schedule-kind-one-home.md): this re-tests what
-	// nextReattempt already decided.
 	// Exactly one schedule attr, paired with the reason naming it: which one appears
 	// says whether t is held to a recorded re-admission moment or to understudy's
 	// probe pacing.
@@ -761,11 +759,25 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 	}, nil)
 }
 
-// recordRateLimited demotes t at once like recordImmediateFailure, but records a
-// known re-admission time, now plus retryAfter — an advertised Retry-After, or the
-// bench understudy synthesizes for an upstream that answered nothing. pickTarget
-// keeps t benched until that time rather than half-open-probing it at the recovery
-// interval, so a target under a timed backoff is not re-admitted before it elapses.
+// recordStalled demotes t for a pre-header stall and benches it for a backoff
+// understudy synthesized, the upstream having named none.
+// TODO(TODO.d/log-a-transition-where-it-happens.md): this is where the stall's
+// "backend down" belongs — the cause and the moment are here and nowhere later.
+func (s *server) recordStalled(t Target, backends map[string]Backend) {
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(synthesizedStallBackoff)) },
+		func(now time.Time, h targetHealth) targetHealth {
+			h.readmitAt = now.Add(synthesizedStallBackoff)
+			return h
+		})
+}
+
+// recordRateLimited demotes t at once like recordImmediateFailure, and records the
+// moment the upstream named. An upstream that answers `Retry-After` has said more
+// about when it will serve again than understudy's own pacing can infer, so that
+// moment supersedes the recovery interval — which would otherwise call the target
+// back while it is still saying no. A bench understudy synthesized for an upstream
+// that said nothing is recordStalled's, not this one's.
 func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends map[string]Backend) {
 	s.writeHealth(t, backends,
 		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(retryAfter)) },
@@ -1879,7 +1891,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// synthesized backoff, then replay the request onto the next untried
 			// target rather than surfacing the stall; only when none remains does the
 			// client see the 504.
-			s.recordRateLimited(chosen, synthesizedStallBackoff, backend.Backends)
+			s.recordStalled(chosen, backend.Backends)
 			releaseHeld()
 			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
 			if logicalTargets != nil {

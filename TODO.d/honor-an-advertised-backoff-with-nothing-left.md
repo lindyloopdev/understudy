@@ -13,7 +13,7 @@ resolve, whatever its health — including one benched until an advertised momen
 has not arrived. Measured: a lone target demoted with `Retry-After: 60` is called
 again one second later. That contradicts `pickTarget`'s own doc ("routed around
 until that time … never half-open-probed early") and `recordRateLimited`'s promise
-("not re-admitted before the backoff it advertised has elapsed"). The call is spent
+("that moment supersedes the recovery interval"). The call is spent
 to be told what understudy already knows.
 
 **Blocked, and the blocking is the point.** Removing the early call is a one-line

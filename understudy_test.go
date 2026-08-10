@@ -2919,6 +2919,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// TODO(TODO.d/pin-the-bench-a-stall-buys.md): "should route around a stalled
+	// target for the bench it synthesized, and call it again once that bench elapses"
+	// belongs here — neither end of that window is asserted, so shortening it breaks
+	// nothing.
 	tests.Add("should fail over within the request when a target stalls before its response header", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
@@ -3752,13 +3756,13 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should say understudy
+	// benched a target that answered nothing" belongs here — a stall reads as an
+	// advertised backoff today, because the record is written by a later walk that
+	// no longer knows what happened.
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require
 	// the status and message the target failed with, which the record omits today.
-	// TODO(TODO.d/name-a-synthesized-bench-as-understudys-own.md): "should say
-	// understudy synthesized the bench when the upstream answered nothing" belongs
-	// here — a stalling target is logged "advertised backoff" today, because the
-	// stall bench is written through the same readmitAt an upstream advertises.
 	// TODO(TODO.d/report-when-a-target-actually-started-failing.md): "should say
 	// when a target actually started failing, not when its demotion is measured
 	// from" belongs here — a demoted target reports failing_since a full failover
