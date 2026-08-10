@@ -2812,6 +2812,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		}
 	})
 
+	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the stall cases assert the
+	// client's answer, not what the attempt recorded. A stall answers with no status,
+	// and nothing here would notice one being invented.
+
 	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},

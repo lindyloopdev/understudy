@@ -561,23 +561,25 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // returns a target benched until a moment that has not arrived, against the rule
 // above.
 //
-// It reports false when every candidate named a backend understudy cannot use,
-// which leaves the request the list a model declaring no targets has. Each reason
-// is on the request's Excluded by then; only the caller can name the model the
-// client is answered with.
-func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) (Target, bool) {
+// It reports false when every candidate named a backend understudy cannot use, and
+// returns each rejection for the caller to record — only the walk knows the order it
+// reached them in. A walk that has already failed somewhere answers with that
+// failure; one that never attempted anything is the model with nothing to serve it,
+// which only the caller can name.
+func (s *server) pickTarget(targets []Target, backends map[string]Backend) (Target, bool, []Attempt) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictStaleHealth()
+	var skipped []Attempt
 	for _, t := range targets {
 		if _, err := s.resolveBackend(backends, t.backend); err != nil {
-			addLogSkipped(ctx, t.backend, t.model, err)
+			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
 			continue
 		}
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
-			return t, true
+			return t, true, skipped
 		}
 		if !h.readmitAt.IsZero() {
 			if now.Before(h.readmitAt) {
@@ -588,55 +590,31 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 			h.lastProbe = now
 			h.lastTouch = now
 			s.health[id] = h
-			return t, true
+			return t, true, skipped
 		}
 		if now.Sub(h.lastProbe) >= s.recoveryInterval {
 			h.lastProbe = now
 			h.lastTouch = now
 			s.health[id] = h
-			return t, true
+			return t, true, skipped
 		}
 		s.noteBackendDown(id, t, h)
 	}
 	// Nothing was healthy, but a target health kept back is still worth attempting.
-	last, ok, _ := s.lastCallableTarget(targets, backends)
-	return last, ok
+	last, ok := s.lastCallableTarget(targets, backends)
+	return last, ok, skipped
 }
 
-// canFailOver reports whether any untried target names a backend understudy could
-// call, recording why it rejected the others when none does — nothing else reaches
-// them once the walk stops.
-//
-// TODO(TODO.d/let-the-walk-carry-the-failure-it-answers-with.md): a walk that
-// carried its own failure would not need this lookahead.
-func (s *server) canFailOver(ctx context.Context, logicalTargets []Target, tried []string, backends map[string]Backend) bool {
-	_, ok, rejected := s.lastCallableTarget(untriedTargets(logicalTargets, tried, backends), backends)
-	if ok {
-		return true
-	}
-	for _, a := range rejected {
-		addLogSkipped(ctx, a.Backend, a.ModelUpstream, a.Err)
-	}
-	return false
-}
-
-// lastCallableTarget returns the last target understudy could call at all, and the
-// ones it could not with the reason each was rejected. A backend understudy cannot
-// call subtracts itself rather than deciding for the list, so what remains is what
-// the request has. The rejected are returned rather than recorded: a caller that
-// walks on leaves that to pickTarget, and only a caller that stops here has to.
-func (s *server) lastCallableTarget(targets []Target, backends map[string]Backend) (Target, bool, []Attempt) {
-	var last Target
-	var found bool
-	var rejected []Attempt
-	for _, t := range targets {
-		if _, err := s.resolveBackend(backends, t.backend); err != nil {
-			rejected = append(rejected, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
-			continue
+// lastCallableTarget returns the last target understudy could call at all, and
+// whether the list held one. A backend understudy cannot call subtracts itself
+// rather than deciding for the list, so what remains is what the request has.
+func (s *server) lastCallableTarget(targets []Target, backends map[string]Backend) (Target, bool) {
+	for _, t := range slices.Backward(targets) {
+		if _, err := s.resolveBackend(backends, t.backend); err == nil {
+			return t, true
 		}
-		last, found = t, true
 	}
-	return last, found, rejected
+	return Target{}, false
 }
 
 // untriedTargets returns the targets whose availability key is absent from
@@ -658,6 +636,8 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 
 // noteBackendDown logs the "backend down" transition for t once per failure
 // streak, recording on h that it has been logged. Caller holds s.mu.
+// TODO(TODO.d/emit-health-transitions-outside-the-lock.md): this writes to a
+// consumer's logger while s.mu is held.
 func (s *server) noteBackendDown(id string, t Target, h targetHealth) {
 	if h.downLogged {
 		return
@@ -758,6 +738,35 @@ func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration
 	return time.Since(h.failingSince)
 }
 
+// failedAttempt is an attempt that failed: what the request would answer with if
+// nothing better comes, and what to record if something does.
+type failedAttempt struct {
+	// answer is client-facing, classified in the iteration that failed: what
+	// cancelled an attempt is only knowable while that attempt's context is alive.
+	answer error
+	// raw is what the verdict reads, since clientFacing rewrites a 501 past
+	// recognizing.
+	raw           error
+	target        Target
+	backend       string
+	upstreamModel string
+}
+
+// status is what the attempt answered with. An attempt cut off before its header
+// answered nothing, so it reports none: Attempt.UpstreamStatus is 0 for exactly that,
+// and yerrors would otherwise invent a 500 for a status-less error.
+func (f failedAttempt) status() int {
+	if errors.Is(f.raw, errHeaderStall) {
+		return 0
+	}
+	return yerrors.HTTPStatus(f.raw)
+}
+
+// record puts f on the request's Excluded: a target the request did not serve from.
+func (f failedAttempt) record(ctx context.Context) {
+	addLogCalled(ctx, f.backend, f.upstreamModel, f.status(), f.raw)
+}
+
 // terminalFailure marks err terminal — the response path rejects it as
 // non-retryable rather than relaying it — when remaining holds nothing understudy
 // could call, whether because it is empty or because every candidate in it names a
@@ -771,7 +780,7 @@ func (s *server) terminalFailure(t Target, remaining []Target, backends map[stri
 	// A candidate understudy cannot call is not somewhere left to go, so it cannot
 	// hold the ladder's last rung open — the same reading the walk uses to decide
 	// whether to fail over at all.
-	if _, ok, _ := s.lastCallableTarget(remaining, backends); ok {
+	if _, ok := s.lastCallableTarget(remaining, backends); ok {
 		return err
 	}
 	return terminalError{err}
@@ -1410,6 +1419,11 @@ func noTargetsError(model string) error {
 	return notFound(fmt.Errorf("logical model %q has no targets", model))
 }
 
+// errWalkExhausted reports, from the pick, that the walk has nowhere left to go. It
+// never reaches a client: the loop recognizes it and answers with the failure that
+// got there.
+var errWalkExhausted = errors.New("walk exhausted")
+
 // errNoSuchBackend is the reason resolveBackend gives when the config declares no
 // backend under the name asked for, as opposed to declaring one understudy cannot
 // use. Callers that phrase the two differently match on it.
@@ -1658,12 +1672,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
-	// throttledErr is the error of a candidate the walk failed over from under a timed
-	// backoff, and throttledTarget the candidate that raised it — the answer is judged
-	// against whichever target it came from.
+	// throttled is the candidate the walk failed over from under a timed backoff; the
+	// answer is judged against whichever target it came from.
 	// TODO(TODO.d/weigh-every-candidates-contribution.md)
-	var throttledErr error
-	var throttledTarget Target
+	var throttled *failedAttempt
+	var lastFailure *failedAttempt
+	var remaining []Target
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
@@ -1686,8 +1700,23 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				picked, ok := s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				picked, ok, skipped := s.pickTarget(untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				if ok && lastFailure != nil {
+					// Somewhere else to go, so the request did move past the last
+					// candidate — recorded before this pick's skips, which is the
+					// order the walk saw them in.
+					lastFailure.record(r.Context())
+				}
+				for _, a := range skipped {
+					addLogSkipped(r.Context(), a.Backend, a.ModelUpstream, a.Err)
+				}
 				if !ok {
+					// A walk that got here through a failure answers for that failure,
+					// which only the loop can do; one that never attempted anything is
+					// the model with nothing to serve it.
+					if lastFailure != nil {
+						return "", errWalkExhausted
+					}
 					return "", resolveError{noTargetsError(model)}
 				}
 				chosen = picked
@@ -1717,6 +1746,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return ref.model, nil
 		})
 		if err != nil {
+			if errors.Is(err, errWalkExhausted) {
+				break
+			}
 			if re, ok := errors.AsType[resolveError](err); ok {
 				return re.error
 			}
@@ -1782,14 +1814,19 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// client see the 504.
 			s.recordRateLimited(chosen, synthesizedStallBackoff, backend.Backends)
 			releaseHeld()
+			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
-				if s.canFailOver(r.Context(), logicalTargets, tried, backend.Backends) {
-					addLogCalled(r.Context(), parsedBackendName, upstreamModel, 0, err)
-					continue
+				lastFailure = &failedAttempt{
+					answer:        stalled,
+					raw:           err,
+					target:        chosen,
+					backend:       parsedBackendName,
+					upstreamModel: upstreamModel,
 				}
+				continue
 			}
-			return yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
+			return stalled
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
@@ -1828,6 +1865,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		if err != nil {
+			failed := failedAttempt{
+				answer:        clientFacing(ctx, err),
+				raw:           err,
+				target:        chosen,
+				backend:       parsedBackendName,
+				upstreamModel: upstreamModel,
+			}
 			// A sustainedRate 429 or refused access has just demoted chosen
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
@@ -1837,32 +1881,19 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// delay is re-derived rather than remembered, so both are what remains
 				// as of now.
 				if sig.condition == sustainedRate && sig.hasRetryAfter &&
-					(throttledErr == nil || sig.retryAfter < classifyLimit(throttledErr).retryAfter) {
-					throttledErr, throttledTarget = err, chosen
+					(throttled == nil || sig.retryAfter < classifyLimit(throttled.raw).retryAfter) {
+					throttled = &failed
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
-				if s.canFailOver(r.Context(), logicalTargets, tried, backend.Backends) {
-					addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
-					releaseHeld()
-					cancel(nil)
-					continue
-				}
+				lastFailure = &failed
+				releaseHeld()
+				cancel(nil)
+				continue
 			}
-			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
 			releaseHeld()
 			cancel(nil)
-			remaining := untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
-			answering := chosen
-			// A refusal contributes nothing to the verdict, and neither does an
-			// operation the upstream does not implement.
-			if throttledErr != nil &&
-				(isAccessRefused(err) || yerrors.HTTPStatus(err) == http.StatusNotImplemented) {
-				// The answer is an earlier candidate's, so this one is a target the
-				// request did not serve from — and the only record of why.
-				addLogCalled(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
-				err, answering = throttledErr, throttledTarget
-			}
-			return s.terminalFailure(answering, remaining, backend.Backends, clientFacing(ctx, err))
+			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
+			break
 		}
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
@@ -1888,4 +1919,19 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		cancel(nil)
 		return err
 	}
+
+	// The walk is over, by either road: it ran out of candidates, or its last failure
+	// was one no other candidate could answer for. What it answers with is that
+	// failure, unless an earlier candidate offered a return it can still make.
+	f := *lastFailure
+	setLogUpstreamStatus(r.Context(), f.status())
+	answer, answering := f.answer, f.target
+	if throttled != nil &&
+		(isAccessRefused(f.raw) || yerrors.HTTPStatus(f.raw) == http.StatusNotImplemented) {
+		// An earlier candidate answers, so this one is a target the request did not
+		// serve from — and the only record of why.
+		f.record(r.Context())
+		answer, answering = throttled.answer, throttled.target
+	}
+	return s.terminalFailure(answering, remaining, backend.Backends, answer)
 }

@@ -10,6 +10,14 @@ operator through `Excluded`, never the client), "A list emptied by misconfigurat
 targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
 valid answer for the listing whatever its cause).
 
+- **Pin what a stalled attempt records.** `Attempt.UpstreamStatus` is documented as
+  `0` when the attempt never produced a response, which a pre-header stall never
+  does, and no case asserts it. A restructure derived the value from the error
+  instead and recorded `500` — a status the upstream never sent — with the whole
+  suite green. Drive a stall the walk moves past, and a walk where every candidate
+  stalls, asserting the recorded status both on `Excluded` and on the record's own
+  fields.
+
 - **Decide whether re-walking records a target again.** `pickTarget` re-walks the
   candidate list from the start on every failover, so targets `[broken, limited,
   good]` where `limited` fails over yield `broken, limited, broken`. The walk-log
