@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -3621,17 +3622,21 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	})
 }
 
+// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should keep routing while
+// the consumer's log sink blocks" belongs beside this table, as its own test — it
+// needs a handler that blocks and a second concurrent request, which no table case
+// here can express.
 func TestChatCompletionsTransitionLogging(t *testing.T) {
 	t.Parallel()
 
-	always502 := func(int) int { return http.StatusBadGateway }
-	recoverOnProbe := func(call int) int {
+	always502 := func(int, context.CancelFunc) int { return http.StatusBadGateway }
+	recoverOnProbe := func(call int, _ context.CancelFunc) int {
 		if call == 2 {
 			return http.StatusOK
 		}
 		return http.StatusBadGateway
 	}
-	recoverWithinGrace := func(call int) int {
+	recoverWithinGrace := func(call int, _ context.CancelFunc) int {
 		if call >= 2 {
 			return http.StatusOK
 		}
@@ -3639,11 +3644,17 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	}
 
 	type test struct {
-		aStatus    func(call int) int
+		aStatus    func(call int, clientLeaves context.CancelFunc) int
 		retryAfter time.Duration
 		advances   []time.Duration
 		wantDown   int
+		// downFields are additional fields the "backend down" records must carry.
+		downFields map[string]any
 		wantUp     int
+	}
+
+	logTime := func(d time.Duration) string {
+		return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(d).Local().Format(time.RFC3339Nano)
 	}
 
 	tests := testy.NewTable[test]()
@@ -3666,6 +3677,18 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantDown: 1,
 		wantUp:   1,
 	})
+	tests.Add("should log a transition the departed client discovered", test{
+		aStatus: func(call int, clientLeaves context.CancelFunc) int {
+			if call < 2 {
+				return http.StatusBadGateway
+			}
+			clientLeaves()
+			return http.StatusOK
+		},
+		advances: []time.Duration{16 * time.Second, 30 * time.Second},
+		wantDown: 1,
+		wantUp:   1,
+	})
 	tests.Add("should not log a transition when a target recovers within the failover threshold", test{
 		aStatus:  recoverWithinGrace,
 		advances: []time.Duration{5 * time.Second},
@@ -3673,7 +3696,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:   0,
 	})
 	tests.Add("should log a target up when a rate-limited target is re-admitted after its retry-after", test{
-		aStatus: func(call int) int {
+		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
 			}
@@ -3685,7 +3708,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     1,
 	})
 	tests.Add("should keep a rate-limited target benched when its re-admission probe fails", test{
-		aStatus: func(call int) int {
+		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
 			}
@@ -3696,16 +3719,67 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantDown:   1,
 		wantUp:     0,
 	})
+	// synctest's clock starts at midnight UTC 2000-01-01, so every moment below is
+	// an offset from it; slog renders them local.
+	tests.Add("should say understudy's own probe pacing holds a target back", test{
+		aStatus:  always502,
+		advances: []time.Duration{16 * time.Second, time.Second},
+		wantDown: 1,
+		downFields: map[string]any{
+			"reason":        "awaiting recovery probe",
+			"failing_since": logTime(0),
+			// recordFailure seeds lastProbe at the demotion moment (t+15s), so the
+			// first half-open probe waits a full recovery interval past it.
+			"next_probe": logTime(45 * time.Second),
+			"readmit_at": slogdiff.Absent(),
+		},
+		wantUp: 0,
+	})
+	tests.Add("should say an upstream's advertised backoff holds a target back", test{
+		aStatus: func(call int, _ context.CancelFunc) int {
+			if call == 1 {
+				return http.StatusTooManyRequests
+			}
+			return http.StatusOK
+		},
+		retryAfter: 50 * time.Second,
+		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
+		wantDown:   1,
+		downFields: map[string]any{
+			"reason":     "advertised backoff",
+			"readmit_at": logTime(50 * time.Second),
+			"next_probe": slogdiff.Absent(),
+		},
+		wantUp: 1,
+	})
+	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
+	// answered when it went down" belongs here — a case whose downFields require
+	// the status and message the target failed with, which the record omits today.
+	// TODO(TODO.d/name-a-synthesized-bench-as-understudys-own.md): "should say
+	// understudy synthesized the bench when the upstream answered nothing" belongs
+	// here — a stalling target is logged "advertised backoff" today, because the
+	// stall bench is written through the same readmitAt an upstream advertises.
+	// TODO(TODO.d/report-when-a-target-actually-started-failing.md): "should say
+	// when a target actually started failing, not when its demotion is measured
+	// from" belongs here — a demoted target reports failing_since a full failover
+	// threshold before its first failure, so no case asserts it.
+	// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should log a backend
+	// down decided by a request that has already gone" belongs here — the departed
+	// client case pins only the up half, so pickTarget's WithoutCancel is unverified.
+	// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should not log a
+	// backend up that was never down" belongs here — a case serving from a target
+	// with no health entry at all, which every case exercises and none asserts.
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			var logBuf bytes.Buffer
-			logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+			logger := slog.New(droppingHandler{slog.NewJSONHandler(&logBuf, nil)})
 
+			ctx, clientGone := context.WithCancel(t.Context())
 			callsA := 0
 			clientA := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 				callsA++
-				status := tt.aStatus(callsA)
+				status := tt.aStatus(callsA, clientGone)
 				body := `{"error":{"message":"bad gateway"}}`
 				if status == http.StatusOK {
 					body = `{"id":"from-a"}`
@@ -3729,7 +3803,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			srv := New(validator, WithLogger(logger))
 
 			doRequest := func() {
-				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -3746,6 +3820,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 
 			down := map[string]any{"msg": "backend down", "level": "INFO", "backend": "a", "model": "ma"}
+			maps.Copy(down, tt.downFields)
 			up := map[string]any{"msg": "backend up", "level": "INFO", "backend": "a", "model": "ma"}
 			if got := slogdiff.JSONCount(logBuf.Bytes(), down); got != tt.wantDown {
 				t.Errorf("%q count for backend=a model=ma: got %d, want %d; log:\n%s", "backend down", got, tt.wantDown, logBuf.String())
@@ -5428,4 +5503,15 @@ func TestChatCompletionsAuthenticatesUpstreamWithEnvNamedCredential(t *testing.T
 	if want := "Bearer sk-from-env"; gotAuth != want {
 		t.Errorf("upstream call authenticated with %q, want %q", gotAuth, want)
 	}
+}
+
+// droppingHandler stands in for a consumer's handler that honors cancellation,
+// discarding any record whose context is already done.
+type droppingHandler struct{ slog.Handler }
+
+func (h droppingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if ctx.Err() == nil {
+		return h.Handler.Handle(ctx, r)
+	}
+	return nil
 }

@@ -127,11 +127,16 @@ const synthesizedStallBackoff = 30 * time.Second
 // errHeaderStall marks an upstream attempt cancelled by the header-stall gate.
 var errHeaderStall = errors.New("upstream produced no response header before the stall gate")
 
-// targetHealth tracks a target's failure streak: failingSince is when the streak
-// began; lastProbe is when the target was last attempted; readmitAt is a known
-// re-admission time from an advertised Retry-After, or zero if none; downLogged
-// is whether the "backend down" transition has been logged; lastTouch is when
-// the entry was last written, the age the eviction sweep measures.
+// deferredLog queues a log call to be emitted once the caller's lock is released.
+type deferredLog func(msg string, args ...any)
+
+// targetHealth tracks a target's failure streak: failingSince is the moment the
+// streak is measured from — when it began, or a failover threshold before a target
+// demoted at once, so the walk routes around that one on the very next request; lastProbe is when the target was last attempted; readmitAt is a known
+// re-admission time, from an advertised Retry-After or a synthesized stall bench,
+// or zero if none; downLogged is whether the "backend down" transition has been
+// logged; lastTouch is when the entry was last written, the age the eviction sweep
+// measures.
 type targetHealth struct {
 	failingSince time.Time
 	lastProbe    time.Time
@@ -540,6 +545,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.h.ServeHTTP(w, r)
 }
 
+// pick is what choosing a target taught the walk. Its skipped list is reported
+// rather than recorded, so the walk can order its own account: it knows what it
+// abandoned before this pick, and pickTarget does not.
+type pick struct {
+	target  Target
+	ok      bool
+	skipped []Attempt // candidates understudy could not call
+}
+
 // pickTarget returns the first target that is usable at all and whose failure
 // streak is within the failover threshold (or that has none). A target whose
 // backend resolveBackend rejects is skipped before its health is consulted, and
@@ -550,7 +564,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // until a recovery interval has elapsed since its last probe, at which point it
 // is offered as a single half-open probe (stamping lastProbe so concurrent
 // requests within the cooldown still skip it). A target demoted with a known
-// re-admission time (readmitAt, from an advertised Retry-After) is instead
+// re-admission time (readmitAt, from an advertised Retry-After or a synthesized
+// stall bench) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
 // health preserved until the probe's outcome) — never half-open-probed early while
 // any other candidate remains. If every target is past the threshold and not due
@@ -566,7 +581,21 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // reached them in. A walk that has already failed somewhere answers with that
 // failure; one that never attempted anything is the model with nothing to serve it,
 // which only the caller can name.
-func (s *server) pickTarget(targets []Target, backends map[string]Backend) (Target, bool, []Attempt) {
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) pick {
+	// Queued under the lock, emitted after it: the logger is the consumer's, and a
+	// handler that blocks on I/O would otherwise hold every other request's walk
+	// behind it. Registered before the unlock below, so LIFO runs it after.
+	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): nothing orders this
+	// against clearFailure's "backend up", so a pair can reach the sink inverted.
+	var queued []func()
+	defer func() {
+		for _, emit := range queued {
+			emit()
+		}
+	}()
+	logLater := func(msg string, args ...any) {
+		queued = append(queued, func() { s.logTransition(ctx, msg, args...) })
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictStaleHealth()
@@ -579,30 +608,21 @@ func (s *server) pickTarget(targets []Target, backends map[string]Backend) (Targ
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
-			return t, true, skipped
+			return pick{target: t, ok: true, skipped: skipped}
 		}
-		if !h.readmitAt.IsZero() {
-			if now.Before(h.readmitAt) {
-				s.noteBackendDown(id, t, h)
-				continue
-			}
-			h.readmitAt = time.Time{}
-			h.lastProbe = now
-			h.lastTouch = now
-			s.health[id] = h
-			return t, true, skipped
+		if now.Before(s.nextReattempt(h)) {
+			s.noteBackendDown(logLater, id, t, h)
+			continue
 		}
-		if now.Sub(h.lastProbe) >= s.recoveryInterval {
-			h.lastProbe = now
-			h.lastTouch = now
-			s.health[id] = h
-			return t, true, skipped
-		}
-		s.noteBackendDown(id, t, h)
+		h.readmitAt = time.Time{}
+		h.lastProbe = now
+		h.lastTouch = now
+		s.health[id] = h
+		return pick{target: t, ok: true, skipped: skipped}
 	}
 	// Nothing was healthy, but a target health kept back is still worth attempting.
 	last, ok := s.lastCallableTarget(targets, backends)
-	return last, ok, skipped
+	return pick{target: last, ok: ok, skipped: skipped}
 }
 
 // lastCallableTarget returns the last target understudy could call at all, and
@@ -634,21 +654,49 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 	return remaining
 }
 
-// noteBackendDown logs the "backend down" transition for t once per failure
-// streak, recording on h that it has been logged. Caller holds s.mu.
-// TODO(TODO.d/emit-health-transitions-outside-the-lock.md): this writes to a
-// consumer's logger while s.mu is held.
-func (s *server) noteBackendDown(id string, t Target, h targetHealth) {
+// nextReattempt is when t is due to be called again: the re-admission moment if one
+// was recorded, and otherwise a full recovery interval past its last attempt. The
+// walk routes around a failing target until this moment and the "backend down"
+// record reports it, so both read the moment from here. Which schedule set it is
+// still read from readmitAt at each site. Caller holds s.mu.
+func (s *server) nextReattempt(h targetHealth) time.Time {
+	if h.readmitAt.IsZero() {
+		return h.lastProbe.Add(s.recoveryInterval)
+	}
+	return h.readmitAt
+}
+
+// noteBackendDown logs t's "backend down" transition once per failure streak, saying
+// why the walk routed around it. It logs through logLater rather than directly,
+// because the caller holds s.mu.
+func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h targetHealth) {
 	if h.downLogged {
 		return
 	}
-	s.logger.InfoContext(context.Background(), "backend down",
-		slog.String("backend", t.backend),
-		slog.String("model", t.model),
-	)
 	h.downLogged = true
 	h.lastTouch = time.Now()
 	s.health[id] = h
+	// TODO(TODO.d/give-the-schedule-kind-one-home.md): this re-tests what
+	// nextReattempt already decided.
+	// Exactly one schedule attr, paired with the reason naming it: which one appears
+	// says whether t is held to a recorded re-admission moment or to understudy's
+	// probe pacing.
+	reason, schedule := "awaiting recovery probe", slog.Time("next_probe", s.nextReattempt(h))
+	if !h.readmitAt.IsZero() {
+		reason, schedule = "advertised backoff", slog.Time("readmit_at", h.readmitAt)
+	}
+	logLater("backend down",
+		slog.String("backend", t.backend),
+		slog.String("model", t.model),
+		slog.String("reason", reason),
+		// What the streak is measured from, which the record's own timestamp is not:
+		// a walk routes around t some time after it started failing.
+		// TODO(TODO.d/report-when-a-target-actually-started-failing.md): for a target
+		// demoted at once this is backdated past its first failure.
+		slog.Time("failing_since", h.failingSince),
+		// TODO(TODO.d/say-why-a-backend-went-down.md): and what it answered with.
+		schedule,
+	)
 }
 
 // evictStaleHealth drops every entry untouched for healthTTL and returns the
@@ -699,7 +747,8 @@ func (s *server) recordFailure(t Target, backends map[string]Backend) {
 // backdated past the failover threshold so pickTarget routes around it on the
 // very next request, and lastProbe is seeded at the demotion moment so the first
 // half-open re-probe still waits a full recovery interval. readmitAt is the known
-// re-admission time from an advertised Retry-After, or zero for an unbounded one.
+// re-admission time — an advertised Retry-After, or the bench understudy synthesizes
+// for an upstream that answered nothing — or zero for an unbounded demotion.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 	return targetHealth{failingSince: now.Add(-s.failoverThreshold), lastProbe: now, readmitAt: readmitAt, lastTouch: now}
 }
@@ -713,10 +762,10 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 }
 
 // recordRateLimited demotes t at once like recordImmediateFailure, but records a
-// known re-admission time (now plus retryAfter) from an advertised Retry-After.
-// pickTarget keeps t benched until that time rather than half-open-probing it at
-// the recovery interval, so a target under a timed backoff is not re-admitted
-// before the backoff it advertised has elapsed.
+// known re-admission time, now plus retryAfter — an advertised Retry-After, or the
+// bench understudy synthesizes for an upstream that answered nothing. pickTarget
+// keeps t benched until that time rather than half-open-probing it at the recovery
+// interval, so a target under a timed backoff is not re-admitted before it elapses.
 func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends map[string]Backend) {
 	s.writeHealth(t, backends,
 		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(retryAfter)) },
@@ -796,19 +845,37 @@ type terminalError struct{ error }
 func (e terminalError) Unwrap() error { return e.error }
 
 // clearFailure marks t healthy, ending any failure streak. It emits the
-// "backend up" transition iff the streak was previously announced "backend
+// "backend up" transition iff the streak was previously logged "backend
 // down", keeping the up/down log pair symmetric.
-func (s *server) clearFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if h, ok := s.health[id]; ok && h.downLogged {
-		s.logger.InfoContext(context.Background(), "backend up",
+func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
+	// Logged after dropHealth returns, so the consumer's handler does not block
+	// every other request's walk behind s.mu.
+	if s.dropHealth(t, backends) {
+		s.logTransition(ctx, "backend up",
 			slog.String("backend", t.backend),
 			slog.String("model", t.model),
 		)
 	}
+}
+
+// logTransition emits a target's health transition. The transition is decided and
+// committed under s.mu before this runs, so the record cannot depend on the request
+// that noticed it still being around: a client that leaves in that window would
+// otherwise take a committed state change out of the log with it. A consumer's
+// values travel; only cancellation is dropped.
+func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
+	s.logger.InfoContext(context.WithoutCancel(ctx), msg, args...)
+}
+
+// dropHealth forgets t's health and reports whether its failure had been logged, so
+// the "backend up" that pairs with it is logged outside the lock.
+func (s *server) dropHealth(t Target, backends map[string]Backend) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := healthKey(t, backends)
+	h, ok := s.health[id]
 	delete(s.health, id)
+	return ok && h.downLogged
 }
 
 // clientFacing maps an error returned by a provider call into the status the
@@ -1076,9 +1143,9 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 }
 
 // addLogSkipped records a backend understudy could not use and never called.
-func addLogSkipped(ctx context.Context, backend, upstreamModel string, err error) {
+func addLogSkipped(ctx context.Context, a Attempt) {
 	if h := logCtxFrom(ctx); h != nil {
-		h.Excluded = append(h.Excluded, Attempt{Backend: backend, ModelUpstream: upstreamModel, Err: err})
+		h.Excluded = append(h.Excluded, a)
 	}
 }
 
@@ -1457,7 +1524,7 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	for name := range backend.Backends {
 		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
-			addLogSkipped(r.Context(), name, "", err)
+			addLogSkipped(r.Context(), Attempt{Backend: name, Err: err})
 			continue
 		}
 		matched = true
@@ -1700,17 +1767,17 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				picked, ok, skipped := s.pickTarget(untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
-				if ok && lastFailure != nil {
+				p := s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				if p.ok && lastFailure != nil {
 					// Somewhere else to go, so the request did move past the last
 					// candidate — recorded before this pick's skips, which is the
 					// order the walk saw them in.
 					lastFailure.record(r.Context())
 				}
-				for _, a := range skipped {
-					addLogSkipped(r.Context(), a.Backend, a.ModelUpstream, a.Err)
+				for _, a := range p.skipped {
+					addLogSkipped(r.Context(), a)
 				}
-				if !ok {
+				if !p.ok {
 					// A walk that got here through a failure answers for that failure,
 					// which only the loop can do; one that never attempted anything is
 					// the model with nothing to serve it.
@@ -1719,7 +1786,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					}
 					return "", resolveError{noTargetsError(model)}
 				}
-				chosen = picked
+				chosen = p.target
 				parsedBackendName = chosen.backend
 				upstreamModel = chosen.model
 				return chosen.model, nil
@@ -1854,7 +1921,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if chosen.backend != "" {
 			switch {
 			case err == nil:
-				s.clearFailure(chosen, backend.Backends)
+				s.clearFailure(r.Context(), chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(chosen, sig.retryAfter, backend.Backends)
 			case demote || isAccessRefused(err):
