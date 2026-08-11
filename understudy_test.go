@@ -3719,7 +3719,16 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 0,
 	})
-	tests.Add("should say a target was told to back off even when no later request tries it", test{
+	tests.Add("should report a refused target when it is refused, not when a walk later finds it", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
+		wantDown: 1,
+		downFields: map[string]any{
+			"reason":     "probe not yet due",
+			"readmit_at": slogdiff.Absent(),
+		},
+		wantUp: 0,
+	})
+	tests.Add("should report a throttled target when it is throttled, not when a walk later finds it", test{
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: 50 * time.Second,
 		wantDown:   1,
@@ -3818,20 +3827,12 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name the cause a
-	// target is out for now, not the one that started its streak" belongs here — a
-	// target benched by a 429 that later stalls reads "no response header", and which of
-	// the two an operator should see is undecided.
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should say when a benched
-	// target's return moves" belongs here — a second bench in one streak overwrites
-	// readmitAt silently, so the record an operator has says the target is due back
-	// at a moment that no longer holds.
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should announce a demotion
-	// the streak never reported" and "should stay silent when a target is demoted
-	// twice in one streak" belong here — bench's update path, both outcomes, is
-	// driven by no test, for either the stall or the retry-after caller.
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name a demotion the
-	// same way whichever request logs it" belongs here — the walk and the demotion
+	// TODO(TODO.d/decide-what-a-second-demotion-says.md): the four cases that entry
+	// leaves open belong here — which cause a re-demoted target names, whether a moved
+	// re-admission moment is said at all, and both outcomes of demote's update path,
+	// which no test reaches for any of its three callers.
+	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
+	// the same way whichever request logs it" belongs here — the walk and the demotion
 	// paths claim one flag, so for an existing entry the reason follows lock order.
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require

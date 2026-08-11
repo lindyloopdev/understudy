@@ -18,11 +18,10 @@ The error is not lost — `addLogCalled` puts it on the demoting request's
 `Excluded[].Err`. But that is a different record, and finding it means identifying
 which request demoted the target, which is exactly what the operator lacks.
 
-The error needs no carrying once the record is written where the demotion is: every
-call to `recordFailure`, `recordImmediateFailure`, `recordRateLimited`, and
-`recordStalled` is made with it in hand. So this lands with
-[[log-a-transition-where-it-happens]], and what remains here is only what the record
-should say of it: its status and message alongside the reason.
+The error needs no carrying: every call to `recordFailure`, `recordImmediateFailure`,
+`recordRateLimited`, and `recordStalled` is made with it in hand. So this lands
+where each demotion is written, and what remains here is only what the record should
+say of it: its status and message alongside the reason.
 
 One thing to settle when it lands:
 

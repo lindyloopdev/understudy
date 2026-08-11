@@ -707,26 +707,43 @@ func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 	}
 }
 
-// bench demotes t for d, and reports the health it wrote along with whether this call
-// is the one that owes a "backend down" — the first of the streak.
-func (s *server) bench(t Target, d time.Duration, backends map[string]Backend) (targetHealth, bool) {
-	var announce bool
-	var benched targetHealth
+// demote writes t's demotion and reports the health written, along with whether this
+// call owes a "backend down" — the first of the streak. bench is how long t is held
+// out, or nil when nothing holds it but understudy's own probe pacing; a nil bench
+// leaves an existing re-admission moment alone rather than clearing it, since an
+// upstream that named one has not withdrawn it by failing another way. Unlike
+// writeHealth, an existing entry is always visited, because a streak that was never
+// reported still owes a record however it is demoted again.
+func (s *server) demote(t Target, backends map[string]Backend, bench *time.Duration) (targetHealth, bool) {
+	var owed bool
+	var written targetHealth
 	s.writeHealth(t, backends,
 		func(now time.Time) targetHealth {
-			h := s.demotedHealth(now, now.Add(d))
-			announce, h.downLogged = true, true
-			benched = h
+			var readmitAt time.Time
+			if bench != nil {
+				readmitAt = now.Add(*bench)
+			}
+			h := s.demotedHealth(now, readmitAt)
+			owed, h.downLogged = true, true
+			written = h
 			return h
 		},
 		func(now time.Time, h targetHealth) targetHealth {
-			h.readmitAt = now.Add(d)
-			announce = !h.downLogged
+			if bench != nil {
+				h.readmitAt = now.Add(*bench)
+			}
+			owed = !h.downLogged
 			h.downLogged = true
-			benched = h
+			written = h
 			return h
 		})
-	return benched, announce
+	return written, owed
+}
+
+// demoteFor is demote with a re-admission moment: t is held out for d, rather than
+// until understudy's own probe pacing lets it back.
+func (s *server) demoteFor(t Target, d time.Duration, backends map[string]Backend) (targetHealth, bool) {
+	return s.demote(t, backends, &d)
 }
 
 // failedSince is the attr naming when a target started failing, built here so every
@@ -759,11 +776,9 @@ func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h ta
 	h.downLogged = true
 	h.lastTouch = time.Now()
 	s.health[id] = h
-	cause := pacedTo(s.nextReattempt(h))
-	if !h.readmitAt.IsZero() {
-		cause = benchedUntil(reasonUpstreamRetryAfter, h.readmitAt)
-	}
-	logLater(msgBackendDown, backendDownRecord(t, h, cause)...)
+	// Always paced: every path that benches a target reports its own demotion and
+	// marks it, so a streak still owing a record is one this walk accrued.
+	logLater(msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 }
 
 // evictStaleHealth drops every entry untouched for healthTTL and returns the
@@ -781,9 +796,10 @@ func (s *server) evictStaleHealth() time.Time {
 // writeHealth stores t's health under s.mu. It sweeps first — the only thing that
 // reclaims an entry named directly and so never walked past — then stamps the
 // entry with the sweep's own clock, so a write cannot be aged out by the sweep
-// that preceded it. mint builds an entry for a key the map does not hold; update,
-// when non-nil, revises one it does.
-func (s *server) writeHealth(t Target, backends map[string]Backend, mint func(now time.Time) targetHealth, update func(now time.Time, h targetHealth) targetHealth) {
+// that preceded it. beginStreak builds the entry for a key the map does not hold —
+// a target with no entry is not failing, so a new one opens a streak; updateStreak,
+// when non-nil, revises a streak already under way.
+func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak func(now time.Time) targetHealth, updateStreak func(now time.Time, h targetHealth) targetHealth) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictStaleHealth()
@@ -791,9 +807,9 @@ func (s *server) writeHealth(t Target, backends map[string]Backend, mint func(no
 	h, ok := s.health[id]
 	switch {
 	case !ok:
-		h = mint(now)
-	case update != nil:
-		h = update(now, h)
+		h = beginStreak(now)
+	case updateStreak != nil:
+		h = updateStreak(now, h)
 	}
 	h.lastTouch = now
 	s.health[id] = h
@@ -822,10 +838,11 @@ func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
 // the very next request rather than tolerating it for a failover threshold.
-func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
-	s.writeHealth(t, backends, func(now time.Time) targetHealth {
-		return s.demotedHealth(now, time.Time{})
-	}, nil)
+func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends map[string]Backend) {
+	h, owed := s.demote(t, backends, nil)
+	if owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
+	}
 }
 
 // recordStalled demotes t for a pre-header stall and benches it for a backoff
@@ -833,7 +850,7 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 // It logs the transition itself: a stall is a demotion understudy decides, so the
 // cause is known here and nowhere later.
 func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend) {
-	if h, owed := s.bench(t, synthesizedStallBackoff, backends); owed {
+	if h, owed := s.demoteFor(t, synthesizedStallBackoff, backends); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonNoResponseHeader, h.readmitAt))...)
 	}
 }
@@ -846,7 +863,7 @@ func (s *server) recordStalled(ctx context.Context, t Target, backends map[strin
 // that said nothing is recordStalled's, not this one's. It logs the transition when
 // the streak has not already reported one.
 func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend) {
-	if h, owed := s.bench(t, retryAfter, backends); owed {
+	if h, owed := s.demoteFor(t, retryAfter, backends); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
 	}
 }
@@ -2001,7 +2018,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends)
 			case demote || isAccessRefused(err):
-				s.recordImmediateFailure(chosen, backend.Backends)
+				s.recordImmediateFailure(r.Context(), chosen, backend.Backends)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
 				s.recordFailure(chosen, backend.Backends)
