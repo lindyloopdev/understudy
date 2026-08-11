@@ -280,6 +280,14 @@ skip like any other and belongs on `Excluded`, on every request that routes arou
 the target, exactly as the rule above requires.
 [[record-a-benched-target-the-walk-routed-around]]
 
+**A transition is never emitted while the health map is held.** The record is decided
+under the lock and written after it, because the handler belongs to the consumer and
+may be slow: a file, a socket, a shipper with a full buffer. Every request's routing
+reads that map, so a handler run under it would hold the whole proxy for as long as it
+took to write one line — and a backend going down is exactly when requests arrive
+together. Deciding and emitting are therefore separate steps in every path that
+reports one.
+
 **A transition is logged when it happens.** The demotion is the event: the request
 that was refused, stalled, or told to back off holds the failure, knows what the
 upstream answered, and knows the moment. Logging instead at the next walk that routes

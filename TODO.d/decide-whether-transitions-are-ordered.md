@@ -26,6 +26,6 @@ the lock. So this is a question to settle, not a bug to fix:
 - **If order is best-effort**, say so where an operator will read it, and keep the
   cheap deferred emission.
 
-Settle it before adding a third transition record; a rule inferred from two is
-already ambiguous. The blocking-sink promise this trades against is
-[[pin-what-the-transition-log-promises]].
+Settle it before adding a third transition record; a rule inferred from two is already
+ambiguous. Whatever serializes them must stay off the health lock — a case pinning that
+a request still routes while the sink holds a record will fail if it does not.

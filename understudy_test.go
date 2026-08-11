@@ -3640,10 +3640,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	})
 }
 
-// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should keep routing while
-// the consumer's log sink blocks" belongs beside this table, as its own test — it
-// needs a handler that blocks and a second concurrent request, which no table case
-// here can express.
 func TestChatCompletionsTransitionLogging(t *testing.T) {
 	t.Parallel()
 
@@ -5585,4 +5581,87 @@ func (h droppingHandler) Handle(ctx context.Context, r slog.Record) error {
 		return h.Handler.Handle(ctx, r)
 	}
 	return nil
+}
+
+// blockingHandler stands in for a consumer's handler that is slow to write: it takes
+// the first record, announces that it is holding it, and does not return it until the
+// test releases it.
+type blockingHandler struct {
+	slog.Handler
+	holdingRecord chan struct{}
+	releaseRecord chan struct{}
+	once          sync.Once
+}
+
+func (h *blockingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.once.Do(func() {
+		close(h.holdingRecord)
+		<-h.releaseRecord
+	})
+	return h.Handler.Handle(ctx, r)
+}
+
+// TestChatCompletionsRoutesWhileTheLogSinkBlocks pins DESIGN's "a transition is never
+// emitted while the health map is held": a consumer's handler is theirs to make slow,
+// and one that blocks must cost only the request that triggered it.
+func TestChatCompletionsRoutesWhileTheLogSinkBlocks(t *testing.T) {
+	t.Parallel()
+
+	// Real time, not synctest: the failure this pins is a request blocked on s.mu,
+	// and a mutex wait does not durably block, so a virtual clock never advances past
+	// it — the test would hang where it should fail.
+	var logBuf bytes.Buffer
+	sink := &blockingHandler{Handler: slog.NewJSONHandler(&logBuf, nil), holdingRecord: make(chan struct{}), releaseRecord: make(chan struct{})}
+	clientA := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Retry-After", "50")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"slow down"}}`)), Header: header}, nil
+	})
+	clientB := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: make(http.Header)}, nil
+	})
+	backends := map[string]Backend{
+		"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA}},
+		"b": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
+	}
+	validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}}}, nil
+	}}
+	srv := New(validator, WithLogger(slog.New(sink)))
+
+	serve := func() *httptest.ResponseRecorder {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer user-token")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+		return rr
+	}
+
+	demoted := make(chan struct{})
+	go func() {
+		defer close(demoted)
+		serve()
+	}()
+	// However this test leaves — assertion, fatal, or panic — the held handler is
+	// released and its request awaited, so no goroutine outlives the test.
+	defer func() {
+		close(sink.releaseRecord)
+		<-demoted
+	}()
+
+	<-sink.holdingRecord
+	statusWhileHeld := make(chan int, 1)
+	go func() { statusWhileHeld <- serve().Code }()
+	select {
+	case code := <-statusWhileHeld:
+		if code != http.StatusOK {
+			t.Errorf("a request did not route while the sink held a record: got %d, want %d", code, http.StatusOK)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("a request could not route while the sink held a record")
+	}
 }
