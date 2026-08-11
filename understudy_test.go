@@ -3681,6 +3681,15 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantDown: 1,
 		wantUp:   1,
 	})
+	tests.Add("should say understudy benched a target that answered nothing", test{
+		aStatus: func(int, context.CancelFunc) int {
+			time.Sleep(defaultHeaderStallGate + time.Second)
+			return http.StatusOK
+		},
+		wantDown:   1,
+		downFields: map[string]any{"reason": "stall backoff"},
+		wantUp:     0,
+	})
 	tests.Add("should log a transition the departed client discovered", test{
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
 			if call < 2 {
@@ -3756,10 +3765,17 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should say understudy
-	// benched a target that answered nothing" belongs here — a stall reads as an
-	// advertised backoff today, because the record is written by a later walk that
-	// no longer knows what happened.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name the cause a
+	// target is out for now, not the one that started its streak" belongs here — a
+	// target benched by a 429 that later stalls reads "stall backoff", and which of
+	// the two an operator should see is undecided.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should announce a stall on
+	// a target already demoted by something else" and "should stay silent when a
+	// target stalls twice in one streak" belong here — recordStalled's update path,
+	// both outcomes, is driven by no test.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name a stall the
+	// same way whichever request logs it" belongs here — the walk and recordStalled
+	// claim one flag, so for an existing entry the reason follows lock order.
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require
 	// the status and message the target failed with, which the record omits today.

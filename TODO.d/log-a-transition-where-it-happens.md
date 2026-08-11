@@ -7,22 +7,50 @@ when it happens", and the health-transition exemption above it, which is what al
 understudy its own log line at all. [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
 — demotion and half-open re-admission, the states these records report.
 
-`noteBackendDown` fires from `pickTarget`: not when a target is demoted, but when
-some later request's walk routes around it. Everything wrong with the record follows
-from that one placement.
+`noteBackendDown` fires from `pickTarget` for every demotion but a stall: not when a
+target is demoted, but when some later request's walk routes around it. Everything
+wrong with those records follows from that one placement.
 
-- The **cause** is out of scope, so the reason is re-derived from `readmitAt` — a
-  field two paths set. A pre-header stall, which advertised nothing, is reported as
-  `advertised backoff`: the opposite of what happened.
+- The **cause** is out of scope, so the reason is re-derived from `readmitAt` and
+  can only ever name a schedule. A target refused outright reads `awaiting recovery
+  probe`, which is true of when it will be retried and says nothing of why it is out.
 - The **error** is out of scope, so the record cannot say what the backend answered.
 - The **moment** is out of scope: the record is dated when a walk tripped over the
   target, which is why it carries `failing_since` at all.
 - A demotion **nobody trips over is never logged**.
 
-Move the emission to the demotion. Every call to `recordStalled`,
-`recordRateLimited`, and `recordImmediateFailure` is made with the cause, the error,
-and the moment in hand, and each names one reason with no inference. Nothing needs
-carrying forward on `targetHealth`.
+Move `recordRateLimited` and `recordImmediateFailure` to emit as `recordStalled`
+does. Every call to them is made with the cause, the error, and the moment in hand,
+so each names one reason with no inference, and nothing needs carrying forward on
+`targetHealth`.
+
+The two emission sites must also agree on what a record says: `recordStalled`'s
+carries no `failing_since`, `pickTarget`'s does. Settle that as the last path moves,
+rather than leaving an operator to notice which code wrote which line.
+
+**Two emitters is the end state, so the record needs one home.** The walk keeps
+emitting for a streak that ages in silence — DESIGN sanctions it as the earliest
+knowable moment — so the demotion sites and `pickTarget` both write "backend down"
+for good. Today each composes the record inline and they already disagree, one
+carrying `failing_since` and one not. Give the record a single constructor, so its
+message, attrs, and the pairing of a reason with its schedule cannot drift.
+
+Both also claim the same `downLogged` under `s.mu` and emit after releasing it, so
+for a target that already carries an entry, which reason an operator reads — the
+stall's own, or one the walk derived — follows lock order. That narrows as the paths
+move, since the walk's remaining case has an unambiguous reason, but it does not
+vanish: a target aging in silence can still stall while a walk is routing around it.
+
+**Which cause a record names is open.** `recordStalled` announces for any entry whose
+demotion was never logged, so a target benched by a `429` and later stalling is
+reported `stall backoff` — the cause it is out for now, rather than the one that
+started the streak. That is the same choice [[say-why-a-backend-went-down]] leaves
+open for the error, and both should be answered once, together.
+
+Three behaviors go unasserted until then: **should name the cause a target is out for
+now, not the one that started its streak**; **should announce a stall on a target
+already demoted by something else**; and **should stay silent when a target stalls
+twice in one streak** — `recordStalled`'s update path is driven by no test at all.
 
 **The emission still may not happen under `s.mu`.** These paths write health through
 `writeHealth`, which holds the lock for the whole write, so logging from inside them

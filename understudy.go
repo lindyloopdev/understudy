@@ -761,15 +761,33 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 
 // recordStalled demotes t for a pre-header stall and benches it for a backoff
 // understudy synthesized, the upstream having named none.
-// TODO(TODO.d/log-a-transition-where-it-happens.md): this is where the stall's
-// "backend down" belongs — the cause and the moment are here and nowhere later.
-func (s *server) recordStalled(t Target, backends map[string]Backend) {
+// It logs the transition itself: a stall is a demotion understudy decides, so the
+// cause is known here and nowhere later.
+func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend) {
+	var announce bool
+	var benched targetHealth
 	s.writeHealth(t, backends,
-		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(synthesizedStallBackoff)) },
+		func(now time.Time) targetHealth {
+			h := s.demotedHealth(now, now.Add(synthesizedStallBackoff))
+			announce, h.downLogged = true, true
+			benched = h
+			return h
+		},
 		func(now time.Time, h targetHealth) targetHealth {
 			h.readmitAt = now.Add(synthesizedStallBackoff)
+			announce = !h.downLogged
+			h.downLogged = true
+			benched = h
 			return h
 		})
+	if announce {
+		s.logTransition(ctx, "backend down",
+			slog.String("backend", t.backend),
+			slog.String("model", t.model),
+			slog.String("reason", "stall backoff"),
+			slog.Time("readmit_at", benched.readmitAt),
+		)
+	}
 }
 
 // recordRateLimited demotes t at once like recordImmediateFailure, and records the
@@ -1891,7 +1909,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// synthesized backoff, then replay the request onto the next untried
 			// target rather than surfacing the stall; only when none remains does the
 			// client see the 504.
-			s.recordStalled(chosen, backend.Backends)
+			s.recordStalled(r.Context(), chosen, backend.Backends)
 			releaseHeld()
 			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
 			if logicalTargets != nil {
