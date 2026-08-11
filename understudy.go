@@ -588,8 +588,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	// Queued under the lock, emitted after it: the logger is the consumer's, and a
 	// handler that blocks on I/O would otherwise hold every other request's walk
 	// behind it. Registered before the unlock below, so LIFO runs it after.
-	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): nothing orders this
-	// against clearFailure's "backend up", so a pair can reach the sink inverted.
+	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): nothing orders this, or
+	// a demotion path's own record, against clearFailure's "backend up", so a pair can
+	// reach the sink inverted.
 	var queued []func()
 	defer func() {
 		for _, emit := range queued {
@@ -657,6 +658,77 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 	return remaining
 }
 
+// msgBackendDown announces a target leaving rotation. Its pair is "backend up".
+const msgBackendDown = "backend down"
+
+// Why a target is out, in the words an operator reads. Each names something visible
+// from outside understudy: what the upstream sent, what it failed to send, or that
+// understudy is pacing its own retries.
+const (
+	reasonUpstreamRetryAfter = "upstream retry-after"
+	reasonNoResponseHeader   = "no response header"
+	reasonProbeNotYetDue     = "probe not yet due"
+)
+
+// downCause is why a target is out paired with when it is due back. The two travel
+// together so a record cannot name an upstream's terms while reporting the schedule
+// understudy set for itself, or the reverse.
+type downCause struct {
+	reason   string
+	schedule slog.Attr
+}
+
+// benchedUntil is a target held to a re-admission moment something recorded, named by
+// whatever recorded it.
+func benchedUntil(reason string, at time.Time) downCause {
+	return downCause{reason: reason, schedule: slog.Time("readmit_at", at)}
+}
+
+// pacedTo is a target no one benched, held back only until understudy's own next
+// probe is due.
+func pacedTo(at time.Time) downCause {
+	return downCause{reason: reasonProbeNotYetDue, schedule: slog.Time("next_probe", at)}
+}
+
+// backendDownRecord is what every "backend down" says: which target, why it is out,
+// when it started failing, and when it is due back — the moment an upstream named, or
+// the one understudy's own pacing sets, never both. Built here so the walk and the
+// demotion paths cannot drift apart. Caller holds s.mu only if h came from the map.
+func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
+	return []any{
+		slog.String("backend", t.backend),
+		slog.String("model", t.model),
+		slog.String("reason", cause.reason),
+		// The record's own timestamp is not this: a demotion may be reported by a
+		// walk that routes around t some time after it started failing.
+		h.failedSince(),
+		// TODO(TODO.d/say-why-a-backend-went-down.md): and what it answered with.
+		cause.schedule,
+	}
+}
+
+// bench demotes t for d, and reports the health it wrote along with whether this call
+// is the one that owes a "backend down" — the first of the streak.
+func (s *server) bench(t Target, d time.Duration, backends map[string]Backend) (targetHealth, bool) {
+	var announce bool
+	var benched targetHealth
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth {
+			h := s.demotedHealth(now, now.Add(d))
+			announce, h.downLogged = true, true
+			benched = h
+			return h
+		},
+		func(now time.Time, h targetHealth) targetHealth {
+			h.readmitAt = now.Add(d)
+			announce = !h.downLogged
+			h.downLogged = true
+			benched = h
+			return h
+		})
+	return benched, announce
+}
+
 // failedSince is the attr naming when a target started failing, built here so every
 // "backend down" record maps the same name to the same field: failingSince is what
 // the streak is measured from, backdated for a target demoted at once, and never
@@ -687,23 +759,11 @@ func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h ta
 	h.downLogged = true
 	h.lastTouch = time.Now()
 	s.health[id] = h
-	// Exactly one schedule attr, paired with the reason naming it: which one appears
-	// says whether t is held to a recorded re-admission moment or to understudy's
-	// probe pacing.
-	reason, schedule := "awaiting recovery probe", slog.Time("next_probe", s.nextReattempt(h))
+	cause := pacedTo(s.nextReattempt(h))
 	if !h.readmitAt.IsZero() {
-		reason, schedule = "advertised backoff", slog.Time("readmit_at", h.readmitAt)
+		cause = benchedUntil(reasonUpstreamRetryAfter, h.readmitAt)
 	}
-	logLater("backend down",
-		slog.String("backend", t.backend),
-		slog.String("model", t.model),
-		slog.String("reason", reason),
-		// The record's own timestamp is not this: a walk routes around t some time
-		// after it started failing.
-		h.failedSince(),
-		// TODO(TODO.d/say-why-a-backend-went-down.md): and what it answered with.
-		schedule,
-	)
+	logLater(msgBackendDown, backendDownRecord(t, h, cause)...)
 }
 
 // evictStaleHealth drops every entry untouched for healthTTL and returns the
@@ -773,30 +833,8 @@ func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
 // It logs the transition itself: a stall is a demotion understudy decides, so the
 // cause is known here and nowhere later.
 func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend) {
-	var announce bool
-	var benched targetHealth
-	s.writeHealth(t, backends,
-		func(now time.Time) targetHealth {
-			h := s.demotedHealth(now, now.Add(synthesizedStallBackoff))
-			announce, h.downLogged = true, true
-			benched = h
-			return h
-		},
-		func(now time.Time, h targetHealth) targetHealth {
-			h.readmitAt = now.Add(synthesizedStallBackoff)
-			announce = !h.downLogged
-			h.downLogged = true
-			benched = h
-			return h
-		})
-	if announce {
-		s.logTransition(ctx, "backend down",
-			slog.String("backend", t.backend),
-			slog.String("model", t.model),
-			slog.String("reason", "stall backoff"),
-			benched.failedSince(),
-			slog.Time("readmit_at", benched.readmitAt),
-		)
+	if h, owed := s.bench(t, synthesizedStallBackoff, backends); owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonNoResponseHeader, h.readmitAt))...)
 	}
 }
 
@@ -805,14 +843,12 @@ func (s *server) recordStalled(ctx context.Context, t Target, backends map[strin
 // about when it will serve again than understudy's own pacing can infer, so that
 // moment supersedes the recovery interval — which would otherwise call the target
 // back while it is still saying no. A bench understudy synthesized for an upstream
-// that said nothing is recordStalled's, not this one's.
-func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends map[string]Backend) {
-	s.writeHealth(t, backends,
-		func(now time.Time) targetHealth { return s.demotedHealth(now, now.Add(retryAfter)) },
-		func(now time.Time, h targetHealth) targetHealth {
-			h.readmitAt = now.Add(retryAfter)
-			return h
-		})
+// that said nothing is recordStalled's, not this one's. It logs the transition when
+// the streak has not already reported one.
+func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend) {
+	if h, owed := s.bench(t, retryAfter, backends); owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
+	}
 }
 
 // failingFor reports how long t's current failure streak has run, or zero when
@@ -1963,7 +1999,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			case err == nil:
 				s.clearFailure(r.Context(), chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
-				s.recordRateLimited(chosen, sig.retryAfter, backend.Backends)
+				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends)
 			case demote || isAccessRefused(err):
 				s.recordImmediateFailure(chosen, backend.Backends)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.

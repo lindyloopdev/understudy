@@ -3686,8 +3686,19 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		advances: []time.Duration{time.Second},
 		wantDown: 1,
 		downFields: map[string]any{
-			"reason":        "awaiting recovery probe",
+			"reason":        "probe not yet due",
 			"failing_since": logTime(0),
+		},
+		wantUp: 0,
+	})
+	tests.Add("should say a target was told to back off even when no later request tries it", test{
+		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
+		retryAfter: 50 * time.Second,
+		wantDown:   1,
+		downFields: map[string]any{
+			"reason":        "upstream retry-after",
+			"failing_since": logTime(0),
+			"readmit_at":    logTime(50 * time.Second),
 		},
 		wantUp: 0,
 	})
@@ -3698,7 +3709,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantDown: 1,
 		downFields: map[string]any{
-			"reason": "stall backoff",
+			"reason": "no response header",
 			// The gate fires at 20s and the stalled handler is reaped a second later.
 			"failing_since": logTime(21 * time.Second),
 		},
@@ -3753,7 +3764,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		advances: []time.Duration{16 * time.Second, time.Second},
 		wantDown: 1,
 		downFields: map[string]any{
-			"reason":        "awaiting recovery probe",
+			"reason":        "probe not yet due",
 			"failing_since": logTime(0),
 			// recordFailure seeds lastProbe at the demotion moment (t+15s), so the
 			// first half-open probe waits a full recovery interval past it.
@@ -3773,7 +3784,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
 		wantDown:   1,
 		downFields: map[string]any{
-			"reason":     "advertised backoff",
+			"reason":     "upstream retry-after",
 			"readmit_at": logTime(50 * time.Second),
 			"next_probe": slogdiff.Absent(),
 		},
@@ -3781,15 +3792,19 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	})
 	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name the cause a
 	// target is out for now, not the one that started its streak" belongs here — a
-	// target benched by a 429 that later stalls reads "stall backoff", and which of
+	// target benched by a 429 that later stalls reads "no response header", and which of
 	// the two an operator should see is undecided.
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should announce a stall on
-	// a target already demoted by something else" and "should stay silent when a
-	// target stalls twice in one streak" belong here — recordStalled's update path,
-	// both outcomes, is driven by no test.
-	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name a stall the
-	// same way whichever request logs it" belongs here — the walk and recordStalled
-	// claim one flag, so for an existing entry the reason follows lock order.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should say when a benched
+	// target's return moves" belongs here — a second bench in one streak overwrites
+	// readmitAt silently, so the record an operator has says the target is due back
+	// at a moment that no longer holds.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should announce a demotion
+	// the streak never reported" and "should stay silent when a target is demoted
+	// twice in one streak" belong here — bench's update path, both outcomes, is
+	// driven by no test, for either the stall or the retry-after caller.
+	// TODO(TODO.d/log-a-transition-where-it-happens.md): "should name a demotion the
+	// same way whichever request logs it" belongs here — the walk and the demotion
+	// paths claim one flag, so for an existing entry the reason follows lock order.
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require
 	// the status and message the target failed with, which the record omits today.

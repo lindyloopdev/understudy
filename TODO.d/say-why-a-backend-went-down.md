@@ -9,9 +9,10 @@ the request record's `Excluded` attempts, which are where the failing error is k
 today.
 
 The "backend down" line says which target, why it is being routed around
-(`advertised backoff` or `awaiting recovery probe`), when its streak is measured
-from, and when it comes back. It does not say what the backend answered when it
-failed, so an operator reading it cannot tell a credential problem from an outage.
+(`upstream retry-after`, `no response header`, or `probe not yet due`), when its
+streak is measured from, and when it comes back. It does not say what the backend
+answered when it failed, so an operator reading it cannot tell a credential problem
+from an outage.
 
 The error is not lost — `addLogCalled` puts it on the demoting request's
 `Excluded[].Err`. But that is a different record, and finding it means identifying
