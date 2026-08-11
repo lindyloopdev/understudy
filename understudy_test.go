@@ -3681,14 +3681,28 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantDown: 1,
 		wantUp:   1,
 	})
+	tests.Add("should date a refused target's streak at the refusal", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
+		advances: []time.Duration{time.Second},
+		wantDown: 1,
+		downFields: map[string]any{
+			"reason":        "awaiting recovery probe",
+			"failing_since": logTime(0),
+		},
+		wantUp: 0,
+	})
 	tests.Add("should say understudy benched a target that answered nothing", test{
 		aStatus: func(int, context.CancelFunc) int {
 			time.Sleep(defaultHeaderStallGate + time.Second)
 			return http.StatusOK
 		},
-		wantDown:   1,
-		downFields: map[string]any{"reason": "stall backoff"},
-		wantUp:     0,
+		wantDown: 1,
+		downFields: map[string]any{
+			"reason": "stall backoff",
+			// The gate fires at 20s and the stalled handler is reaped a second later.
+			"failing_since": logTime(21 * time.Second),
+		},
+		wantUp: 0,
 	})
 	tests.Add("should log a transition the departed client discovered", test{
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
@@ -3779,10 +3793,6 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require
 	// the status and message the target failed with, which the record omits today.
-	// TODO(TODO.d/report-when-a-target-actually-started-failing.md): "should say
-	// when a target actually started failing, not when its demotion is measured
-	// from" belongs here — a demoted target reports failing_since a full failover
-	// threshold before its first failure, so no case asserts it.
 	// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should log a backend
 	// down decided by a request that has already gone" belongs here — the departed
 	// client case pins only the up half, so pickTarget's WithoutCancel is unverified.

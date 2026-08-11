@@ -132,13 +132,16 @@ type deferredLog func(msg string, args ...any)
 
 // targetHealth tracks a target's failure streak: failingSince is the moment the
 // streak is measured from — when it began, or a failover threshold before a target
-// demoted at once, so the walk routes around that one on the very next request; lastProbe is when the target was last attempted; readmitAt is a known
+// demoted at once, so the walk routes around that one on the very next request and
+// the terminal ladder ages it from there; streakBegan is when the target actually
+// first failed, which is what a record reports and no backdate touches; lastProbe is when the target was last attempted; readmitAt is a known
 // re-admission time, from an advertised Retry-After or a synthesized stall bench,
 // or zero if none; downLogged is whether the "backend down" transition has been
 // logged; lastTouch is when the entry was last written, the age the eviction sweep
 // measures.
 type targetHealth struct {
 	failingSince time.Time
+	streakBegan  time.Time
 	lastProbe    time.Time
 	readmitAt    time.Time
 	downLogged   bool
@@ -654,6 +657,14 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 	return remaining
 }
 
+// failedSince is the attr naming when a target started failing, built here so every
+// "backend down" record maps the same name to the same field: failingSince is what
+// the streak is measured from, backdated for a target demoted at once, and never
+// what an operator is told.
+func (h targetHealth) failedSince() slog.Attr {
+	return slog.Time("failing_since", h.streakBegan)
+}
+
 // nextReattempt is when t is due to be called again: the re-admission moment if one
 // was recorded, and otherwise a full recovery interval past its last attempt. The
 // walk routes around a failing target until this moment and the "backend down"
@@ -687,11 +698,9 @@ func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h ta
 		slog.String("backend", t.backend),
 		slog.String("model", t.model),
 		slog.String("reason", reason),
-		// What the streak is measured from, which the record's own timestamp is not:
-		// a walk routes around t some time after it started failing.
-		// TODO(TODO.d/report-when-a-target-actually-started-failing.md): for a target
-		// demoted at once this is backdated past its first failure.
-		slog.Time("failing_since", h.failingSince),
+		// The record's own timestamp is not this: a walk routes around t some time
+		// after it started failing.
+		h.failedSince(),
 		// TODO(TODO.d/say-why-a-backend-went-down.md): and what it answered with.
 		schedule,
 	)
@@ -737,7 +746,7 @@ func (s *server) writeHealth(t Target, backends map[string]Backend, mint func(no
 // the target is actually routed around, not from its first failure.
 func (s *server) recordFailure(t Target, backends map[string]Backend) {
 	s.writeHealth(t, backends, func(now time.Time) targetHealth {
-		return targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold)}
+		return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold)}
 	}, nil)
 }
 
@@ -748,7 +757,7 @@ func (s *server) recordFailure(t Target, backends map[string]Backend) {
 // re-admission time — an advertised Retry-After, or the bench understudy synthesizes
 // for an upstream that answered nothing — or zero for an unbounded demotion.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
-	return targetHealth{failingSince: now.Add(-s.failoverThreshold), lastProbe: now, readmitAt: readmitAt, lastTouch: now}
+	return targetHealth{failingSince: now.Add(-s.failoverThreshold), streakBegan: now, lastProbe: now, readmitAt: readmitAt, lastTouch: now}
 }
 
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
@@ -785,6 +794,7 @@ func (s *server) recordStalled(ctx context.Context, t Target, backends map[strin
 			slog.String("backend", t.backend),
 			slog.String("model", t.model),
 			slog.String("reason", "stall backoff"),
+			benched.failedSince(),
 			slog.Time("readmit_at", benched.readmitAt),
 		)
 	}

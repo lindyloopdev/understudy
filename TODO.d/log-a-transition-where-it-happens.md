@@ -24,16 +24,13 @@ does. Every call to them is made with the cause, the error, and the moment in ha
 so each names one reason with no inference, and nothing needs carrying forward on
 `targetHealth`.
 
-The two emission sites must also agree on what a record says: `recordStalled`'s
-carries no `failing_since`, `pickTarget`'s does. Settle that as the last path moves,
-rather than leaving an operator to notice which code wrote which line.
-
 **Two emitters is the end state, so the record needs one home.** The walk keeps
 emitting for a streak that ages in silence — DESIGN sanctions it as the earliest
 knowable moment — so the demotion sites and `pickTarget` both write "backend down"
-for good. Today each composes the record inline and they already disagree, one
-carrying `failing_since` and one not. Give the record a single constructor, so its
-message, attrs, and the pairing of a reason with its schedule cannot drift.
+for good. Today each composes the record inline, so every attr's name and the field
+it maps to are chosen twice — a pairing that has already drifted once. Give the
+record a single constructor, so its message, its attrs, and the pairing of a reason
+with its schedule cannot.
 
 Both also claim the same `downLogged` under `s.mu` and emit after releasing it, so
 for a target that already carries an entry, which reason an operator reads — the
@@ -64,9 +61,8 @@ failure is the event; where the streak ages in silence, the discovering walk sta
 the emission point, and dates the streak rather than the discovery.
 
 Absorbs the record's other two open faults, both of which exist only because of the
-placement: [[say-why-a-backend-went-down]] (the error is in hand at the demotion) and
-[[report-when-a-target-actually-started-failing]] (the demotion knows the real
-moment, so it need not publish the backdate the walk relies on).
+placement: [[say-why-a-backend-went-down]] — the error is in hand at the demotion,
+and nowhere later.
 
 Guards: "should say an upstream's advertised backoff holds a target back" and "should
 say understudy's own probe pacing holds a target back" both pin reasons that must
