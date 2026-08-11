@@ -2919,10 +2919,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/pin-the-bench-a-stall-buys.md): "should route around a stalled
-	// target for the bench it synthesized, and call it again once that bench elapses"
-	// belongs here — neither end of that window is asserted, so shortening it breaks
-	// nothing.
 	tests.Add("should fail over within the request when a target stalls before its response header", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
@@ -2932,6 +2928,24 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should route around a stalled target for the bench it synthesized, and call it again once that bench elapses", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(r *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return stall(r, call)
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{advance: synthesizedStallBackoff / 2, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{advance: synthesizedStallBackoff, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
 		},
 	})
 
@@ -3681,6 +3695,24 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantDown: 1,
 		wantUp:   1,
 	})
+	tests.Add("should not log a target up that was never down", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusOK },
+		advances: []time.Duration{time.Second},
+		wantDown: 0,
+		wantUp:   0,
+	})
+	tests.Add("should log a target down that the departed client's walk discovered", test{
+		aStatus: func(call int, clientLeaves context.CancelFunc) int {
+			if call == 1 {
+				clientLeaves()
+			}
+			return http.StatusUnauthorized
+		},
+		advances:   []time.Duration{time.Second},
+		wantDown:   1,
+		downFields: map[string]any{"reason": "probe not yet due"},
+		wantUp:     0,
+	})
 	tests.Add("should date a refused target's streak at the refusal", test{
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		advances: []time.Duration{time.Second},
@@ -3808,12 +3840,6 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
 	// answered when it went down" belongs here — a case whose downFields require
 	// the status and message the target failed with, which the record omits today.
-	// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should log a backend
-	// down decided by a request that has already gone" belongs here — the departed
-	// client case pins only the up half, so pickTarget's WithoutCancel is unverified.
-	// TODO(TODO.d/pin-what-the-transition-log-promises.md): "should not log a
-	// backend up that was never down" belongs here — a case serving from a target
-	// with no health entry at all, which every case exercises and none asserts.
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
