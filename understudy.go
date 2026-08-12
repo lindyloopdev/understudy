@@ -614,10 +614,11 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
 			return pick{target: t, ok: true, skipped: skipped}
 		}
-		if now.Before(s.nextReattempt(h)) {
-			// Not why it is out: readmitAt cannot tell an upstream's terms from a
-			// bench understudy chose, so naming the cause is the demotion's job.
-			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: errors.New("routed around: not due to be called yet")})
+		if due := s.nextReattempt(h); now.Before(due) {
+			// When, not why: readmitAt cannot tell an upstream's terms from a bench
+			// understudy chose, so naming the cause is the demotion's job.
+			notDue := fmt.Errorf("routed around: not due until %s", due.Format(time.RFC3339))
+			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
 			s.noteBackendDown(logLater, id, t, h)
 			continue
 		}

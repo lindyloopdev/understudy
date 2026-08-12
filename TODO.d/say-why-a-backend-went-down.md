@@ -18,10 +18,18 @@ The error is not lost — `addLogCalled` puts it on the demoting request's
 `Excluded[].Err`. But that is a different record, and finding it means identifying
 which request demoted the target, which is exactly what the operator lacks.
 
-The error needs no carrying: every call to `recordFailure`, `recordImmediateFailure`,
-`recordRateLimited`, and `recordStalled` is made with it in hand. So this lands
-where each demotion is written, and what remains here is only what the record should
-say of it: its status and message alongside the reason.
+The error needs no carrying to reach the demotion: every call to `recordFailure`,
+`recordImmediateFailure`, `recordRateLimited`, and `recordStalled` is made with it in
+hand. Carrying it on `targetHealth` is what the *later* readers need, and there are
+two:
+
+- the `"backend down"` line, which should say the status and message alongside the
+  reason;
+- a benched target on a request's `Excluded`, which today says when it comes back and
+  nothing of why it went. **Should say what a routed-around target last answered.**
+
+Neither reader can name the cause from `readmitAt`: an advertised backoff and a bench
+understudy synthesized both set it, and only the demotion knows which.
 
 One thing to settle when it lands:
 

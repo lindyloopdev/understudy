@@ -2672,6 +2672,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// stall never returns a response header, blocking until its request context is
 	// cancelled — a pre-header stall. The long fallback keeps a broken gate surfacing
 	// as an assertion failure rather than a hang.
+	// notDueUntil is the record a walk leaves for a target it stepped over: the moment
+	// it is due back, d after synctest's epoch, rendered as pickTarget renders it.
+	notDueUntil := func(d time.Duration) error {
+		return fmt.Errorf("routed around: not due until %s",
+			time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(d).Local().Format(time.RFC3339))
+	}
+
 	stall := func(r *http.Request, _ int) (*http.Response, error) {
 		select {
 		case <-r.Context().Done():
@@ -3004,7 +3011,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: time.Second, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{
 				Backend:       "a",
 				ModelUpstream: "ma",
-				Err:           errors.New("routed around: not due to be called yet"),
+				Err:           notDueUntil(50 * time.Second), // the Retry-After the upstream named
 			}}},
 		},
 	})
@@ -3504,7 +3511,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b", wantExcluded: []Attempt{{
 				Backend:       "a",
 				ModelUpstream: "ma",
-				Err:           errors.New("routed around: not due to be called yet"),
+				Err:           notDueUntil(30 * time.Second), // one recovery interval, understudy's own pacing
 			}}},
 		},
 	})
