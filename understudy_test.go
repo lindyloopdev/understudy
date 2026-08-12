@@ -3739,6 +3739,31 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 0,
 	})
+	tests.Add("should announce a demotion the streak never reported", test{
+		aStatus: func(call int, _ context.CancelFunc) int {
+			if call == 1 {
+				return http.StatusTooManyRequests
+			}
+			return http.StatusUnauthorized
+		},
+		retryAfter: time.Second,
+		advances:   []time.Duration{2 * time.Second},
+		wantDown:   1,
+		downFields: map[string]any{"reason": "probe not yet due"},
+		wantUp:     0,
+	})
+	tests.Add("should stay silent when a target is demoted twice in one streak", test{
+		aStatus: func(call int, _ context.CancelFunc) int {
+			if call == 1 {
+				return http.StatusUnauthorized
+			}
+			return http.StatusTooManyRequests
+		},
+		retryAfter: 50 * time.Second,
+		advances:   []time.Duration{31 * time.Second},
+		wantDown:   1,
+		wantUp:     0,
+	})
 	tests.Add("should report a refused target when it is refused, not when a walk later finds it", test{
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
@@ -3847,9 +3872,6 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
-	// TODO(TODO.d/pin-what-a-second-demotion-does.md): both outcomes of demote's
-	// update path belong here — announcing a demotion the streak never reported, and
-	// staying silent on a second one — which no test reaches for any of its callers.
 	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
 	// the same way whichever request logs it" belongs here — the walk and the demotion
 	// paths claim one flag, so for an existing entry the reason follows lock order.
