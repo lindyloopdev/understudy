@@ -130,22 +130,31 @@ var errHeaderStall = errors.New("upstream produced no response header before the
 // deferredLog queues a log call to be emitted once the caller's lock is released.
 type deferredLog func(msg string, args ...any)
 
-// targetHealth tracks a target's failure streak: failingSince is the moment the
-// streak is measured from — when it began, or a failover threshold before a target
-// demoted at once, so the walk routes around that one on the very next request and
-// the terminal ladder ages it from there; streakBegan is when the target actually
-// first failed, which is what a record reports and no backdate touches; lastProbe is when the target was last attempted; readmitAt is a known
-// re-admission time, from an advertised Retry-After or a synthesized stall bench,
-// or zero if none; downLogged is whether the "backend down" transition has been
-// logged; lastTouch is when the entry was last written, the age the eviction sweep
-// measures.
+// targetHealth tracks a target's failure streak. An absent entry is a healthy target:
+// only a failure creates one, and clearing it is what recovery means.
 type targetHealth struct {
+	// failingSince is the moment the streak is measured from: when it began, or a
+	// failover threshold before a target demoted at once, so the walk routes around
+	// that one on the very next request and the terminal ladder ages it from there.
 	failingSince time.Time
-	streakBegan  time.Time
-	lastProbe    time.Time
-	readmitAt    time.Time
-	downLogged   bool
-	lastTouch    time.Time
+	// streakBegan is when the target actually first failed, which is what a record
+	// reports and no backdate touches.
+	streakBegan time.Time
+	// lastProbe is when the target was last attempted.
+	lastProbe time.Time
+	// readmitAt is a known re-admission time, from an advertised Retry-After or a
+	// synthesized stall bench, or zero when only probe pacing holds the target back.
+	readmitAt time.Time
+	// downLogged is whether this streak's "backend down" has been reported, so the
+	// walk and every demotion after the first stay silent.
+	downLogged bool
+	// lastError is what the target answered when it was last demoted, so a later
+	// reader can name the cause and its status without hunting the request that saw
+	// it.
+	lastError error
+	// lastTouch is when the entry was last written, the age the eviction sweep
+	// measures.
+	lastTouch time.Time
 }
 
 // healthTTL is how long a health entry may sit untouched before the
@@ -706,7 +715,7 @@ func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 		// The record's own timestamp is not this: a demotion may be reported by a
 		// walk that routes around t some time after it started failing.
 		h.failedSince(),
-		// TODO(TODO.d/say-why-a-backend-went-down.md): and what it answered with.
+		slog.String("upstream_error", errText(h.lastError)),
 		cause.schedule,
 	}
 }
@@ -718,7 +727,7 @@ func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 // upstream that named one has not withdrawn it by failing another way. Unlike
 // writeHealth, an existing entry is always visited, because a streak that was never
 // reported still owes a record however it is demoted again.
-func (s *server) demote(t Target, backends map[string]Backend, bench *time.Duration) (targetHealth, bool) {
+func (s *server) demote(t Target, backends map[string]Backend, bench *time.Duration, answered error) (targetHealth, bool) {
 	var owed bool
 	var written targetHealth
 	s.writeHealth(t, backends,
@@ -729,6 +738,7 @@ func (s *server) demote(t Target, backends map[string]Backend, bench *time.Durat
 			}
 			h := s.demotedHealth(now, readmitAt)
 			owed, h.downLogged = true, true
+			h.lastError = answered
 			written = h
 			return h
 		},
@@ -738,6 +748,7 @@ func (s *server) demote(t Target, backends map[string]Backend, bench *time.Durat
 			}
 			owed = !h.downLogged
 			h.downLogged = true
+			h.lastError = answered
 			written = h
 			return h
 		})
@@ -746,8 +757,16 @@ func (s *server) demote(t Target, backends map[string]Backend, bench *time.Durat
 
 // demoteFor is demote with a re-admission moment: t is held out for d, rather than
 // until understudy's own probe pacing lets it back.
-func (s *server) demoteFor(t Target, d time.Duration, backends map[string]Backend) (targetHealth, bool) {
-	return s.demote(t, backends, &d)
+func (s *server) demoteFor(t Target, d time.Duration, backends map[string]Backend, answered error) (targetHealth, bool) {
+	return s.demote(t, backends, &d, answered)
+}
+
+// errText renders an error for a record, or "" when there is none.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // failedSince is the attr naming when a target started failing, built here so every
@@ -842,8 +861,8 @@ func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
 // the very next request rather than tolerating it for a failover threshold.
-func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends map[string]Backend) {
-	h, owed := s.demote(t, backends, nil)
+func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends map[string]Backend, answered error) {
+	h, owed := s.demote(t, backends, nil, answered)
 	if owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 	}
@@ -853,8 +872,8 @@ func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends 
 // understudy synthesized, the upstream having named none.
 // It logs the transition itself: a stall is a demotion understudy decides, so the
 // cause is known here and nowhere later.
-func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend) {
-	if h, owed := s.demoteFor(t, synthesizedStallBackoff, backends); owed {
+func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend, answered error) {
+	if h, owed := s.demoteFor(t, synthesizedStallBackoff, backends, answered); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonNoResponseHeader, h.readmitAt))...)
 	}
 }
@@ -866,8 +885,8 @@ func (s *server) recordStalled(ctx context.Context, t Target, backends map[strin
 // back while it is still saying no. A bench understudy synthesized for an upstream
 // that said nothing is recordStalled's, not this one's. It logs the transition when
 // the streak has not already reported one.
-func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend) {
-	if h, owed := s.demoteFor(t, retryAfter, backends); owed {
+func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend, answered error) {
+	if h, owed := s.demoteFor(t, retryAfter, backends, answered); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
 	}
 }
@@ -1976,7 +1995,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// synthesized backoff, then replay the request onto the next untried
 			// target rather than surfacing the stall; only when none remains does the
 			// client see the 504.
-			s.recordStalled(r.Context(), chosen, backend.Backends)
+			s.recordStalled(r.Context(), chosen, backend.Backends, err)
 			releaseHeld()
 			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
 			if logicalTargets != nil {
@@ -2020,9 +2039,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			case err == nil:
 				s.clearFailure(r.Context(), chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
-				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends)
+				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
 			case demote || isAccessRefused(err):
-				s.recordImmediateFailure(r.Context(), chosen, backend.Backends)
+				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
 				s.recordFailure(chosen, backend.Backends)

@@ -3000,6 +3000,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// TODO(TODO.d/say-why-a-routed-around-target-is-out.md): "should say what a
+	// routed-around target last answered" belongs beside this case — the record names
+	// when the target returns and nothing of what it said.
 	tests.Add("should name a benched target the request routed around", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("50", "slow down")},
@@ -3882,9 +3885,17 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
 	// the same way whichever request logs it" belongs here — the walk and the demotion
 	// paths claim one flag, so for an existing entry the reason follows lock order.
-	// TODO(TODO.d/say-why-a-backend-went-down.md): "should say what a backend
-	// answered when it went down" belongs here — a case whose downFields require
-	// the status and message the target failed with, which the record omits today.
+	// TODO(TODO.d/say-what-an-accrued-streak-answered.md): the same assertion for a
+	// streak the walk discovers belongs here — recordFailure opens one without
+	// storing what the target said, so that record's upstream_error is empty.
+	tests.Add("should say what a backend answered when it went down", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
+		wantDown: 1,
+		downFields: map[string]any{
+			"upstream_error": "upstream returned status 401: bad gateway",
+		},
+		wantUp: 0,
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
