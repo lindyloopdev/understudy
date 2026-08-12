@@ -19,4 +19,15 @@ per-request ones, which is the work `Excluded` exists to save. The field's own d
 already promises otherwise: "A skipped backend appears on every request that routes
 around it."
 
-The behavior to pin: **should name a benched target the request routed around.**
+The entry names both halves: the bench it is held to, and the failure that put it
+there. When it comes back is what a request needs to know now; why it went is what an
+operator reconstructing the outage needs, and neither is recoverable from the other.
+
+- **Should name a benched target the request routed around**, with `Called` false —
+  understudy sent nothing — and the re-admission moment in force at that request,
+  which `pickTarget` already holds.
+- **Should say what the target last answered**, which needs the demoting error carried
+  on `targetHealth`: [[say-why-a-backend-went-down]]. That half lands with it.
+
+The bench half stands alone if the error half is deferred — a record naming when a
+target returns is worth more than nothing while its cause is still unavailable.

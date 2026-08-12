@@ -3827,10 +3827,9 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
-	// TODO(TODO.d/decide-what-a-second-demotion-says.md): the four cases that entry
-	// leaves open belong here — which cause a re-demoted target names, whether a moved
-	// re-admission moment is said at all, and both outcomes of demote's update path,
-	// which no test reaches for any of its three callers.
+	// TODO(TODO.d/pin-what-a-second-demotion-does.md): both outcomes of demote's
+	// update path belong here — announcing a demotion the streak never reported, and
+	// staying silent on a second one — which no test reaches for any of its callers.
 	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
 	// the same way whichever request logs it" belongs here — the walk and the demotion
 	// paths claim one flag, so for an existing entry the reason follows lock order.
