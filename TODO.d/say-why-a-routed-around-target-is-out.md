@@ -12,8 +12,9 @@ A benched target on a request's `Excluded` says when it comes back and nothing o
 it went, so an operator reading one request still cannot tell a credential problem
 from an outage without finding the request that demoted it.
 
-The cause is on the entry: `targetHealth.lastError` is what the target answered when
-it was last demoted, and `pickTarget` holds the entry when it decides the skip.
+The cause is on the entry: `targetHealth.lastError` is what the target answered the
+last time it failed — demoted at once, or accruing a streak — and `pickTarget` holds
+the entry when it decides the skip.
 
 **Should say what a routed-around target last answered.**
 

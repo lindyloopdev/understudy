@@ -148,9 +148,8 @@ type targetHealth struct {
 	// downLogged is whether this streak's "backend down" has been reported, so the
 	// walk and every demotion after the first stay silent.
 	downLogged bool
-	// lastError is what the target answered when it was last demoted, so a later
-	// reader can name the cause and its status without hunting the request that saw
-	// it.
+	// lastError is what the target answered the last time it failed, so a later reader
+	// can name the cause and its status without hunting the request that saw it.
 	lastError error
 	// lastTouch is when the entry was last written, the age the eviction sweep
 	// measures.
@@ -839,14 +838,21 @@ func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak 
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
-// so the threshold measures from the first failure, not the most recent. A new
+// so the threshold measures from the first failure, not the most recent, while
+// lastError follows the most recent — the streak's age and its cause answer
+// different questions. A new
 // streak seeds lastProbe at the demotion moment (failingSince plus the failover
 // threshold), so the first half-open probe waits a full recovery interval after
 // the target is actually routed around, not from its first failure.
-func (s *server) recordFailure(t Target, backends map[string]Backend) {
-	s.writeHealth(t, backends, func(now time.Time) targetHealth {
-		return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold)}
-	}, nil)
+func (s *server) recordFailure(t Target, backends map[string]Backend, answered error) {
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth {
+			return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold), lastError: answered}
+		},
+		func(_ time.Time, h targetHealth) targetHealth {
+			h.lastError = answered
+			return h
+		})
 }
 
 // demotedHealth builds the health of a target demoted at once: the streak is
@@ -2044,7 +2050,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
-				s.recordFailure(chosen, backend.Backends)
+				s.recordFailure(chosen, backend.Backends, err)
 			}
 		}
 		if err != nil {

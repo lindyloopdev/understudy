@@ -3885,9 +3885,17 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
 	// the same way whichever request logs it" belongs here — the walk and the demotion
 	// paths claim one flag, so for an existing entry the reason follows lock order.
-	// TODO(TODO.d/say-what-an-accrued-streak-answered.md): the same assertion for a
-	// streak the walk discovers belongs here — recordFailure opens one without
-	// storing what the target said, so that record's upstream_error is empty.
+	tests.Add("should say what a target answered when a walk discovers its streak", test{
+		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
+		retryAfter: time.Second,
+		advances:   []time.Duration{16 * time.Second},
+		wantDown:   1,
+		downFields: map[string]any{
+			"reason":         "probe not yet due",
+			"upstream_error": "upstream returned status 429: bad gateway",
+		},
+		wantUp: 0,
+	})
 	tests.Add("should say what a backend answered when it went down", test{
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
