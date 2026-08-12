@@ -3880,9 +3880,6 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 1,
 	})
-	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): "should name a demotion
-	// the same way whichever request logs it" belongs here — the walk and the demotion
-	// paths claim one flag, so for an existing entry the reason follows lock order.
 	tests.Add("should say what a target answered when a walk discovers its streak", test{
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: time.Second,

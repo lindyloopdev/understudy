@@ -279,6 +279,14 @@ is back — and not the per-request fact that a walk routed around it. That fact
 skip like any other and belongs on `Excluded`, on every request that routes around
 the target, exactly as the rule above requires.
 
+**The pair is not ordered.** Two requests can decide a target's transitions in quick
+succession — one demoting it, another finding it healthy — and each writes its record
+after releasing the lock, so an operator can read "backend up" before the "backend
+down" it followed. What is ordered is the decision: `downLogged` is claimed under the
+lock, so exactly one record is written per streak and the pair is never doubled or
+dropped. Ordering the writes too would mean one serialization point outside the lock,
+paid on every transition to correct a reading that the next event corrects anyway.
+
 **A transition is never emitted while the health map is held.** The record is decided
 under the lock and written after it, because the handler belongs to the consumer and
 may be slow: a file, a socket, a shipper with a full buffer. Every request's routing

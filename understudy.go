@@ -596,9 +596,6 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	// Queued under the lock, emitted after it: the logger is the consumer's, and a
 	// handler that blocks on I/O would otherwise hold every other request's walk
 	// behind it. Registered before the unlock below, so LIFO runs it after.
-	// TODO(TODO.d/decide-whether-transitions-are-ordered.md): nothing orders this, or
-	// a demotion path's own record, against clearFailure's "backend up", so a pair can
-	// reach the sink inverted.
 	var queued []func()
 	defer func() {
 		for _, emit := range queued {
