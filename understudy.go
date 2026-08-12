@@ -1473,9 +1473,10 @@ func writeErrorEnvelope(ctx context.Context, w http.ResponseWriter, err error, s
 	setLogError(ctx, err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// TODO(TODO.d/record-a-client-that-left-before-the-answer.md): a client that
-	// disconnects between the header and the body leaves no trace here, where the
-	// streaming path logs the same event.
+	// Discarding the encoder's error is deliberate, here and at the listing below. A
+	// client that leaves before understudy answers is already recorded as 499; one
+	// that leaves while these few hundred bytes go out leaves a request recorded in
+	// full, missing only the fact that nobody read it.
 	_ = json.NewEncoder(w).Encode(errorBody{
 		Error:        apiError{Message: message, Type: errType},
 		RetryAfterMS: retryAfter.Round(time.Second).Milliseconds(),
