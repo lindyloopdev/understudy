@@ -136,6 +136,7 @@ func errorFromResponse(resp *http.Response, now time.Time) error {
 	err = withPerDayQuotaRetryAfter(err, apiErr, now)
 	err = withRetryAfter(err, resp.Header.Get("Retry-After"))
 	err = withGeminiQuotaRetryAfter(err, msg)
+	err = withServerBusy(err, resp.StatusCode, apiErr.Code)
 	err = errorTypeError{error: err, errorType: errType}
 	return err
 }
@@ -250,6 +251,27 @@ func withGeminiQuotaRetryAfter(err error, msg string) error {
 		return err
 	}
 	return retryAfterError{error: err, retryAfter: time.Now().Add(time.Duration(secs * float64(time.Second)))}
+}
+
+// serverBusyError marks a failure as [providers.ErrServerBusy] while leaving the
+// upstream's own status, message, and attrs on the chain beneath it.
+type serverBusyError struct{ error }
+
+// Is reports the wrapped failure as [providers.ErrServerBusy].
+func (serverBusyError) Is(target error) bool { return target == providers.ErrServerBusy }
+
+func (e serverBusyError) Unwrap() error { return e.error }
+
+// withServerBusy marks err as [providers.ErrServerBusy] when status and code carry
+// a backend's "temporarily at capacity" signal. The signature is exact, not
+// heuristic: a 503 coded "unavailable" has one producer in kronk, its
+// busy-eviction sentinel. Matching a signature rather than a configured dialect
+// means an operator pointing at such a backend declares nothing.
+func withServerBusy(err error, status int, code string) error {
+	if status != http.StatusServiceUnavailable || code != "unavailable" {
+		return err
+	}
+	return serverBusyError{error: err}
 }
 
 // typeForStatus returns the OpenAI envelope error type implied by the upstream

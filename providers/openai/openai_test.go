@@ -159,6 +159,7 @@ func TestChatResponse(t *testing.T) {
 		wantHeaders     http.Header
 		wantErr         string
 		wantErrExcludes string
+		wantServerBusy  bool
 		wantRetryAfter  time.Time
 		wantErrorType   string
 		wantAttrs       map[string]any
@@ -396,6 +397,27 @@ func TestChatResponse(t *testing.T) {
 		}
 	})
 
+	// TODO: add "should leave a 503 carrying another code a generic failure" — a
+	// 503 coded e.g. "overloaded" must not match ErrServerBusy, so it keeps the
+	// ordinary 5xx path and still demotes.
+	tests.AddFunc("should report an upstream 503 coded unavailable as a busy server", func(t *testing.T) test {
+		srvURL, _ := newCapturingServer(t, http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}},
+			`{"error":{"message":"server busy","code":"unavailable"}}`)
+		return test{
+			cfg:            providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr:        "server busy",
+			wantStatus:     http.StatusServiceUnavailable,
+			wantServerBusy: true,
+			wantErrorType:  "server_error",
+			wantAttrs: map[string]any{
+				"upstream_status":        int64(http.StatusServiceUnavailable),
+				"upstream_error_type":    "server_error",
+				"upstream_error_message": "server busy",
+				"upstream_error_code":    "unavailable",
+			},
+		}
+	})
+
 	tests.AddFunc("should cap the error message at 1 KiB", func(t *testing.T) test {
 		body := strings.Repeat("x", 1024) + "OVERFLOW_PAST_CAP"
 		srvURL, _ := newCapturingServer(t, http.StatusBadGateway, http.Header{"Content-Type": {"text/plain"}}, body)
@@ -421,6 +443,9 @@ func TestChatResponse(t *testing.T) {
 		resp, err := Chat(ctx, tt.cfg, strings.NewReader(`{}`))
 		if !testy.ErrorMatchesRE(tt.wantErr, err) {
 			t.Errorf("unexpected error: got %v, want /%s/", err, tt.wantErr)
+		}
+		if got := errors.Is(err, providers.ErrServerBusy); got != tt.wantServerBusy {
+			t.Errorf("server busy: got %v, want %v", got, tt.wantServerBusy)
 		}
 		gotStatus := yerrors.HTTPStatus(err)
 		if err == nil {
