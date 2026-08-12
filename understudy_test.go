@@ -463,8 +463,21 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	// TODO: add "should forward an upstream 5xx's own Retry-After". It is forwarded
-	// today, but the only test driving that path uses a backoff understudy minted.
+	tests.AddFunc("should forward an upstream 5xx's own Retry-After", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{"Retry-After": {"20"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"try later"}}`)),
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
+		}
+	})
+
 	tests.AddFunc("should pass through a long-Retry-After 404 instead of rejecting it", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -3150,8 +3163,23 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/understudy-server-busy-503-retryable.md): add "should start a fresh
-	// busy run once a target serves again" — a recovered backend must not stay rejected.
+	tests.Add("should start a fresh busy run once a target serves again", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 2 {
+					return resp(http.StatusOK, `{"id":"from-a"}`), nil
+				}
+				return resp(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
+			{advance: 2*time.Minute + time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+		},
+	})
+
 	tests.Add("should reject as non-retryable once a target has been busy past the terminal threshold with nowhere to fail over", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
