@@ -22,23 +22,46 @@ type Target struct {
 	query   url.Values
 }
 
-// UnmarshalText parses a "<backend>/<model>" string, with an optional
-// "?key=value" query carrying request-body overrides, into the Target. It
-// implements [encoding.TextUnmarshaler] so a Target can be decoded directly
-// from a TOML string.
-func (t *Target) UnmarshalText(text []byte) error {
-	ref, rawQuery, _ := strings.Cut(string(text), "?")
+// malformedRefFormat is one wording for both shape malformations — no separator,
+// or an empty half — because a config document cannot act on the difference. An
+// unparseable query surfaces the URL parser's own error instead.
+const malformedRefFormat = "target %q must be <backend>/<model>"
+
+// notAReferenceError marks a separator-less string: a bare model name, not a
+// malformed reference. Callers that route the two differently match on it.
+type notAReferenceError struct{ ref string }
+
+func (e notAReferenceError) Error() string { return fmt.Sprintf(malformedRefFormat, e.ref) }
+
+// ParseTarget parses a "<backend>/<model>" reference, with an optional
+// "?key=value" query carrying request-body overrides. It is the only way to
+// build a Target: the same reference means the same thing whether an operator
+// wrote it in a config or a caller named it as a request's model.
+func ParseTarget(s string) (Target, error) {
+	ref, rawQuery, _ := strings.Cut(s, "?")
 	backend, model, ok := strings.Cut(ref, "/")
-	if !ok || backend == "" || model == "" {
-		return fmt.Errorf("target %q must be <backend>/<model>", text)
+	if !ok {
+		return Target{}, notAReferenceError{ref: s}
+	}
+	if backend == "" || model == "" {
+		return Target{}, fmt.Errorf(malformedRefFormat, s)
 	}
 	query, err := url.ParseQuery(rawQuery)
 	if err != nil {
+		return Target{}, err
+	}
+	return Target{backend: backend, model: model, query: query}, nil
+}
+
+// UnmarshalText implements [encoding.TextUnmarshaler]. It settles only the
+// grammar: a decoded Target's overrides are unchecked, so [Target.validate] still
+// has to run — config load and the request boundary each do that themselves.
+func (t *Target) UnmarshalText(text []byte) error {
+	parsed, err := ParseTarget(string(text))
+	if err != nil {
 		return err
 	}
-	t.backend = backend
-	t.model = model
-	t.query = query
+	*t = parsed
 	return nil
 }
 

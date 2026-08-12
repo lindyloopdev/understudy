@@ -127,17 +127,33 @@ const synthesizedStallBackoff = 30 * time.Second
 // errHeaderStall marks an upstream attempt cancelled by the header-stall gate.
 var errHeaderStall = errors.New("upstream produced no response header before the stall gate")
 
-// targetHealth tracks a target's failure streak: failingSince is when the streak
-// began; lastProbe is when the target was last attempted; readmitAt is a known
-// re-admission time from an advertised Retry-After, or zero if none; downLogged
-// is whether the "backend down" transition has been logged; lastTouch is when
-// the entry was last written, the age the eviction sweep measures.
+// deferredLog queues a log call to be emitted once the caller's lock is released.
+type deferredLog func(msg string, args ...any)
+
+// targetHealth tracks a target's failure streak. An absent entry is a healthy target:
+// only a failure creates one, and clearing it is what recovery means.
 type targetHealth struct {
+	// failingSince is the moment the streak is measured from: when it began, or a
+	// failover threshold before a target demoted at once, so the walk routes around
+	// that one on the very next request and the terminal ladder ages it from there.
 	failingSince time.Time
-	lastProbe    time.Time
-	readmitAt    time.Time
-	downLogged   bool
-	lastTouch    time.Time
+	// streakBegan is when the target actually first failed, which is what a record
+	// reports and no backdate touches.
+	streakBegan time.Time
+	// lastProbe is when the target was last attempted.
+	lastProbe time.Time
+	// readmitAt is a known re-admission time, from an advertised Retry-After or a
+	// synthesized stall bench, or zero when only probe pacing holds the target back.
+	readmitAt time.Time
+	// downLogged is whether this streak's "backend down" has been reported, so the
+	// walk and every demotion after the first stay silent.
+	downLogged bool
+	// lastError is what the target answered the last time it failed, so a later reader
+	// can name the cause and its status without hunting the request that saw it.
+	lastError error
+	// lastTouch is when the entry was last written, the age the eviction sweep
+	// measures.
+	lastTouch time.Time
 }
 
 // healthTTL is how long a health entry may sit untouched before the
@@ -291,6 +307,13 @@ func (l *upstreamLimiter) tryAcquire() bool {
 	}
 	return false
 }
+
+// neverRetryableError lets the response path recognize a failure no delay can
+// clear, after clientFacing has flattened the upstream status to 502 and taken the
+// evidence with it.
+type neverRetryableError struct{ error }
+
+func (e neverRetryableError) Unwrap() error { return e.error }
 
 func (l *upstreamLimiter) release() {
 	l.mu.Lock()
@@ -533,46 +556,97 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.h.ServeHTTP(w, r)
 }
 
-// pickTarget returns the first target whose failure streak is within the
-// failover threshold (or that has none). A target past the threshold is skipped
+// pick is what choosing a target taught the walk. Its skipped list is reported
+// rather than recorded, so the walk can order its own account: it knows what it
+// abandoned before this pick, and pickTarget does not.
+type pick struct {
+	target  Target
+	ok      bool
+	skipped []Attempt // candidates understudy could not call
+}
+
+// pickTarget returns the first target that is usable at all and whose failure
+// streak is within the failover threshold (or that has none). A target whose
+// backend resolveBackend rejects is skipped before its health is consulted, and
+// never demoted: only a configuration change can make it usable, so a health
+// entry for it would be one no recovery probe could clear.
+//
+// Among the targets that remain, a target past the threshold is skipped
 // until a recovery interval has elapsed since its last probe, at which point it
 // is offered as a single half-open probe (stamping lastProbe so concurrent
 // requests within the cooldown still skip it). A target demoted with a known
-// re-admission time (readmitAt, from an advertised Retry-After) is instead
+// re-admission time (readmitAt, from an advertised Retry-After or a synthesized
+// stall bench) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
-// health preserved until the probe's outcome) — never half-open-probed early. If every target is past the threshold and not
-// due for a probe, it returns the last so a request always has somewhere to go.
-func (s *server) pickTarget(targets []Target, backends map[string]Backend) Target {
+// health preserved until the probe's outcome) — never half-open-probed early while
+// any other candidate remains. If every target is past the threshold and not due
+// for a probe, it returns the last one it could call so a request always has
+// somewhere to go.
+//
+// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): that fallback
+// returns a target benched until a moment that has not arrived, against the rule
+// above.
+//
+// It reports false when every candidate named a backend understudy cannot use, and
+// returns each rejection for the caller to record — only the walk knows the order it
+// reached them in. A walk that has already failed somewhere answers with that
+// failure; one that never attempted anything is the model with nothing to serve it,
+// which only the caller can name.
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) pick {
+	// Queued under the lock, emitted after it: the logger is the consumer's, and a
+	// handler that blocks on I/O would otherwise hold every other request's walk
+	// behind it. Registered before the unlock below, so LIFO runs it after.
+	var queued []func()
+	defer func() {
+		for _, emit := range queued {
+			emit()
+		}
+	}()
+	logLater := func(msg string, args ...any) {
+		queued = append(queued, func() { s.logTransition(ctx, msg, args...) })
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	s.evictStaleHealth(now)
+	now := s.evictStaleHealth()
+	var skipped []Attempt
 	for _, t := range targets {
+		if _, err := s.resolveBackend(backends, t.backend); err != nil {
+			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
+			continue
+		}
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
 		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
-			return t
+			return pick{target: t, ok: true, skipped: skipped}
 		}
-		if !h.readmitAt.IsZero() {
-			if now.Before(h.readmitAt) {
-				s.noteBackendDown(id, t, h)
-				continue
-			}
-			h.readmitAt = time.Time{}
-			h.lastProbe = now
-			h.lastTouch = now
-			s.health[id] = h
-			return t
+		if due := s.nextReattempt(h); now.Before(due) {
+			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
+				due.Format(time.RFC3339), h.lastError)
+			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
+			s.noteBackendDown(logLater, id, t, h)
+			continue
 		}
-		if now.Sub(h.lastProbe) >= s.recoveryInterval {
-			h.lastProbe = now
-			h.lastTouch = now
-			s.health[id] = h
-			return t
-		}
-		s.noteBackendDown(id, t, h)
+		h.readmitAt = time.Time{}
+		h.lastProbe = now
+		h.lastTouch = now
+		s.health[id] = h
+		return pick{target: t, ok: true, skipped: skipped}
 	}
-	return targets[len(targets)-1]
+	// Nothing was healthy, but a target health kept back is still worth attempting.
+	last, ok := s.lastCallableTarget(targets, backends)
+	return pick{target: last, ok: ok, skipped: skipped}
+}
+
+// lastCallableTarget returns the last target understudy could call at all, and
+// whether the list held one. A backend understudy cannot call subtracts itself
+// rather than deciding for the list, so what remains is what the request has.
+func (s *server) lastCallableTarget(targets []Target, backends map[string]Backend) (Target, bool) {
+	for _, t := range slices.Backward(targets) {
+		if _, err := s.resolveBackend(backends, t.backend); err == nil {
+			return t, true
+		}
+	}
+	return Target{}, false
 }
 
 // untriedTargets returns the targets whose availability key is absent from
@@ -592,85 +666,231 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 	return remaining
 }
 
-// noteBackendDown logs the "backend down" transition for t once per failure
-// streak, recording on h that it has been logged. Caller holds s.mu.
-func (s *server) noteBackendDown(id string, t Target, h targetHealth) {
+// msgBackendDown announces a target leaving rotation. Its pair is "backend up".
+const msgBackendDown = "backend down"
+
+// Why a target is out, in the words an operator reads. Each names something visible
+// from outside understudy: what the upstream sent, what it failed to send, or that
+// understudy is pacing its own retries.
+const (
+	reasonUpstreamRetryAfter = "upstream retry-after"
+	reasonNoResponseHeader   = "no response header"
+	reasonProbeNotYetDue     = "probe not yet due"
+)
+
+// downCause is why a target is out paired with when it is due back. The two travel
+// together so a record cannot name an upstream's terms while reporting the schedule
+// understudy set for itself, or the reverse.
+type downCause struct {
+	reason   string
+	schedule slog.Attr
+}
+
+// benchedUntil is a target held to a re-admission moment something recorded, named by
+// whatever recorded it.
+func benchedUntil(reason string, at time.Time) downCause {
+	return downCause{reason: reason, schedule: slog.Time("readmit_at", at)}
+}
+
+// pacedTo is a target no one benched, held back only until understudy's own next
+// probe is due.
+func pacedTo(at time.Time) downCause {
+	return downCause{reason: reasonProbeNotYetDue, schedule: slog.Time("next_probe", at)}
+}
+
+// backendDownRecord is what every "backend down" says: which target, why it is out,
+// when it started failing, and when it is due back — the moment an upstream named, or
+// the one understudy's own pacing sets, never both. Built here so the walk and the
+// demotion paths cannot drift apart. Caller holds s.mu only if h came from the map.
+func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
+	return []any{
+		slog.String("backend", t.backend),
+		slog.String("model", t.model),
+		slog.String("reason", cause.reason),
+		// The record's own timestamp is not this: a demotion may be reported by a
+		// walk that routes around t some time after it started failing.
+		h.failedSince(),
+		slog.String("upstream_error", errText(h.lastError)),
+		cause.schedule,
+	}
+}
+
+// demote writes t's demotion and reports the health written, along with whether this
+// call owes a "backend down" — the first of the streak. bench is how long t is held
+// out, or nil when nothing holds it but understudy's own probe pacing; a nil bench
+// leaves an existing re-admission moment alone rather than clearing it, since an
+// upstream that named one has not withdrawn it by failing another way. Unlike
+// writeHealth, an existing entry is always visited, because a streak that was never
+// reported still owes a record however it is demoted again.
+func (s *server) demote(t Target, backends map[string]Backend, bench *time.Duration, answered error) (targetHealth, bool) {
+	var owed bool
+	var written targetHealth
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth {
+			var readmitAt time.Time
+			if bench != nil {
+				readmitAt = now.Add(*bench)
+			}
+			h := s.demotedHealth(now, readmitAt)
+			owed, h.downLogged = true, true
+			h.lastError = answered
+			written = h
+			return h
+		},
+		func(now time.Time, h targetHealth) targetHealth {
+			if bench != nil {
+				h.readmitAt = now.Add(*bench)
+			}
+			owed = !h.downLogged
+			h.downLogged = true
+			h.lastError = answered
+			written = h
+			return h
+		})
+	return written, owed
+}
+
+// demoteFor is demote with a re-admission moment: t is held out for d, rather than
+// until understudy's own probe pacing lets it back.
+func (s *server) demoteFor(t Target, d time.Duration, backends map[string]Backend, answered error) (targetHealth, bool) {
+	return s.demote(t, backends, &d, answered)
+}
+
+// errText renders an error for a record, or "" when there is none.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// failedSince is the attr naming when a target started failing, built here so every
+// "backend down" record maps the same name to the same field: failingSince is what
+// the streak is measured from, backdated for a target demoted at once, and never
+// what an operator is told.
+func (h targetHealth) failedSince() slog.Attr {
+	return slog.Time("failing_since", h.streakBegan)
+}
+
+// nextReattempt is when t is due to be called again: the re-admission moment if one
+// was recorded, and otherwise a full recovery interval past its last attempt. The
+// walk routes around a failing target until this moment and the "backend down"
+// record reports it, so both read the moment from here. Which schedule set it is
+// still read from readmitAt at each site. Caller holds s.mu.
+func (s *server) nextReattempt(h targetHealth) time.Time {
+	if h.readmitAt.IsZero() {
+		return h.lastProbe.Add(s.recoveryInterval)
+	}
+	return h.readmitAt
+}
+
+// noteBackendDown logs t's "backend down" transition once per failure streak, saying
+// why the walk routed around it. It logs through logLater rather than directly,
+// because the caller holds s.mu.
+func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h targetHealth) {
 	if h.downLogged {
 		return
 	}
-	s.logger.InfoContext(context.Background(), "backend down",
-		slog.String("backend", t.backend),
-		slog.String("model", t.model),
-	)
 	h.downLogged = true
 	h.lastTouch = time.Now()
 	s.health[id] = h
+	// Always paced: every path that benches a target reports its own demotion and
+	// marks it, so a streak still owing a record is one this walk accrued.
+	logLater(msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 }
 
-// evictStaleHealth drops every entry untouched for healthTTL — the ones no live
-// target can reach any more, since a reachable demotion is re-stamped by the
-// probes and failures that keep measuring it. Caller holds s.mu.
-func (s *server) evictStaleHealth(now time.Time) {
+// evictStaleHealth drops every entry untouched for healthTTL and returns the
+// sweep time, so a caller's own write agrees with the eviction. Caller holds s.mu.
+func (s *server) evictStaleHealth() time.Time {
+	now := time.Now()
 	for id, h := range s.health {
 		if now.Sub(h.lastTouch) >= healthTTL {
 			delete(s.health, id)
 		}
 	}
+	return now
+}
+
+// writeHealth stores t's health under s.mu. It sweeps first — the only thing that
+// reclaims an entry named directly and so never walked past — then stamps the
+// entry with the sweep's own clock, so a write cannot be aged out by the sweep
+// that preceded it. beginStreak builds the entry for a key the map does not hold —
+// a target with no entry is not failing, so a new one opens a streak; updateStreak,
+// when non-nil, revises a streak already under way.
+func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak func(now time.Time) targetHealth, updateStreak func(now time.Time, h targetHealth) targetHealth) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.evictStaleHealth()
+	id := healthKey(t, backends)
+	h, ok := s.health[id]
+	switch {
+	case !ok:
+		h = beginStreak(now)
+	case updateStreak != nil:
+		h = updateStreak(now, h)
+	}
+	h.lastTouch = now
+	s.health[id] = h
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
-// so the threshold measures from the first failure, not the most recent. A new
+// so the threshold measures from the first failure, not the most recent, while
+// lastError follows the most recent — the streak's age and its cause answer
+// different questions. A new
 // streak seeds lastProbe at the demotion moment (failingSince plus the failover
 // threshold), so the first half-open probe waits a full recovery interval after
 // the target is actually routed around, not from its first failure.
-func (s *server) recordFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if _, ok := s.health[id]; !ok {
-		now := time.Now()
-		s.health[id] = targetHealth{failingSince: now, lastProbe: now.Add(s.failoverThreshold), lastTouch: now}
-	}
+func (s *server) recordFailure(t Target, backends map[string]Backend, answered error) {
+	s.writeHealth(t, backends,
+		func(now time.Time) targetHealth {
+			return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold), lastError: answered}
+		},
+		func(_ time.Time, h targetHealth) targetHealth {
+			h.lastError = answered
+			return h
+		})
 }
 
 // demotedHealth builds the health of a target demoted at once: the streak is
 // backdated past the failover threshold so pickTarget routes around it on the
 // very next request, and lastProbe is seeded at the demotion moment so the first
 // half-open re-probe still waits a full recovery interval. readmitAt is the known
-// re-admission time from an advertised Retry-After, or zero for an unbounded one.
+// re-admission time — an advertised Retry-After, or the bench understudy synthesizes
+// for an upstream that answered nothing — or zero for an unbounded demotion.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
-	return targetHealth{failingSince: now.Add(-s.failoverThreshold), lastProbe: now, readmitAt: readmitAt, lastTouch: now}
+	return targetHealth{failingSince: now.Add(-s.failoverThreshold), streakBegan: now, lastProbe: now, readmitAt: readmitAt, lastTouch: now}
 }
 
 // recordImmediateFailure demotes t at once, so pickTarget routes around it on
 // the very next request rather than tolerating it for a failover threshold.
-func (s *server) recordImmediateFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if _, ok := s.health[id]; !ok {
-		s.health[id] = s.demotedHealth(time.Now(), time.Time{})
+func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends map[string]Backend, answered error) {
+	h, owed := s.demote(t, backends, nil, answered)
+	if owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 	}
 }
 
-// recordRateLimited demotes t at once like recordImmediateFailure, but records a
-// known re-admission time (now plus retryAfter) from an advertised Retry-After.
-// pickTarget keeps t benched until that time rather than half-open-probing it at
-// the recovery interval, so a target under a timed backoff is not re-admitted
-// before the backoff it advertised has elapsed.
-func (s *server) recordRateLimited(t Target, retryAfter time.Duration, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	now := time.Now()
-	h, ok := s.health[id]
-	if !ok {
-		h = s.demotedHealth(now, now.Add(retryAfter))
-	} else {
-		h.readmitAt = now.Add(retryAfter)
-		h.lastTouch = now
+// recordStalled demotes t for a pre-header stall and benches it for a backoff
+// understudy synthesized, the upstream having named none.
+// It logs the transition itself: a stall is a demotion understudy decides, so the
+// cause is known here and nowhere later.
+func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend, answered error) {
+	if h, owed := s.demoteFor(t, synthesizedStallBackoff, backends, answered); owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonNoResponseHeader, h.readmitAt))...)
 	}
-	s.health[id] = h
+}
+
+// recordRateLimited demotes t at once like recordImmediateFailure, and records the
+// moment the upstream named. An upstream that answers `Retry-After` has said more
+// about when it will serve again than understudy's own pacing can infer, so that
+// moment supersedes the recovery interval — which would otherwise call the target
+// back while it is still saying no. A bench understudy synthesized for an upstream
+// that said nothing is recordStalled's, not this one's. It logs the transition when
+// the streak has not already reported one.
+func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend, answered error) {
+	if h, owed := s.demoteFor(t, retryAfter, backends, answered); owed {
+		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
+	}
 }
 
 // failingFor reports how long t's current failure streak has run, or zero when
@@ -685,13 +905,49 @@ func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration
 	return time.Since(h.failingSince)
 }
 
+// failedAttempt is an attempt that failed: what the request would answer with if
+// nothing better comes, and what to record if something does.
+type failedAttempt struct {
+	// answer is client-facing, classified in the iteration that failed: what
+	// cancelled an attempt is only knowable while that attempt's context is alive.
+	answer error
+	// raw is what the verdict reads, since clientFacing rewrites a 501 past
+	// recognizing.
+	raw           error
+	target        Target
+	backend       string
+	upstreamModel string
+}
+
+// status is what the attempt answered with. An attempt cut off before its header
+// answered nothing, so it reports none: Attempt.UpstreamStatus is 0 for exactly that,
+// and yerrors would otherwise invent a 500 for a status-less error.
+func (f failedAttempt) status() int {
+	if errors.Is(f.raw, errHeaderStall) {
+		return 0
+	}
+	return yerrors.HTTPStatus(f.raw)
+}
+
+// record puts f on the request's Excluded: a target the request did not serve from.
+func (f failedAttempt) record(ctx context.Context) {
+	addLogCalled(ctx, f.backend, f.upstreamModel, f.status(), f.raw)
+}
+
 // terminalFailure marks err terminal — the response path rejects it as
-// non-retryable rather than relaying it — when remaining is empty and t's
-// streak has crossed the terminal threshold. Both are required: a long streak
-// on a target the list can still route around is a demoted target, not an
-// exhausted list.
+// non-retryable rather than relaying it — when remaining holds nothing understudy
+// could call, whether because it is empty or because every candidate in it names a
+// backend understudy cannot use, and t has been failing past the terminal
+// threshold. Both are required: a long failure on a target the list can still route
+// around is a demoted target, not an exhausted list.
 func (s *server) terminalFailure(t Target, remaining []Target, backends map[string]Backend, err error) error {
-	if t.backend == "" || len(remaining) > 0 || s.failingFor(t, backends) < s.terminalThreshold {
+	if t.backend == "" || s.failingFor(t, backends) < s.terminalThreshold {
+		return err
+	}
+	// A candidate understudy cannot call is not somewhere left to go, so it cannot
+	// hold the ladder's last rung open — the same reading the walk uses to decide
+	// whether to fail over at all.
+	if _, ok := s.lastCallableTarget(remaining, backends); ok {
 		return err
 	}
 	return terminalError{err}
@@ -707,19 +963,37 @@ type terminalError struct{ error }
 func (e terminalError) Unwrap() error { return e.error }
 
 // clearFailure marks t healthy, ending any failure streak. It emits the
-// "backend up" transition iff the streak was previously announced "backend
+// "backend up" transition iff the streak was previously logged "backend
 // down", keeping the up/down log pair symmetric.
-func (s *server) clearFailure(t Target, backends map[string]Backend) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	if h, ok := s.health[id]; ok && h.downLogged {
-		s.logger.InfoContext(context.Background(), "backend up",
+func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
+	// Logged after dropHealth returns, so the consumer's handler does not block
+	// every other request's walk behind s.mu.
+	if s.dropHealth(t, backends) {
+		s.logTransition(ctx, "backend up",
 			slog.String("backend", t.backend),
 			slog.String("model", t.model),
 		)
 	}
+}
+
+// logTransition emits a target's health transition. The transition is decided and
+// committed under s.mu before this runs, so the record cannot depend on the request
+// that noticed it still being around: a client that leaves in that window would
+// otherwise take a committed state change out of the log with it. A consumer's
+// values travel; only cancellation is dropped.
+func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
+	s.logger.InfoContext(context.WithoutCancel(ctx), msg, args...)
+}
+
+// dropHealth forgets t's health and reports whether its failure had been logged, so
+// the "backend up" that pairs with it is logged outside the lock.
+func (s *server) dropHealth(t Target, backends map[string]Backend) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := healthKey(t, backends)
+	h, ok := s.health[id]
 	delete(s.health, id)
+	return ok && h.downLogged
 }
 
 // clientFacing maps an error returned by a provider call into the status the
@@ -732,7 +1006,10 @@ func clientFacing(ctx context.Context, err error) error {
 	if errors.Is(err, context.Cause(ctx)) {
 		return err
 	}
-	if yerrors.HTTPStatus(err) >= 500 {
+	if status := yerrors.HTTPStatus(err); status >= 500 {
+		if status == http.StatusNotImplemented {
+			err = neverRetryableError{err}
+		}
 		return yerrors.WithHTTPStatus(http.StatusBadGateway, err)
 	}
 	return err
@@ -745,11 +1022,13 @@ func isFatalUpstream(err error) bool {
 	return yerrors.HTTPStatus(err) >= 500
 }
 
-// isCredentialRefused reports whether the upstream refused the target's
-// credential (401: rejected, 402: out of funds).
-func isCredentialRefused(err error) bool {
+// isAccessRefused reports whether the upstream refused the account the target
+// (401: identity rejected, 402: out of funds, 403: not permitted). Each is a
+// standing property of the account, not of the request, so retrying the same
+// target only refuses again.
+func isAccessRefused(err error) bool {
 	switch yerrors.HTTPStatus(err) {
-	case http.StatusUnauthorized, http.StatusPaymentRequired:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
 		return true
 	}
 	return false
@@ -800,7 +1079,8 @@ type limitClassification struct {
 	status int
 	// isRateLimit reports status == 429 Too Many Requests.
 	isRateLimit bool
-	// hasRetryAfter reports that the upstream advertised a Retry-After.
+	// hasRetryAfter reports that the upstream advertised a Retry-After still
+	// outstanding; one that has elapsed counts as no advertisement.
 	hasRetryAfter bool
 	// retryAfter is the remaining Retry-After delay (valid when hasRetryAfter).
 	retryAfter time.Duration
@@ -825,8 +1105,12 @@ func classifyLimit(err error) limitClassification {
 		error
 		RetryAfter() time.Time
 	}](err); ok {
-		sig.hasRetryAfter = true
-		sig.retryAfter = time.Until(ra.RetryAfter())
+		// An elapsed advertisement leaves nothing to relay, so the failure falls to
+		// the synthesized path rather than handing every reader a negative delay.
+		if remaining := time.Until(ra.RetryAfter()); remaining > 0 {
+			sig.hasRetryAfter = true
+			sig.retryAfter = remaining
+		}
 	}
 	sig.shouldReject = sig.hasRetryAfter && sig.retryAfter > maxPassthroughRetryAfter
 	// A failure the walk gave up on rejects on its own terms: the streak, not an
@@ -838,6 +1122,14 @@ func classifyLimit(err error) limitClassification {
 		if !sig.hasRetryAfter {
 			sig.retryAfter = maxPassthroughRetryAfter
 		}
+	}
+	// A failure no retry can help offers no delay, in either form one takes: not a
+	// relayed header, not a reject's retry_after_ms. Clearing it here rather than at
+	// each exit keeps the two from drifting apart.
+	if _, never := errors.AsType[neverRetryableError](err); never {
+		sig.hasRetryAfter = false
+		sig.shouldReject = false
+		sig.retryAfter = 0
 	}
 	switch {
 	case !sig.isRateLimit:
@@ -887,27 +1179,39 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
-	// FailedOver holds the attempts a failover abandoned before the one the
-	// fields above describe, in the order they were tried. It is empty for a
-	// request that never failed over. A demotion is attributable through it: the
-	// target it demoted is here when the request moved on, and in the fields
-	// above when there was nowhere left to go.
-	FailedOver []Attempt
+	// Excluded holds what the request considered and did not serve from: targets a
+	// failover abandoned, targets excluded as unusable before any call, and the
+	// backends a listing could not use. A listing whose catalog fetch fails is not
+	// here — that reaches understudy's own logger alone. A chat request records
+	// them in the order it walked its candidates, so an exclusion and a failover
+	// interleave as they happened; a listing ranges a map and has no order to
+	// report. It is empty for a request that
+	// served from its first target. A demotion is attributable through it: the
+	// target it demoted is here when the request moved on, and in the fields above
+	// when there was nowhere left to go. A skipped backend appears on every request
+	// that routes around it, since only a configuration change can clear it.
+	Excluded []Attempt
 }
 
-// Attempt describes one upstream call a request made and abandoned, so a
-// failover leaves a record of the targets it walked past rather than only the
-// one that determined the client's outcome.
+// Attempt describes one target or backend a request considered and did not use,
+// so a failover leaves a record of them rather than only the one that determined
+// the client's outcome. Called separates the two ways that happens: understudy
+// called it and abandoned the result, or could not use it and never called.
 type Attempt struct {
-	// Backend is the backend the attempt called.
+	// Backend is the backend considered.
 	Backend string
-	// ModelUpstream is the upstream model name the attempt requested.
+	// Called reports whether understudy issued a request to it. False means the
+	// backend was unusable as configured and Err says why; nothing was sent.
+	Called bool
+	// ModelUpstream is the upstream model name the attempt requested. Empty when
+	// nothing was called, and for a listing, which names no model.
 	ModelUpstream string
 	// UpstreamStatus is the status the attempt answered with, or 0 when it never
-	// produced a response — a pre-header stall, or a transport failure.
+	// produced a response — a pre-header stall, a transport failure, or a backend
+	// that was never called.
 	UpstreamStatus int
 	// Err is the error that ended the attempt, carrying the upstream's own
-	// message where it sent one.
+	// message where it sent one, or why the backend could not be used at all.
 	Err error
 }
 
@@ -956,9 +1260,17 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	}
 }
 
-func addLogFailedOver(ctx context.Context, backend, upstreamModel string, status int, err error) {
+// addLogSkipped records a backend understudy could not use and never called.
+func addLogSkipped(ctx context.Context, a Attempt) {
 	if h := logCtxFrom(ctx); h != nil {
-		h.FailedOver = append(h.FailedOver, Attempt{Backend: backend, ModelUpstream: upstreamModel, UpstreamStatus: status, Err: err})
+		h.Excluded = append(h.Excluded, a)
+	}
+}
+
+// addLogCalled records a target understudy called and abandoned the result of.
+func addLogCalled(ctx context.Context, backend, upstreamModel string, status int, err error) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.Excluded = append(h.Excluded, Attempt{Backend: backend, Called: true, ModelUpstream: upstreamModel, UpstreamStatus: status, Err: err})
 	}
 }
 
@@ -1001,14 +1313,6 @@ func authMiddleware(v TokenValidator, next http.Handler) http.Handler {
 			}
 			writeJSONError(r.Context(), w, err, errTypeServer)
 			return
-		}
-		// A backend with no base URL is malformed validator output; reject it here
-		// at the trust boundary before any handler runs, regardless of map iteration order.
-		for name, b := range backend.Backends {
-			if b.Config.BaseURL == nil {
-				writeJSONError(r.Context(), w, yerrors.WithHTTPStatus(http.StatusInternalServerError, fmt.Errorf("backend %q: must provide base_url", name)), errTypeServer)
-				return
-			}
 		}
 		ctx := context.WithValue(r.Context(), backendKey{}, backend)
 		ctx = context.WithValue(ctx, tokenKey{}, token)
@@ -1064,20 +1368,22 @@ func cause(ctx context.Context, err error) error {
 	return err
 }
 
-// errNoBackendConfigured is returned when no entry in the resolved
-// [BackendConfig] maps to a registered provider type. It carries HTTP 500 so
+// errNoBackendConfigured is returned when no backend in the resolved
+// [BackendConfig] is usable — because it declares none, or because
+// [server.resolveBackend] rejects every one it declares. It carries HTTP 500 so
 // the error seam renders it as Internal Server Error.
 var errNoBackendConfigured = yerrors.WithHTTPStatus(http.StatusInternalServerError, errors.New("no backend configured"))
 
 // Error envelope `type` values. The first three are OpenAI-spec, written by
-// [writeJSONError]; the upstream_* values are understudy-specific, written by
-// [writeRetryAfterReject].
+// [writeJSONError]; the upstream_* values are understudy's own, written by the
+// rejects that end a request rather than relay it.
 const (
 	errTypeAuth                = "authentication_error"
 	errTypeServer              = "server_error"
 	errTypeInvalidRequest      = "invalid_request_error"
 	errTypeUpstreamRateLimited = "upstream_rate_limited"
 	errTypeUpstreamUnavailable = "upstream_unavailable"
+	errTypeUpstreamRefused     = "upstream_refused"
 )
 
 // maxPassthroughRetryAfter is the longest Retry-After delay understudy
@@ -1137,19 +1443,43 @@ var sensitiveResponseHeaders = []string{"Authorization", "Set-Cookie"}
 // internal error detail, and 401/403 to avoid revealing which auth check
 // failed. The real error is always logged.
 func writeJSONError(ctx context.Context, w http.ResponseWriter, err error, errType string) {
-	setLogError(ctx, err)
 	status := yerrors.HTTPStatus(err)
 	msg := err.Error()
 	if status >= 500 || status == http.StatusUnauthorized || status == http.StatusForbidden {
 		msg = http.StatusText(status)
 	}
+	writeErrorEnvelope(ctx, w, err, status, msg, errType, 0)
+}
+
+// errorBody is the shape every failure answer takes on the wire, so the format has
+// one declaration rather than a literal at each writer. retryAfter is understudy's
+// own decision — sometimes what an upstream advertised, sometimes a value it
+// synthesized — so it arrives as a duration and is rendered in milliseconds here,
+// where the wire encoding belongs.
+type errorBody struct {
+	Error        apiError `json:"error"`
+	RetryAfterMS int64    `json:"retry_after_ms,omitempty"`
+}
+
+type apiError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+// writeErrorEnvelope writes the error body every failure answer shares. The real
+// error reaches the log whatever the client is shown. A zero retryAfter carries no
+// delay at all; a rounded one is how far off the client is told to come back.
+func writeErrorEnvelope(ctx context.Context, w http.ResponseWriter, err error, status int, message, errType string, retryAfter time.Duration) {
+	setLogError(ctx, err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"message": msg,
-			"type":    errType,
-		},
+	// Discarding the encoder's error is deliberate, here and at the listing below. A
+	// client that leaves before understudy answers is already recorded as 499; one
+	// that leaves while these few hundred bytes go out leaves a request recorded in
+	// full, missing only the fact that nobody read it.
+	_ = json.NewEncoder(w).Encode(errorBody{
+		Error:        apiError{Message: message, Type: errType},
+		RetryAfterMS: retryAfter.Round(time.Second).Milliseconds(),
 	})
 }
 
@@ -1207,8 +1537,15 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 					return
 				}
 			}
-			// Forward the upstream backoff so the client waits before retrying.
-			if sig.isRateLimit && sig.hasRetryAfter {
+			if isAccessRefused(err) {
+				writeRefusal(r.Context(), w, err)
+				return
+			}
+			// Any retryable failure carries its advertised backoff, not just a rate
+			// limit — a 503 that named its own return is worth relaying. A request the
+			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
+			// means nothing.
+			if sig.hasRetryAfter && (sig.isRateLimit || isFatalUpstream(err)) {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
 			}
 			// A rate limit the upstream left unbounded still needs a client backoff.
@@ -1220,19 +1557,22 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 	}
 }
 
+// writeRefusal writes the 400 reject for a request no configured target will
+// serve. It does not route through [writeJSONError]: that obfuscates on status
+// (>=500, 401, 403), so a 400 escapes it and would carry the upstream's own words.
+// No delay rides with it either, because no delay clears a refusal. What a client
+// may be told is §Understudy's to say, not this function's.
+func writeRefusal(ctx context.Context, w http.ResponseWriter, err error) {
+	writeErrorEnvelope(ctx, w, err, http.StatusBadRequest,
+		"no configured target could serve this request", errTypeUpstreamRefused, 0)
+}
+
 // writeRetryAfterReject writes a 400 reject envelope carrying errType and
 // message plus a top-level retry_after_ms. remaining is rounded to the nearest
 // second to absorb the few ms of processing lag between when the provider
 // parsed Retry-After and when we emit the response.
 func writeRetryAfterReject(ctx context.Context, w http.ResponseWriter, err error, remaining time.Duration, errType, message string) {
-	setLogError(ctx, err)
-	retryAfterMS := remaining.Round(time.Second).Milliseconds()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":          map[string]any{"message": message, "type": errType},
-		"retry_after_ms": retryAfterMS,
-	})
+	writeErrorEnvelope(ctx, w, err, http.StatusBadRequest, message, errType, remaining)
 }
 
 // responseStatus classifies an error into an HTTP status. A status-less
@@ -1258,21 +1598,41 @@ type selection struct {
 	handler providers.Handler
 }
 
-// resolveBackend reports whether b is a backend the proxy can route to, and why
-// not when it cannot: a nil error means routable, a non-nil error is the reason a
-// caller skips it. Required-field validation (e.g. BaseURL) is owned by the auth
-// boundary, not here.
-//
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): no caller reads the reason
-// yet — they skip on any error and report what they reported when this returned a
-// bool. Retiring the auth boundary's pre-flight adds the missing-base-URL reason
-// and the callers that surface both.
-func (s *server) resolveBackend(b Backend) (selection, error) {
-	h, ok := s.providers[b.ProviderType]
-	if !ok {
-		return selection{}, fmt.Errorf("provider type %q has no registered handler", b.ProviderType)
+// noTargetsError is what a client is told about a model nothing can serve, whether it
+// declared no targets or every target it declared named a backend understudy cannot
+// call. The two are one condition to a caller, so they are one sentence.
+func noTargetsError(model string) error {
+	return notFound(fmt.Errorf("logical model %q has no targets", model))
+}
+
+// errWalkExhausted reports, from the pick, that the walk has nowhere left to go. It
+// never reaches a client: the loop recognizes it and answers with the failure that
+// got there.
+var errWalkExhausted = errors.New("walk exhausted")
+
+// errNoSuchBackend is the reason resolveBackend gives when the config declares no
+// backend under the name asked for, as opposed to declaring one understudy cannot
+// use. Callers that phrase the two differently match on it.
+var errNoSuchBackend = errors.New("no such backend")
+
+// resolveBackend reports whether the backend named name is one the proxy can route
+// to, and why not when it cannot: a nil error means routable, a non-nil error is
+// the reason a caller skips it. It is the one place that question is answered, for
+// every selection site, so a routable verdict promises a declared backend with a
+// handler and a base URL.
+func (s *server) resolveBackend(backends map[string]Backend, name string) (selection, error) {
+	backend, declared := backends[name]
+	if !declared {
+		return selection{}, errNoSuchBackend
 	}
-	return selection{cfg: b.Config, handler: h}, nil
+	h, ok := s.providers[backend.ProviderType]
+	if !ok {
+		return selection{}, fmt.Errorf("provider type %q has no registered handler", backend.ProviderType)
+	}
+	if backend.Config.BaseURL == nil {
+		return selection{}, errors.New("must provide base_url")
+	}
+	return selection{cfg: backend.Config, handler: h}, nil
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
@@ -1280,15 +1640,23 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 
 	var all []providers.Model
 	matched := false
-	for name, b := range backend.Backends {
-		sel, err := s.resolveBackend(b)
+	for name := range backend.Backends {
+		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
+			addLogSkipped(r.Context(), Attempt{Backend: name, Err: err})
 			continue
 		}
 		matched = true
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
-			return clientFacing(r.Context(), err)
+			// The listing answers what understudy can serve, so a backend that cannot
+			// answer contributes nothing rather than failing the request. The reason is
+			// the operator's fact and reaches the log alone.
+			s.logger.ErrorContext(r.Context(), "backend catalog unavailable",
+				slog.String("backend", name),
+				slog.Any("error", err),
+			)
+			continue
 		}
 		for i := range data {
 			data[i].ID = name + "/" + data[i].ID
@@ -1490,6 +1858,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
+	// throttled is the candidate the walk failed over from under a timed backoff; the
+	// answer is judged against whichever target it came from.
+	// TODO(TODO.d/weigh-every-candidates-contribution.md)
+	var throttled *failedAttempt
+	var lastFailure *failedAttempt
+	var remaining []Target
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
@@ -1498,37 +1872,69 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		cr := &countingReader{ReadCloser: io.NopCloser(bytes.NewReader(bodyBytes))}
 		body, err := rewriteModel(cr, func(model string) (string, error) {
 			requestedModel = model
+			// Nothing is resolved against a name the request never gave; the
+			// model-is-required check below answers it once the rewrite returns.
+			if model == "" {
+				return model, nil
+			}
 			if lm, ok := backend.Models[model]; ok {
 				if len(lm.Targets) == 0 {
-					return "", resolveError{yerrors.WithHTTPStatus(http.StatusInternalServerError, fmt.Errorf("logical model %q has no targets", model))}
+					return "", resolveError{noTargetsError(model)}
 				}
 				logicalTargets = lm.Targets
 				// A within-request failover has just demoted the prior target, but
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				chosen = s.pickTarget(untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				p := s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				if p.ok && lastFailure != nil {
+					// Somewhere else to go, so the request did move past the last
+					// candidate — recorded before this pick's skips, which is the
+					// order the walk saw them in.
+					lastFailure.record(r.Context())
+				}
+				for _, a := range p.skipped {
+					addLogSkipped(r.Context(), a)
+				}
+				if !p.ok {
+					// A walk that got here through a failure answers for that failure,
+					// which only the loop can do; one that never attempted anything is
+					// the model with nothing to serve it.
+					if lastFailure != nil {
+						return "", errWalkExhausted
+					}
+					return "", resolveError{noTargetsError(model)}
+				}
+				chosen = p.target
 				parsedBackendName = chosen.backend
 				upstreamModel = chosen.model
 				return chosen.model, nil
 			}
-			prefix, bare, ok := strings.Cut(model, "/")
-			if !ok {
+			ref, err := ParseTarget(model)
+			if _, notRef := errors.AsType[notAReferenceError](err); notRef {
 				if len(backend.Backends) == 0 {
 					// Nothing is configured to have declared the model, so the absent
-					// configuration is the more useful answer: parsedBackendName stays
-					// empty, which this function reports as errNoBackendConfigured once
-					// rewriteModel returns.
-					upstreamModel = model
-					return model, nil
+					// configuration is the more useful answer than calling the model
+					// unknown.
+					return "", resolveError{notFound(fmt.Errorf("no backend configured to serve model %q", model))}
 				}
 				return "", resolveError{notFound(fmt.Errorf("unknown logical model %q", requestedModel))}
 			}
-			parsedBackendName = prefix
-			upstreamModel = bare
-			return bare, nil
+			if err != nil {
+				return "", resolveError{badRequest(err)}
+			}
+			if err := ref.validate(); err != nil {
+				return "", resolveError{badRequest(fmt.Errorf("model %q: %w", model, err))}
+			}
+			chosen = ref
+			parsedBackendName = ref.backend
+			upstreamModel = ref.model
+			return ref.model, nil
 		})
 		if err != nil {
+			if errors.Is(err, errWalkExhausted) {
+				break
+			}
 			if re, ok := errors.AsType[resolveError](err); ok {
 				return re.error
 			}
@@ -1538,20 +1944,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return badRequest(errors.New("model is required"))
 		}
 
-		if parsedBackendName == "" {
-			return errNoBackendConfigured
-		}
-
-		b, ok := backend.Backends[parsedBackendName]
-		var sel selection
-		var usable bool
-		if ok {
-			var selErr error
-			sel, selErr = s.resolveBackend(b)
-			usable = selErr == nil
-		}
-		if !ok || !usable {
+		// A configured-but-unusable backend is not an unknown one; the caller gets
+		// the real reason rather than a falsehood about what was declared.
+		sel, err := s.resolveBackend(backend.Backends, parsedBackendName)
+		if errors.Is(err, errNoSuchBackend) {
 			return notFound(fmt.Errorf("model references unknown backend %q", parsedBackendName))
+		}
+		if err != nil {
+			return notFound(fmt.Errorf("model references unusable backend %q: %w", parsedBackendName, err))
 		}
 		name := parsedBackendName
 		setLogBackendName(r.Context(), name)
@@ -1598,21 +1998,26 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// synthesized backoff, then replay the request onto the next untried
 			// target rather than surfacing the stall; only when none remains does the
 			// client see the 504.
-			s.recordRateLimited(chosen, synthesizedStallBackoff, backend.Backends)
+			s.recordStalled(r.Context(), chosen, backend.Backends, err)
 			releaseHeld()
+			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
 			if logicalTargets != nil {
 				tried = append(tried, healthKey(chosen, backend.Backends))
-				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, 0, err)
-					continue
+				lastFailure = &failedAttempt{
+					answer:        stalled,
+					raw:           err,
+					target:        chosen,
+					backend:       parsedBackendName,
+					upstreamModel: upstreamModel,
 				}
+				continue
 			}
-			return yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
+			return stalled
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
-		// target, so shrink on a rate-limit 429 even when the request bypassed target
-		// health tracking (a direct backend/model reference has no chosen target).
+		// target, so shrink on a rate-limit 429 even for a request that has no chosen
+		// target to demote.
 		switch {
 		case err == nil:
 			// Demand-gated: a success that never waited for a slot is no evidence
@@ -1635,34 +2040,46 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if chosen.backend != "" {
 			switch {
 			case err == nil:
-				s.clearFailure(chosen, backend.Backends)
+				s.clearFailure(r.Context(), chosen, backend.Backends)
 			case demote && sig.hasRetryAfter:
-				s.recordRateLimited(chosen, sig.retryAfter, backend.Backends)
-			case demote || isCredentialRefused(err):
-				s.recordImmediateFailure(chosen, backend.Backends)
+				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
+			case demote || isAccessRefused(err):
+				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
 			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
 			case sig.condition == transientRate || isFatalUpstream(err):
-				s.recordFailure(chosen, backend.Backends)
+				s.recordFailure(chosen, backend.Backends, err)
 			}
 		}
 		if err != nil {
-			// A sustainedRate 429 or a refused credential has just demoted chosen
+			failed := failedAttempt{
+				answer:        clientFacing(ctx, err),
+				raw:           err,
+				target:        chosen,
+				backend:       parsedBackendName,
+				upstreamModel: upstreamModel,
+			}
+			// A sustainedRate 429 or refused access has just demoted chosen
 			// above; if another target has not yet been tried this request, replay it
 			// there rather than surface the refusal to the client.
-			if logicalTargets != nil && (sig.condition == sustainedRate || isCredentialRefused(err)) {
-				tried = append(tried, healthKey(chosen, backend.Backends))
-				if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-					addLogFailedOver(r.Context(), parsedBackendName, upstreamModel, yerrors.HTTPStatus(err), err)
-					releaseHeld()
-					cancel(nil)
-					continue
+			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
+				// The verdict is the soonest return on offer, so a later candidate
+				// displaces the incumbent when it comes back first. The incumbent's
+				// delay is re-derived rather than remembered, so both are what remains
+				// as of now.
+				if sig.condition == sustainedRate && sig.hasRetryAfter &&
+					(throttled == nil || sig.retryAfter < classifyLimit(throttled.raw).retryAfter) {
+					throttled = &failed
 				}
+				tried = append(tried, healthKey(chosen, backend.Backends))
+				lastFailure = &failed
+				releaseHeld()
+				cancel(nil)
+				continue
 			}
-			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
 			releaseHeld()
 			cancel(nil)
-			remaining := untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
-			return s.terminalFailure(chosen, remaining, backend.Backends, clientFacing(ctx, err))
+			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
+			break
 		}
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
@@ -1688,4 +2105,19 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		cancel(nil)
 		return err
 	}
+
+	// The walk is over, by either road: it ran out of candidates, or its last failure
+	// was one no other candidate could answer for. What it answers with is that
+	// failure, unless an earlier candidate offered a return it can still make.
+	f := *lastFailure
+	setLogUpstreamStatus(r.Context(), f.status())
+	answer, answering := f.answer, f.target
+	if throttled != nil &&
+		(isAccessRefused(f.raw) || yerrors.HTTPStatus(f.raw) == http.StatusNotImplemented) {
+		// An earlier candidate answers, so this one is a target the request did not
+		// serve from — and the only record of why.
+		f.record(r.Context())
+		answer, answering = throttled.answer, throttled.target
+	}
+	return s.terminalFailure(answering, remaining, backend.Backends, answer)
 }

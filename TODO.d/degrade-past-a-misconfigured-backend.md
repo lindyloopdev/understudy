@@ -1,82 +1,50 @@
-# Skip an unusable backend instead of failing the request
+# Answer when nothing is usable, and report the skip everywhere
 
 **Tag:** understudy / fallback / ha
 
-**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Least degradation:
-a backend understudy cannot use costs that backend, not the request", and the four
-paragraphs after it (skipped-not-demoted, the reason travels, operator vs caller,
-two endpoints).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Operator and caller
+learn different things" (the skip reason reaches the operator through the request's
+`LogRecord`), "The reason travels with the skip" (each reason reaches the
+operator through `Excluded`, never the client), "A list emptied by misconfiguration answers
+404, not 500" (which ending each exhaustion gets, and that the rule is about usable
+targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
+valid answer for the listing whatever its cause).
 
-A backend that reached understudy without a base URL fails **every** request
-against that configuration. `authMiddleware` loops over all backends before any
-handler runs and 500s on the first one missing a base
-URL — deliberately, "regardless of map iteration order", to keep the error
-deterministic. So given a logical model with targets `[x/a, y/b, z/a]` and an
-unusable `y`, a request resolving to `x/a` dies at the trust boundary having never
-needed `y`.
+- **Pin what a walk of nothing but stalls reports.** When every candidate stalls the
+  walk exhausts, and the status it reports for the attempt it answers for lands on
+  the record's own fields rather than on `Excluded`. Nothing asserts it, and a
+  status-less error yields `500` from `yerrors` if anything derives one — which has
+  happened once already, green.
 
-This is not reachable from a TOML config: `BackendSpec.BaseURL` carries
-`validate:"required,url"` and `Resolve` applies `Validate` before reading anything,
-so the document fails to load and the operator is told at config time. It is
-reachable when a `TokenValidator` returns a `BackendConfig` it did not build
-through `Config.Resolve` — the embedded and multi-tenant case, where the config
-arrives per-token and there is no load-time gate.
+- **Pin that a re-walked target is recorded once per pass.** `pickTarget` re-walks
+  the candidate list from the start on every failover, so targets `[broken, limited,
+  good]` where `limited` fails over yield `broken, limited, broken`. No case
+  exercises the repeat. Say in the `Excluded` doc that a target walked past twice is
+  recorded twice — the field reads as a set, and a set does not repeat.
 
-`resolveBackend` decides routability and reports why a backend is not routable;
-its doc comment still disclaims field validation as "owned by the auth boundary".
-That ownership moves here — it becomes the one place a backend is judged usable,
-for every selection site — which means giving it the missing-base-URL reason.
+- **A listing's failed catalog fetch reaches only the log.** The listing's two
+  omission paths answer a consumer differently: a backend understudy cannot use is
+  recorded on `Excluded`, while one whose catalog fetch fails is written to
+  `s.logger` at ERROR and left off the record. Both are the same fact from the
+  consumer's side — this backend is missing from your listing, and here is why.
 
-## Build path
-
-Two steps, either shippable alone.
-
-**Skip unusable backends at selection, and retire the blanket pre-flight.** Drop
-the middleware loop, so a request is never failed for a backend it does not
-resolve to. This is the fix: a logical model with targets `[x/a, y/b, z/a]` serves
-from `x/a` while `y` is unusable, rather than failing at the trust boundary. A
-logical model whose targets span two backends is the vehicle for the test.
-
-Two things must land with it, not after:
-
-- **The nil base URL must be caught before `canonicalUpstreamKey`**, which
-  `chatCompletions` reaches through `upstreamLimiter` and which dereferences
-  `*baseURL` unconditionally. The middleware check is the only thing preventing
-  that panic, so removing it without the selection-time check trades a 500 for a
-  recovered panic.
-- **The chat path must report the real reason.** Once a malformed backend is no
-  longer rejected up front, a direct request for `alpha/gpt-4` reaches
-  `model references unknown backend "alpha"` — a falsehood the design forbids,
-  since `alpha` *is* configured. So distinguish *unknown* from *known but
-  unusable*, and carry the skip reason into the error. Deferring this ships a
-  knowingly false error message.
-
-Report the skip to the operator on `s.logger` at ERROR, deduplicated per condition
-the way `noteBackendDown` dedupes a streak — `Validate` runs on every request, so
-an undeduplicated log floods.
-
-Test surface: whatever asserts `model references unknown backend`, or a 500 from
-the retired pre-flight, for a backend that is declared rather than absent.
-
-**`/v1/models` answers its own question.** Skip unusable backends and stop
-aborting the listing when a catalog fetch fails — the `models` handler returns
-`clientFacing` on any backend's `Models` error today — making the endpoint
-effectively non-failing. Independent of the skip work: the chat path is what
-couples to it, the listing does not.
-
-Test surface: three `/v1/models` cases turn from 500 into 200 — "should return 500
-when no backend configured", the sole nil-`BaseURL` case, and "should return 500
-when any backend has a nil config even if another is usable". The last pins the
-defect itself, so it inverts rather than merely changing status.
+- **Answer an empty catalog when nothing is usable.** `/v1/models` returns 500
+  (`errNoBackendConfigured` on `!matched`), against "emptiness is a valid answer
+  whatever its cause". Zero usable backends is an empty catalog, so the case
+  "should return 500 when no backend configured" inverts. It is the sole remaining
+  use of `errNoBackendConfigured`, so this retires the error too.
 
 ## Out of scope
 
-- **Failover for a target unusable at runtime.** A refused credential or an
+- **Failover for a target unusable at runtime.** Refused access or an
   unreachable host still demotes and is walked past; only *static* unusability is
   a skip. See [[fail-over-in-place-from-a-demoted-target]].
 - **An unset credential under `auth = "auto"`.** The document is correct and the
   world is not supplying a key, which seeds health state rather than skipping —
   see [[auth-requirement-and-key-env-source]] and [[resolve-validate-split]].
+- **Exported sentinels for the skip reasons.** No such backend, no registered
+  handler, and no base URL all mean one thing to a consumer — this backend is
+  unusable until an operator edits config — so none becomes public API.
 - **Exposing the registered provider set** so a consumer can pre-check
   routability itself. Deliberately deferred until one needs it; a consumer can
   already enforce any rule it *can* see from its own `TokenValidator`.

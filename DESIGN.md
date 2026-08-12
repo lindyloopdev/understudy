@@ -83,9 +83,10 @@ is** — a defect in the document, or a fact about the world:
   nothing to be absent. Naming a key source is a config error, since it could
   never be read. If the upstream turns out to demand a credential after all, its
   `401` is the diagnostic and reaches the client — the one exception to the
-  credential-refusal failover below. A `401` here contradicts the *declaration*,
-  not an account, so no sibling can serve in its place; routing around it would
-  hide a wrong config behind a paid backend.
+  access-refusal failover below, and that exception covers the `401` alone. A
+  `401` here contradicts the *declaration*, not an account, so no sibling can
+  serve in its place; routing around it would hide a wrong config behind a paid
+  backend.
 - `optional` — **reserved, rejected.** Send a credential when one loads, stay
   available when none does. Its name is held so that `auto` does not drift into
   meaning it.
@@ -149,29 +150,59 @@ not here.
   selector; the name is the whole interface.
 
 **Availability failover.** A logical model resolves to a **priority-ordered
-candidate list** (`BackendConfig.Models`) that understudy **fails over** across.
+candidate list** (`BackendConfig.Models`) that understudy **fails over** across. A
+request naming a `<backend>/<model>` reference instead resolves to that one target
+and is not failed over — a logical model *is* the declaration of which substitutes
+are acceptable and in what order, so a reference, declaring none, leaves understudy
+nothing it is authorized to try. Both forms are otherwise identical: everything
+below keys on the canonical endpoint, never on how a request spelled it.
 understudy routes each request to the first target not currently
 failing past a threshold, tracking a failing-since per canonical `(url + key + model)` and
 classifying a 502/connection error as an availability failure. understudy **walks** the list,
 advancing to the next target when an attempt is **classified an availability
-failure** — a hard error (502/connection), a rate-limited target, or a **refused
-credential**: a `401` (rejected) or `402` (out of funds) from a backend that
-supplies one. A refused credential is an availability fact about the one account
-called, not a client error — a cost-ordered candidate list reaches an exhausted
-balance in the ordinary course — so the target is demoted at once and the request
-continues on a sibling instead of the refusal reaching the client. A backend
-declaring `auth = none` is excluded: it supplies no credential to refuse, so its
-`401` is a config diagnostic and passes through (see §LLM API Keys via Understudy).
+failure** — a hard error (502/connection), a rate-limited target, or **refused
+access**: a `401` (identity rejected), `402` (out of funds), or `403` (not
+permitted). Refused access is an availability fact about the one account called,
+not a client error — a cost-ordered candidate list reaches an exhausted balance in
+the ordinary course, and an account is routinely entitled to one backend's model
+and not another's — so the target is demoted at once and the request continues on
+a sibling instead of the refusal reaching the client. The three differ only in why
+the account may not use the target, never in what understudy can do about it
+within the request.
+
+A backend declaring `auth = none` is excluded **from the `401` arm only**: it
+supplies no credential to refuse, so its `401` is a config diagnostic and passes
+through (see §LLM API Keys via Understudy). That argument is about credentials, so
+it does not reach `402` or `403`, which say nothing about a declaration.
+
+**Every `403` is account-scoped, so this arm needs no request-scoped guard.** That
+is a finding about what providers send, not an assumption drawn from the status. A
+refusal the *request* earned arrives one of two ways: as a `4xx` naming the request
+itself as the defect, or as a **successful** response the model declined, which
+understudy relays untouched. Neither is classified here. A `403` means the account
+may not use the target — an unsupported region, a permission its key lacks — and
+even where a safety system answers `403`, it is aggregated over the account's
+traffic and clears on its own, which is account-scoped and temporary: exactly what
+demotion and recovery already handle.
+
+The guard is therefore unbuilt on purpose, and the damage it would prevent is
+unreachable until that finding stops holding. Were a provider to answer `403` for
+one request's content, understudy would replay it across every candidate, be
+refused identically at each, and demote them all on the way — benching targets
+that serve other requests fine, on the strength of one request. That is the signal
+to stop the walk and keep such a refusal out of the health map, since a fact about
+one request is not evidence about an account. Until a provider sends that shape,
+there is nothing for a guard to distinguish.
 
 **Least degradation: a backend understudy cannot use costs that backend, not the
-request.** The refused-credential rule generalizes past runtime faults. A backend
+request.** The refused-access rule generalizes past runtime faults. A backend
 may also be unusable *statically* — its `provider_type` has no registered handler,
 or it reached understudy without a base URL — and that is still a fact about one
 backend, which the candidate list exists precisely so one fact cannot decide the
 request. So an unusable backend is **skipped where a target is chosen**, and a
 request that resolves to a usable sibling never pays for it.
 
-Skipped, not demoted. A refused credential is a fact about the world that can
+Skipped, not demoted. Refused access is a fact about the world that can
 change on its own, so it belongs in the health state the failover walk consults; a
 statically unusable backend cannot become usable without a configuration change, so
 demoting it would seed a health entry no recovery probe can ever clear
@@ -183,25 +214,131 @@ actually chosen, where it is chosen.
 
 **The reason travels with the skip.** A skip that discards *why* turns understudy's
 own errors into falsehoods — a caller told a configured-but-unusable backend is
-"unknown", or told "no backend configured" when several are. So the reason reaches
-whichever answer the request produces: the terminal error when the skipping
-exhausted the candidates, and the operator's diagnostic either way.
+"unknown", or told "no backend configured" when several are. So every reason reaches
+the operator, through the request's `Excluded`. It does not reach the client: a
+caller told a backend "must provide base_url" has been handed a diagnostic it cannot
+act on about a deployment it never named, so it is answered in understudy's own
+words instead.
+
+**A list emptied by misconfiguration answers 404, not 500.** The two ways a
+candidate list runs out are not the same ending. Emptied by *health*, something is
+still worth attempting — a demoted target can serve again — so the request is made
+and the client receives the upstream's own answer, or the ladder's reject once the
+streak passes the terminal threshold (§Understudy, the Retry-After ladder). Emptied
+by *static unusability*, there is nothing to attempt: no upstream is called, and the
+client is told the model has nothing to serve it, while why each backend was skipped
+goes to the operator.
+
+That answer is a 404 even though the fault is the operator's, for three reasons.
+Least degradation already holds that an unusable backend costs that backend and not
+the request, so faults do not sum: if one misconfigured target still serves a
+request from a healthy sibling, three misconfigured targets are still only facts
+about themselves, and what decides the request is that nothing is left. Second, a
+5xx body is rewritten to its bare status text, so a 500 would discard the very
+reason the paragraph above requires to travel — 404 is the only status on which the
+requirement is satisfiable. Third, a model that cannot be served is the condition
+`invalid_request_error` already names, whatever put it in that state.
+
+The rule is about *usable targets*, not about how the list came to be empty. A
+logical model declaring no targets at all is the same condition as one whose every
+target is unusable, and answers the same way, in the same words.
 
 **Operator and caller learn different things.** The caller gets the best available
 answer to the request it made; the reason a backend was skipped is the *operator's*
-fact and goes to understudy's own logger at ERROR — deduplicated per condition, not
-emitted per request, since a `TokenValidator` runs on every one. In an embedded
-deployment the two may be the same person; understudy must not assume it, so a
-caller's request is never failed to deliver an operator's diagnostic.
+fact, and it reaches the operator through the request's `LogRecord` rather than
+understudy's own logger. In an embedded deployment the two may be the same person;
+understudy must not assume it, so a caller's request is never failed to deliver an
+operator's diagnostic.
+
+Reporting the skip rather than logging it is what keeps understudy out of a policy
+it has no standing to set. A `TokenValidator` runs on every request, so a skip
+recurs on every request, and suppressing the repetition means choosing a unit to
+suppress it over — a unit understudy cannot see. Per process is wrong for a proxy
+that runs for weeks; per token assumes a token lifetime understudy is not told and
+which is static in the ordinary case; per elapsed interval is a number invented to
+stand in for a cadence the consumer knows and understudy does not. The consumer
+knows its own unit of work, so the fact is handed to it and it decides whether that
+becomes a log line, a metric, or nothing.
+
+**A target's health transitions are understudy's own to log.** The rule above sends
+an operator's facts through the request's `LogRecord`, because understudy cannot know
+the unit over which a recurring fact should be suppressed. A health transition is the
+exception, and the reason is that it does not recur: it is an edge, and the unit is
+understudy's own — a failure streak it began and will end. Suppressing a transition
+per streak invents nothing about the consumer's work.
+
+The other half of the reason is that a recovery has no request to ride on. A target
+coming back excludes nothing and fails nothing; no walk moves past it, so `Excluded`
+cannot carry it, and a consumer assembling health from request records alone would
+watch targets go down and never come back — reading a permanently degraded fleet.
+Degradations are worth knowing, and knowing them without recoveries is worse than
+knowing neither. Both directions are logged, or neither is.
+
+The exception is narrow. It covers the transition — this target is out, this target
+is back — and not the per-request fact that a walk routed around it. That fact is a
+skip like any other and belongs on `Excluded`, on every request that routes around
+the target, exactly as the rule above requires.
+
+**The pair is not ordered.** Two requests can decide a target's transitions in quick
+succession — one demoting it, another finding it healthy — and each writes its record
+after releasing the lock, so an operator can read "backend up" before the "backend
+down" it followed. What is ordered is the decision: `downLogged` is claimed under the
+lock, so exactly one record is written per streak and the pair is never doubled or
+dropped. Ordering the writes too would mean one serialization point outside the lock,
+paid on every transition to correct a reading that the next event corrects anyway.
+
+**A transition is never emitted while the health map is held.** The record is decided
+under the lock and written after it, because the handler belongs to the consumer and
+may be slow: a file, a socket, a shipper with a full buffer. Every request's routing
+reads that map, so a handler run under it would hold the whole proxy for as long as it
+took to write one line — and a backend going down is exactly when requests arrive
+together. Deciding and emitting are therefore separate steps in every path that
+reports one.
+
+**A transition is logged when it happens.** The demotion is the event: the request
+that was refused, stalled, or told to back off holds the failure, knows what the
+upstream answered, and knows the moment. Logging instead at the next walk that routes
+around the target dates the record to when someone tripped over it, drops the cause,
+and says nothing at all when no one trips. What such a record owes an operator — the
+target, why it is out, when it will be tried again, and whether that moment is the
+upstream's terms or a bench understudy chose — is in scope at the demotion and none
+of it is at the walk.
+
+One shape has no such moment. A target whose streak merely ages past the failover
+threshold is routed around from the instant the threshold elapses, and nothing runs
+then; the crossing is computed by whichever walk next weighs the streak against it.
+Where a further failure does the crossing, that failure is the event. Where the
+streak ages in silence, the walk that discovers it is the earliest knowable moment,
+and the record answers for that by dating the streak rather than the discovery.
+
+Everything a request moved on from goes on one record, `Excluded`, whatever kept it
+from serving: a target abandoned after a call, a target understudy could not use and
+never called, a backend a listing left out. The candidate that *ended* a walk is
+carried in the record's own fields when it is what the request answered from; when
+an earlier candidate answers for the request instead, it joins `Excluded` like any
+other the walk moved past. They differ
+in why they did not serve, not in what the consumer is being told, and one list
+preserves the order a request walked its candidates in — an exclusion and a failover
+interleave, and two lists could not say which came first. `Called` carries the
+distinction the shape no longer does: whether understudy sent anything before
+excluding it.
+
+Order is only meaningful where a walk produced it. A chat request walks an ordered
+candidate list; a listing ranges a map, so its exclusions arrive in whatever order
+the range yields and none is implied.
 
 **Two endpoints, two answers.** `/v1/models` asks *what can you serve* — emptiness
 is a valid answer whatever its cause, so unusable backends are skipped and a usable
 backend advertising nothing contributes nothing; the listing does not fail because
 some backend, or every backend, could not be reached. Chat asks understudy to
 *serve this*, and there failure is failure: a request naming a model no usable
-backend can serve is an error carrying the reason. The consequence is deliberate —
+backend can serve is an error, and why each backend was skipped goes to the
+operator with it. The consequence is deliberate —
 a total upstream outage renders as an empty catalog rather than an error, and the
-operator learns of it from the log rather than the response.
+operator learns of it from the log rather than the response. The listing does not
+yet hold to this: a config resolving to no usable backend still fails, and a
+backend dropped by a failed catalog fetch reaches no consumer —
+[[degrade-past-a-misconfigured-backend]].
 
 A consumer wanting stricter behavior enforces it in its own `TokenValidator`,
 before handing understudy a configuration. Routability as *understudy* defines it
@@ -251,6 +388,17 @@ alternate → ~0 (fail over at once), a pricier one → retry the cheaper target
 longer. A later, larger threshold (≈2m) hard-fails to the terminal reject when no
 alternate remains.
 
+**A success clears the streak, so only a target failing outright is routed
+around.** Any success on an account deletes its failure record, so crossing the
+threshold takes a window in which *nothing* succeeded. A target failing a fraction
+of its requests keeps receiving them, and how fast one demotes depends on how busy
+the account is — the volume dependence the duration threshold otherwise avoids.
+That is accepted, not overlooked: a partly-serving target still beats no target,
+and every rule for netting failures against successes needs a window and a ratio,
+the tuning constants these thresholds exist to do without until cost can derive
+them. Revisit when a partly-failing target is seen hurting a run, which is the
+evidence this trade is missing.
+
 **Session target binding.** Within a session understudy pins one target and
 reuses it — no per-request re-selection. It re-walks the list (from the top,
 first available) **only when the pinned target fails to serve** — having been
@@ -290,9 +438,13 @@ carrying different body policy.
 That projection is what lets the *same* model appear as distinct profiles across
 logical models — a home a global per-model flag (bakes one behavior in) or a
 logical-model-per-profile (nests logical models) can't provide. The **domain
-rules** — the `thinking` value's semantics — are validated where the config
-**resolves** (`Config.Resolve`), beside the existing backend-reference check,
-never in the decode. An **unrecognized query param is ignored, not rejected**
+rules** — the `thinking` value's semantics — are validated wherever a reference
+is accepted, never in the decode: at `Config.Resolve` beside the existing
+backend-reference check, and again when a request names a `backend/model`
+reference directly, which is a target the caller wrote rather than the operator.
+One reference means one thing however it arrives, so an override the config would
+refuse is refused from a request too — as a `400`, since there it is the caller's
+input that is wrong. An **unrecognized query param is ignored, not rejected**
 (Postel's law): rejecting it would break forward/backward compatibility — an
 older binary would refuse a config carrying a param it hasn't learned yet, so a
 new override couldn't roll out across a fleet ahead of the binary. Only *known*
@@ -338,7 +490,8 @@ understudy performs. Ease of first run is a **packaging** concern, answered by a
 shipped example configuration that declares its own models, not by understudy
 guessing.
 
-**Rate-limit reject.** A long upstream `Retry-After` (429/5xx) is converted to a
+**Rate-limit reject.** A long upstream `Retry-After` on a retryable failure — a
+`429`, or a `5xx` outside the never-retryable class — is converted to a
 non-retryable **400** before the agent sees it — opencode honors `Retry-After`
 with no ceiling (~24.8 days) and lindy can't detect the situation from the event
 stream, so the reject must live in the proxy. The response splits status (400 =
@@ -350,8 +503,10 @@ failure carrying **no** `Retry-After` — a 429 without the header, or a 5xx —
 not relayed raw either. Unhandled, opencode hammers rapid retries at a failing
 upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** a
 `Retry-After` and injects it while preserving the retryable status, so opencode
-backs off *understudy's* interval instead of its flat 30s. The interval grows
-exponentially per backend, is jittered, and resets on success; its ceiling **is
+backs off *understudy's* interval instead of its flat 30s. Only the `429` half is
+built: a `5xx` advertising nothing still reaches the client bare, and the injected
+interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
+interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is
 the rate-limit-reject threshold**, so on crossing it the response becomes that
 same terminal 400 — one threshold caps both paths. This makes understudy an
 active backoff *controller*, not a pure header relay — still an availability
@@ -428,7 +583,17 @@ while making worst-case detection unbounded — worst precisely when an operator
 just paid and expects work to resume. Jitter, for the same reason the synthesized
 backoff needs it; reset to base on success. A known `readmitAt` **supersedes the
 schedule entirely** — there is nothing to discover, the advertised time is the
-answer.
+answer. A success on a concurrent request deletes the advertised time along with
+the streak today — [[a-success-clears-more-than-its-own-streak]].
+
+**Health belongs to the endpoint, not to the route that reached it.** The key is
+the canonical `(url + key + model)` and nothing else — not the logical model walked
+to get there, not whether the caller named a logical model at all. A request naming
+`<backend>/<model>` directly reaches the same upstream as a logical model whose
+target resolves to it, so it reads and writes the same entry: what one learns about
+an account, all learn. Keying health on how a request was *addressed* would make an
+account's availability depend on spelling, and let a demoted upstream keep serving
+one route while another routes around it.
 
 **Credential rotation needs no probe.** Health is keyed on the canonical
 `(url + key + model)`, so a rotated key is a *different* entry, healthy by
@@ -623,6 +788,127 @@ composition root mounts. The boundary splits three ways:
 - **Populating the `/v1` request's telemetry is understudy's** — the per-request facts a
   mount can't see (which backend and model served, the upstream status, and on failure the
   *real* error behind an obfuscated body) understudy records into its own log record.
+
+**One table maps an upstream failure to what the client is told.** A provider reports
+what the upstream *said* — the condition it observed, and any retry boundary it
+recovered — and understudy alone derives the status, envelope `type`, and
+`Retry-After` from it. Relaying a provider's own type string would make understudy's
+contract the union of every vendor's vocabulary and leak a name one vendor invented
+(`RegionError`) into the field a consumer dispatches on; it would also misdescribe a
+response understudy has already reshaped, since by the time a client sees an error the
+status may be normalized, the body obfuscated, the backoff synthesized, and the target
+a different one than was asked for. The table is **documented for library users**, not
+left to be read out of the code, because a consumer classifies on it. It is not
+caller-overridable, for the same reason error rendering is not: a hook would let a
+caller break the contract its consumers depend on. Should a real need for one appear,
+it is a later addition, not a reason to build the seam now.
+
+**Upstream failures.** Status is retry-control, `type` is the reason, and the body is
+obfuscated for `5xx`/`401`/`403` per the rule above. These are a request's **final**
+disposition: a refusal, a stall, and a `429` past the demotion threshold each fail
+over first, so a client is told one of these only once no untried candidate remains.
+
+A **`5xx` no retry can help** is `501`: the operation is not implemented, and no
+delay changes that. It is a standing fact like a refusal, not the transient fault
+the rest of the range describes. The tables below name the class rather than the
+status, so a row reads as the rule it follows.
+
+| what the upstream did | client status | envelope `type` | retry delay |
+| --- | --- | --- | --- |
+| `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
+| `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none; the account's own recovery clears it |
+| `429` advertising under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
+| `429` advertising nothing | `429` | `rate_limit_error` | synthesized |
+| a `5xx` no retry can help | `502` | `server_error` | none, whatever it advertised |
+| any other `5xx` advertising up to the passthrough ceiling (≈2m) | `502` | `server_error` | the delay still outstanding |
+| any other `5xx` advertising beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+| any other `5xx` advertising nothing, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
+| overloaded (`529` and kin) | `502` | *open* | as `5xx` |
+| every candidate stalled before its header | `504` | `server_error` | — |
+| failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+
+**A walk that runs out of candidates answers for the request, not for its last
+target.** Relaying the final failure makes the answer depend on list order: with
+`[a: 429 for 60s, b: 401]` a caller would be told to escalate a standing refusal,
+when `a` is merely throttled and will serve once its delay elapses. Only a sustained
+`429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
+falls — so it would be the last candidate whose answer a client sees. The verdict is
+instead the **most optimistic** disposition among the candidates the request had —
+including one it declined to call, because a target benched until a known time is
+as time-bound as a disposition gets.
+
+Every candidate contributes a delay or contributes nothing, so there is no tie to
+break by judgement:
+
+| what the candidate did | contributes |
+| --- | --- |
+| advertised a `Retry-After` | what remains of it |
+| answered a retryable failure advertising none — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
+| stalled before its header | the synthesized stall backoff |
+| was benched and never called | its `readmitAt`, less now |
+| refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
+| answered a `5xx` no retry can help | nothing |
+| was unusable as configured | nothing; only a config change clears it |
+
+The verdict is the **soonest** contribution, answered in the shape of the candidate
+that made it: a bench earned by a rate limit answers as a rate limit, carrying that
+bench's remaining time. Answering in the shape of whichever failure happened to end
+the walk would tell a client to stop and to retry in the same breath. A verdict with
+no contribution at all is the stop. Not every row is weighed yet —
+[[weigh-every-candidates-contribution]].
+
+Optimism is the cheaper error. Guessing retryable when nothing will recover costs
+one more failed request; guessing terminal when something would have recovered
+strands work that could have run. The individual reasons are not lost — every
+candidate the walk moved on from is on `LogRecord.Excluded` with the status it
+answered, and the one the request answered from is in the record's own fields,
+which together are where an operator reads what actually happened.
+
+A relayed failure carries its delay in a `Retry-After` **header** — retry-control
+aimed at the agent, which sleeps and retries on its own. A **reject** carries it as
+a top-level `retry_after_ms` (milliseconds, rounded to the second) beside the
+`error` object, and sends no header at all. Both would reach lindy either way: the
+agent publishes an error event carrying the response body *and* its headers. The
+header is withheld because `Retry-After` **is** an instruction to sleep, and a
+reject exists to make the agent stop — so the delay is put where only the
+orchestrator above it will read it. understudy is speaking past the agent to
+lindy, which schedules the retry itself.
+
+An upstream's own `type` string is still relayed ahead of this table today, except
+on the refusal row — [[understudy-error-envelope-type]].
+
+**A failure the caller cannot act on says so and no more.** Where a request fails
+on understudy's own arrangements with a provider — a credential rejected, a balance
+spent, a resource the account was never granted — the client is told the request
+cannot be served, and never which of those it was. It can pay no bill, rotate no
+key, and opt no account into a region, so the cause is not help to it; and
+understudy's client is a party the operator has already decided not to trust with
+secrets (§LLM API Keys via Understudy), which makes the operator's commercial
+standing not understudy's to disclose either. The cause goes to the log, where the
+operator reads it. The envelope `type` still separates a refusal from an
+outage, because a consumer has to tell *wait* from *escalate* — that much is
+remediation, not narration.
+
+**A `500` is understudy's own fault, never an upstream's.** Every upstream `5xx`
+is flattened to `502` — which one a backend chose is not the client's business —
+and `500` is reserved for understudy failing: a panic it recovered, a configuration
+it cannot serve from. That reservation is why the flattening happens where a
+failure is known to be a relay, rather than where every error is rendered: by then
+understudy's own `500` and a backend's are indistinguishable, and the reservation
+would be lost.
+
+**understudy's own refusals**, which reach no upstream:
+
+| condition | status | envelope `type` |
+| --- | --- | --- |
+| session token absent or rejected | `401` | `authentication_error` |
+| model undeclared, backend unknown, or a model with no targets | `404` | `invalid_request_error` |
+| malformed body, malformed reference, or a rejected override | `400` | `invalid_request_error` |
+| client disconnected | `499` | — |
+| request deadline exceeded | `504` | — |
+| understudy panicked, or cannot serve from its own configuration | `500` | `server_error` |
 
 **understudy owns its telemetry record; what a consumer does with it is the consumer's.**
 understudy's telemetry is understudy's, so its log record — the **`LogRecord`** value type —

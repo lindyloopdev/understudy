@@ -13,6 +13,13 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
+- **Synthesize for a 5xx at all.** The synthesis branch in the response path is
+  gated on `sig.isRateLimit`, which is `status == 429`, so a `5xx` that advertised
+  nothing — a plain `503`, a transport failure, an Anthropic `529` — reaches the
+  client as a bare `502` with no backoff signal. §Understudy names "a 429 without
+  the header, **or a 5xx**" as the case this mechanism exists for, so this is the
+  coverage gap under the graduated-interval work below, not a separate feature.
+
 - **Graduated injected backoff.** understudy still injects only a **fixed** 60s
   `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
   `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
@@ -129,3 +136,7 @@ Shares one per-host health-state substrate with failover (go elsewhere) and the
 circuit breaker (the binary degenerate of this backoff). Together they are the
 post-v1 **per-host availability layer**, all capped by the same threshold the
 stateless reject uses.
+
+The interval is also what a `5xx` or a signal-less `429` contributes to a walk's
+verdict, so the rest of that comparison waits on this —
+[[weigh-every-candidates-contribution]].
