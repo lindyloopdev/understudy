@@ -3714,12 +3714,18 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		}
 		return http.StatusBadGateway
 	}
+	const badGateway = `{"error":{"message":"bad gateway"}}`
+	bothTargets := []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}
 
 	type test struct {
-		aStatus    func(call int, clientLeaves context.CancelFunc) int
+		aStatus func(call int, clientLeaves context.CancelFunc) int
+		// aBody is the error body a answers with.
+		aBody      string
 		retryAfter time.Duration
-		advances   []time.Duration
-		wantDown   int
+		// targets is the logical model's candidate list.
+		targets  []Target
+		advances []time.Duration
+		wantDown int
 		// downFields are additional fields the "backend down" records must carry.
 		downFields map[string]any
 		wantUp     int
@@ -3733,29 +3739,39 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 
 	tests.Add("should log a target down once when it crosses the failover threshold", test{
 		aStatus:  always502,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, time.Second},
 		wantDown: 1,
 		wantUp:   0,
 	})
 	tests.Add("should re-log a target down after it recovers and fails again", test{
 		aStatus:  recoverOnProbe,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, 30 * time.Second, time.Second, 16 * time.Second},
 		wantDown: 2,
 		wantUp:   1,
 	})
 	tests.Add("should log a target up when a demoted target recovers", test{
 		aStatus:  recoverOnProbe,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, 30 * time.Second},
 		wantDown: 1,
 		wantUp:   1,
 	})
 	tests.Add("should not log a target up that was never down", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusOK },
 		advances: []time.Duration{time.Second},
 		wantDown: 0,
 		wantUp:   0,
 	})
 	tests.Add("should log a target down that the departed client's walk discovered", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
 			if call == 1 {
 				clientLeaves()
@@ -3768,6 +3784,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should date a refused target's streak at the refusal", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		advances: []time.Duration{time.Second},
 		wantDown: 1,
@@ -3778,6 +3796,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should announce a demotion the streak never reported", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
@@ -3791,6 +3811,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should stay silent when a target is demoted twice in one streak", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusUnauthorized
@@ -3803,6 +3825,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should report a refused target when it is refused, not when a walk later finds it", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
 		downFields: map[string]any{
@@ -3812,6 +3836,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should report a throttled target when it is throttled, not when a walk later finds it", test{
+		aBody:      badGateway,
+		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: 50 * time.Second,
 		wantDown:   1,
@@ -3823,6 +3849,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say understudy benched a target that answered nothing", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(int, context.CancelFunc) int {
 			time.Sleep(defaultHeaderStallGate + time.Second)
 			return http.StatusOK
@@ -3836,6 +3864,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should log a transition the departed client discovered", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
 			if call < 2 {
 				return http.StatusBadGateway
@@ -3849,6 +3879,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	})
 	tests.Add("should not log a transition when a target recovers within the failover threshold", test{
 		aStatus:  recoverWithinGrace,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{5 * time.Second},
 		wantDown: 0,
 		wantUp:   0,
@@ -3860,6 +3892,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 			return http.StatusOK
 		},
+		aBody:      badGateway,
+		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
 		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
 		wantDown:   1,
@@ -3872,6 +3906,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 			return http.StatusBadGateway
 		},
+		aBody:      badGateway,
+		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
 		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
 		wantDown:   1,
@@ -3880,6 +3916,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// synctest's clock starts at midnight UTC 2000-01-01, so every moment below is
 	// an offset from it; slog renders them local.
 	tests.Add("should say understudy's own probe pacing holds a target back", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  always502,
 		advances: []time.Duration{16 * time.Second, time.Second},
 		wantDown: 1,
@@ -3894,6 +3932,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say an upstream's advertised backoff holds a target back", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
@@ -3911,6 +3951,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 1,
 	})
 	tests.Add("should say what a target answered when a walk discovers its streak", test{
+		aBody:      badGateway,
+		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: time.Second,
 		advances:   []time.Duration{16 * time.Second},
@@ -3922,12 +3964,23 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say what a backend answered when it went down", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
 		downFields: map[string]any{
 			"upstream_error": "upstream returned status 401: bad gateway",
 		},
 		wantUp: 0,
+	})
+
+	tests.Add("should not announce a lone target down while it is only swapping models", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusServiceUnavailable },
+		aBody:    `{"error":{"message":"server busy","code":"unavailable"}}`,
+		targets:  []Target{{backend: "a", model: "ma"}},
+		advances: []time.Duration{16 * time.Second, 16 * time.Second},
+		wantDown: 0,
+		wantUp:   0,
 	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
@@ -3940,7 +3993,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			clientA := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 				callsA++
 				status := tt.aStatus(callsA, clientGone)
-				body := `{"error":{"message":"bad gateway"}}`
+				body := tt.aBody
 				if status == http.StatusOK {
 					body = `{"id":"from-a"}`
 				}
@@ -3958,7 +4011,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 				"b": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
 			}
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}}}, nil
+				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
 			srv := New(validator, WithLogger(logger))
 
