@@ -4,8 +4,9 @@
 **Tag:** understudy / fallback / multi-model
 
 **Design:**
-[DESIGN.md §Understudy](../DESIGN.md#understudy) — the availability walk, the
-synthesized backoff, and the rate-limit reject; and
+[DESIGN.md §Understudy](../DESIGN.md#understudy) — the stall dispositions (case 1
+is this, "the busy-local-model case"), the availability walk, the synthesized
+backoff, and the rate-limit reject; and
 [DESIGN.md §Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting).
 Related: [[understudy-adaptive-coordinated-backoff]]. Consumer context:
 [notes/2026-08-08-kronk-gemma4-local-stack.md](../../../lindy/notes/2026-08-08-kronk-gemma4-local-stack.md)
@@ -13,26 +14,19 @@ in the lindy repo.
 
 ## The gap
 
-The provider recognizes kronk's busy signal and raises `providers.ErrServerBusy`
-alongside the upstream's 503, but the core does not consult it. So a "I'm
-momentarily full" 503 — kronk's answer when a request names a non-resident model
-while another is generating on a single-GPU pool — still travels the generic 5xx
-path:
-
-- `clientFacing` renders it **502** to the caller.
-- `isFatalUpstream` counts it against target health.
-- Nothing retries it.
-
-With a single-member logical model (`review-local-12b` → one kronk target),
-demotion leaves failover nowhere to go, so `terminalFailure` converts the streak
-and the caller gets `"upstream unavailable"`. Observed: four review beats fail
-within a second of each other, every run.
+A busy 503 replays onto a sibling, but with no sibling to reach it falls through
+to the generic 5xx path: `clientFacing` renders **502**, and `isFatalUpstream`
+spends the failure streak `terminalFailure` converts. That is the shape the
+motivating case has — a single-member logical model (`review-local-12b` → one
+kronk target), where the caller gets `"upstream unavailable"` for a backend that
+is merely swapping models. Observed: four review beats fail within a second of
+each other, every run.
 
 ## Remaining work
 
-**Relay the 503 with a synthesized `Retry-After`,** per §Understudy's
-synthesized-backoff rule, rather than converting the status. opencode retries any
-5xx and honors `Retry-After` regardless of status
+**Relay the 503 with a synthesized `Retry-After` when no candidate remains,**
+per §Understudy's synthesized-backoff rule, rather than converting the status.
+opencode retries any 5xx and honors `Retry-After` regardless of status
 ([notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md)),
 so a 429 would buy nothing and would assert something untrue. Two things block it:
 `clientFacing` maps every 5xx to 502, and `errToResponse` emits the `Retry-After`
@@ -46,8 +40,12 @@ an estimate of swap time — swap duration is per-GPU and per-model, and nothing
 know it. Coverage of a long swap comes from repetition, not from sizing one delay.
 Jitter it, so concurrent requests against one backend do not retry in lockstep.
 
-**Exempt it from target health.** Without this the rest does nothing: the 5xx
-still feeds the failure streak and `terminalFailure` still converts it.
+**Exempt that path from target health too.** The exemption holds only where the
+replay does; a busy 503 with nowhere to go still reaches `recordFailure`.
+
+**Pin the exemption with a test.** Nothing but statement order keeps the busy
+branch ahead of `recordFailure`, so a refactor can start spending the streak
+silently. Assert that a busy target accrues none.
 
 **Bound it** with a wall-clock budget rather than an attempt count, so a permanent
 condition degrades to an honest terminal failure instead of spinning. Size it

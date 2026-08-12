@@ -2014,6 +2014,22 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			return stalled
 		}
+		// errHeaderStall's disposition, told rather than inferred. Ahead of
+		// recordFailure: a loading target spends no streak.
+		if logicalTargets != nil && errors.Is(err, providers.ErrServerBusy) {
+			s.recordRateLimited(r.Context(), chosen, synthesizedStallBackoff, backend.Backends, err)
+			tried = append(tried, healthKey(chosen, backend.Backends))
+			lastFailure = &failedAttempt{
+				answer:        clientFacing(ctx, err),
+				raw:           err,
+				target:        chosen,
+				backend:       parsedBackendName,
+				upstreamModel: upstreamModel,
+			}
+			releaseHeld()
+			cancel(nil)
+			continue
+		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen

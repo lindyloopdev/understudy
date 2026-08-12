@@ -2938,6 +2938,19 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// TODO(TODO.d/understudy-server-busy-503-retryable.md): add "should answer a lone
+	// busy target with a retryable 503"; today it falls through to 502, streak spent.
+	tests.Add("should fail over within the request when a target reports itself busy", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
 	tests.Add("should route around a stalled target for the bench it synthesized, and call it again once that bench elapses", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(r *http.Request, call int) (*http.Response, error) {
