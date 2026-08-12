@@ -953,6 +953,21 @@ func (s *server) terminalFailure(t Target, remaining []Target, backends map[stri
 	return terminalError{err}
 }
 
+// retryAfterError attaches a Retry-After deadline to an error carrying none, so
+// classifyLimit and the response path read a backoff understudy synthesized
+// exactly as they read an upstream's own.
+type retryAfterError struct {
+	error
+	at time.Time
+}
+
+// RetryAfter returns the moment understudy is asking the client to come back.
+func (e retryAfterError) RetryAfter() time.Time { return e.at }
+
+// Unwrap returns the underlying error so that errors.Is/As and
+// yerrors.HTTPStatus can still traverse the chain.
+func (e retryAfterError) Unwrap() error { return e.error }
+
 // terminalError marks an upstream failure understudy has stopped relaying. It
 // carries the verdict only — the backoff the reject advertises is the response
 // path's to decide.
@@ -1079,6 +1094,10 @@ type limitClassification struct {
 	status int
 	// isRateLimit reports status == 429 Too Many Requests.
 	isRateLimit bool
+	// isRetryable reports a failure repeating could answer: a rate limit, or an
+	// upstream 5xx. Any other 4xx fails identically on repeat, so handing one a
+	// backoff would only spend the client's time.
+	isRetryable bool
 	// hasRetryAfter reports that the upstream advertised a Retry-After still
 	// outstanding; one that has elapsed counts as no advertisement.
 	hasRetryAfter bool
@@ -1101,6 +1120,7 @@ func classifyLimit(err error) limitClassification {
 	}
 	sig := limitClassification{status: responseStatus(err)}
 	sig.isRateLimit = sig.status == http.StatusTooManyRequests
+	sig.isRetryable = sig.isRateLimit || sig.status >= http.StatusInternalServerError
 	if ra, ok := errors.AsType[interface {
 		error
 		RetryAfter() time.Time
@@ -1545,7 +1565,7 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 			// limit — a 503 that named its own return is worth relaying. A request the
 			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
 			// means nothing.
-			if sig.hasRetryAfter && (sig.isRateLimit || isFatalUpstream(err)) {
+			if sig.hasRetryAfter && sig.isRetryable {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
 			}
 			// A rate limit the upstream left unbounded still needs a client backoff.
@@ -2017,18 +2037,24 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// errHeaderStall's disposition, told rather than inferred. Ahead of
 		// recordFailure: a loading target spends no streak.
 		if logicalTargets != nil && errors.Is(err, providers.ErrServerBusy) {
-			s.recordRateLimited(r.Context(), chosen, synthesizedStallBackoff, backend.Backends, err)
 			tried = append(tried, healthKey(chosen, backend.Backends))
-			lastFailure = &failedAttempt{
-				answer:        clientFacing(ctx, err),
-				raw:           err,
-				target:        chosen,
-				backend:       parsedBackendName,
-				upstreamModel: upstreamModel,
-			}
 			releaseHeld()
 			cancel(nil)
-			continue
+			if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+				s.recordRateLimited(r.Context(), chosen, synthesizedStallBackoff, backend.Backends, err)
+				lastFailure = &failedAttempt{
+					answer:        clientFacing(ctx, err),
+					raw:           err,
+					target:        chosen,
+					backend:       parsedBackendName,
+					upstreamModel: upstreamModel,
+				}
+				continue
+			}
+			// Nowhere to replay to: hand the client the wait instead of a verdict, so
+			// it comes back to a target that will by then have finished loading.
+			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
+			return retryAfterError{error: err, at: time.Now().Add(synthesizedStallBackoff)}
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model

@@ -48,9 +48,6 @@ func (e sentinelErr) Error() string { return string(e) }
 // momentarily at capacity, not because it failed: the same request stands a good
 // chance of succeeding shortly, on the same target. A provider raises it
 // alongside — never instead of — the status the upstream sent.
-//
-// TODO(TODO.d/understudy-server-busy-503-retryable.md): the core does not yet
-// consult this, so a busy 503 still travels the generic 5xx path.
 const ErrServerBusy sentinelErr = "upstream server busy"
 
 // Config carries the per-call configuration for an LLM provider call.

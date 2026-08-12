@@ -463,6 +463,8 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	// TODO: add "should forward an upstream 5xx's own Retry-After". It is forwarded
+	// today, but the only test driving that path uses a backoff understudy minted.
 	tests.AddFunc("should pass through a long-Retry-After 404 instead of rejecting it", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -2710,6 +2712,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		// wantEnvelope is the error response's asserted aspects; a field left zero
 		// is one this case's behavior does not name.
 		wantEnvelope errorEnvelope
+		// wantRetryAfter is the backoff the client is handed; empty asserts that no
+		// backoff was advertised.
+		wantRetryAfter string
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
 	// plus its stubbed round-trip: given the request and the 1-based call count, it
@@ -2792,7 +2797,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "60"},
 			{advance: 46 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: 15 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
 		},
@@ -2891,7 +2896,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{
-				advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a",
+				wantRetryAfter: "60",
+				advance:        0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a",
 				wantExcluded: []Attempt{{Backend: "b", ModelUpstream: "mb", Err: errors.New("must provide base_url")}},
 			},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
@@ -2921,7 +2927,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "60"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -2938,8 +2944,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/understudy-server-busy-503-retryable.md): add "should answer a lone
-	// busy target with a retryable 503"; today it falls through to 502, streak spent.
+	tests.Add("should answer a lone busy target with a 503 and a backoff to wait out", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":{"message":"Service Unavailable","type":"server_error"}}`, wantRetryAfter: "30"},
+		},
+	})
+
 	tests.Add("should fail over within the request when a target reports itself busy", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
@@ -3071,7 +3085,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{backend: "acct-c", model: "glm"},
 		},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a", wantRetryAfter: "60"},
 			// acct-b is the same account+model as the demoted acct-a, so it is
 			// benched too: failover routes to the different account acct-c.
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "acct-c"},
@@ -3091,8 +3105,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
-			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
+			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
 		},
 	})
 
@@ -3213,12 +3227,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 			{
-				model:      "a/ma",
-				advance:    24*time.Hour + time.Second,
-				wantStatus: http.StatusTooManyRequests,
-				wantBody:   rateLimit429,
+				wantRetryAfter: "60",
+				model:          "a/ma",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusTooManyRequests,
+				wantBody:       rateLimit429,
 			},
 		},
 	})
@@ -3409,7 +3424,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3426,7 +3441,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantExcluded: []Attempt{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "60", wantExcluded: []Attempt{
 				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 				{Backend: "b", ModelUpstream: "mb", UpstreamStatus: http.StatusUnauthorized, Err: errors.New("upstream returned status 401: invalid api key"), Called: true},
 			}},
@@ -3449,9 +3464,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 			{advance: 61 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
-			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3464,7 +3479,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}, {backend: "d", model: "md"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3475,7 +3490,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3493,7 +3508,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in forty","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in forty","type":"rate_limit_error"}}`, wantRetryAfter: "25"},
 		},
 	})
 
@@ -3542,7 +3557,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "10"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -3612,7 +3627,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3671,6 +3686,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				_ = json.Unmarshal(rr.Body.Bytes(), &envelope)
 				if d := gocmp.Diff(s.wantEnvelope, envelope, assertedFields); d != "" {
 					t.Errorf("step %d envelope (-want +got):\n%s", i, d)
+				}
+				if got := rr.Header().Get("Retry-After"); got != s.wantRetryAfter {
+					t.Errorf("step %d Retry-After: got %q want %q", i, got, s.wantRetryAfter)
 				}
 				if s.wantBackend != "" && lastDialed != s.wantBackend {
 					t.Errorf("step %d dialed %q want %q", i, lastDialed, s.wantBackend)
@@ -5137,16 +5155,6 @@ func TestServerProcessSlotBudget(t *testing.T) {
 	})
 }
 
-// retryAfterErr wraps an error with a fixed RetryAfter deadline, satisfying the
-// interface classifyLimit looks up via errors.AsType.
-type retryAfterErr struct {
-	error
-	at time.Time
-}
-
-func (e retryAfterErr) RetryAfter() time.Time { return e.at }
-func (e retryAfterErr) Unwrap() error         { return e.error }
-
 func TestClassifyLimit(t *testing.T) {
 	t.Parallel()
 
@@ -5168,6 +5176,7 @@ func TestClassifyLimit(t *testing.T) {
 		want: limitClassification{
 			status:      http.StatusBadGateway,
 			isRateLimit: false,
+			isRetryable: true,
 			condition:   notRateLimited,
 		},
 	})
@@ -5178,13 +5187,14 @@ func TestClassifyLimit(t *testing.T) {
 		want: limitClassification{
 			status:      http.StatusTooManyRequests,
 			isRateLimit: true,
+			isRetryable: true,
 			condition:   signalless,
 		},
 	})
 	tests.AddFunc("should classify a 429 with a Retry-After at the sustained-rate threshold as sustainedRate", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(rateLimitDemotionThreshold),
 				}
@@ -5192,6 +5202,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    rateLimitDemotionThreshold,
 				condition:     sustainedRate,
@@ -5201,7 +5212,7 @@ func TestClassifyLimit(t *testing.T) {
 	tests.AddFunc("should classify a 429 with a Retry-After just below the sustained-rate threshold as transientRate", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(rateLimitDemotionThreshold - time.Second),
 				}
@@ -5209,6 +5220,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    rateLimitDemotionThreshold - time.Second,
 				condition:     transientRate,
@@ -5218,7 +5230,7 @@ func TestClassifyLimit(t *testing.T) {
 	tests.AddFunc("should reject a 429 with a Retry-After beyond the passthrough ceiling", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(maxPassthroughRetryAfter + time.Second),
 				}
@@ -5226,6 +5238,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    maxPassthroughRetryAfter + time.Second,
 				shouldReject:  true,
