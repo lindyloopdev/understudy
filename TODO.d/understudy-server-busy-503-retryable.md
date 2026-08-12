@@ -1,61 +1,58 @@
-# Treat upstream 503 server-busy as retryable (not 502/terminal)
+# Answer a busy backend's 503 as retryable, not as a failure
 
 **Priority:** high
 **Tag:** understudy / fallback / multi-model
 
 **Design:**
+[DESIGN.md §Understudy](../DESIGN.md#understudy) — the availability walk, the
+synthesized backoff, and the rate-limit reject; and
 [DESIGN.md §Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting).
-Related: [[understudy-adaptive-coordinated-backoff]]. Upstream findings:
-[notes/kronk.md](../notes/kronk.md). Consumer context:
+Related: [[understudy-adaptive-coordinated-backoff]]. Consumer context:
 [notes/2026-08-08-kronk-gemma4-local-stack.md](../../../lindy/notes/2026-08-08-kronk-gemma4-local-stack.md)
 in the lindy repo.
 
-## The gap (line refs verified 2026-08-10)
+## The gap
 
-A backend's "I'm temporarily full" signal — kronk's `503` when a request targets
-a non-resident model while another is generating on a single-GPU pool — is
-treated as a **generic 5xx failure**, not a capacity signal:
+The provider recognizes kronk's busy signal and raises `providers.ErrServerBusy`
+alongside the upstream's 503, but the core does not consult it. So a "I'm
+momentarily full" 503 — kronk's answer when a request names a non-resident model
+while another is generating on a single-GPU pool — still travels the generic 5xx
+path:
 
-- `understudy.go:1025` — `sig.isRateLimit = sig.status == http.StatusTooManyRequests`:
-  only **429** enters the rate-limit/retry-after path.
-- `understudy.go:931` — `if status >= 500 { … }`: any 5xx (incl. this 503) renders
-  as **502** to the caller and counts against target health via `isFatalUpstream`.
-- `understudy.go:1057` — `case !sig.isRateLimit`: a bare 503 is not retried.
+- `clientFacing` renders it **502** to the caller.
+- `isFatalUpstream` counts it against target health.
+- Nothing retries it.
 
 With a single-member logical model (`review-local-12b` → one kronk target),
 demotion leaves failover nowhere to go, so `terminalFailure` converts the streak
 and the caller gets `"upstream unavailable"`. Observed: four review beats fail
 within a second of each other, every run.
 
-## Fix
+## Remaining work
 
-**Recognize** by content signature, in the openai provider alongside
-`withGeminiQuotaRetryAfter` — the established idiom for a vendor dialect. The
-signature is `503` **and** `code == "unavailable"`, which is exact rather than
-heuristic: kronk's `errs.FromSDK` has one producer for that code
-(`kronkpool.ErrServerBusy`, the busy-eviction sentinel), pinned by kronk's own
-`errs_test.go`. Prefer it over matching the message prose. No config field, no
-`provider_type`, no dialect axis — a signature needs no operator action and works
-for anyone pointing at kronk without knowing it.
+**Relay the 503 with a synthesized `Retry-After`,** per §Understudy's
+synthesized-backoff rule, rather than converting the status. opencode retries any
+5xx and honors `Retry-After` regardless of status
+([notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md)),
+so a 429 would buy nothing and would assert something untrue. Two things block it:
+`clientFacing` maps every 5xx to 502, and `errToResponse` emits the `Retry-After`
+header only for a 429. The second is not specific to this signal — injecting a
+backoff on a 5xx at all belongs to [[understudy-adaptive-coordinated-backoff]],
+which owns it; this entry needs it to land, not to define it.
 
-**Answer** the caller with a retryable response rather than holding the request:
-render as 429 with a short jittered `Retry-After`, under
-`maxPassthroughRetryAfter` so it rides the existing passthrough and opencode's
-own retry does the waiting. Understudy then holds no connection and grows no
-retry loop, and no wait budget is needed to stop a saturated backend parking
-unbounded work.
+Keep the interval under `maxPassthroughRetryAfter` so it rides the existing
+passthrough rather than tripping the reject. It is a "don't hammer" value, **not**
+an estimate of swap time — swap duration is per-GPU and per-model, and nothing can
+know it. Coverage of a long swap comes from repetition, not from sizing one delay.
+Jitter it, so concurrent requests against one backend do not retry in lockstep.
 
-The interval is a "don't hammer" value, **not** an estimate of swap time — swap
-duration is per-GPU and per-model, and nothing can know it. Coverage of a long
-swap comes from repetition, not from sizing one delay.
-
-**Exempt it from target health.** Without this the fix does nothing: the 5xx
+**Exempt it from target health.** Without this the rest does nothing: the 5xx
 still feeds the failure streak and `terminalFailure` still converts it.
 
-**Bound it** with a wall-clock budget rather than an attempt count, so a
-permanent condition degrades to the honest 503 instead of spinning. Size it
-against `maxPassthroughRetryAfter` rather than inventing a value. This also
-covers the one other producer of `code: "unavailable"` — `mid/authen.go`, when an
+**Bound it** with a wall-clock budget rather than an attempt count, so a permanent
+condition degrades to an honest terminal failure instead of spinning. Size it
+against `maxPassthroughRetryAfter` rather than inventing a value. This also covers
+the one other producer of `code: "unavailable"` — kronk's `mid/authen.go`, when an
 external auth service is down, which is persistent rather than transient.
 
 Keep genuine 5xx on the existing 502/demote path — the discriminator is
@@ -67,5 +64,4 @@ kronk's **429s** get no such treatment. `FromSDK` maps two unrelated conditions
 to `ResourceExhausted` → 429: `ErrNoCapacity` ("insufficient memory budget" — the
 model does not fit, permanent) and `ErrAdmissionTimeout` (already waited out the
 3m admission budget). Neither is a transient-busy signal, and retrying the first
-would spin forever. The existing rate-limit path is an acceptable answer for
-both. See [notes/kronk.md](../notes/kronk.md) §2.
+would spin forever. The existing rate-limit path is an acceptable answer for both.

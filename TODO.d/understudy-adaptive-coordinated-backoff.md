@@ -23,7 +23,9 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 - **Graduated injected backoff.** understudy still injects only a **fixed** 60s
   `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
   `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
-  below.
+  below. That opencode honors an understudy-injected `Retry-After`, on any
+  retryable status, is confirmed:
+  [notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md).
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
@@ -43,10 +45,7 @@ behavior). The circuit breaker is **this feature's binary degenerate** — same
 per-backend health state, tripping straight into the reject instead of dialling
 the interval up first.
 
-opencode honors an injected `Retry-After`: its bundled retry path reads
-`retry-after-ms`, falls back to `retry-after` as delta-seconds or HTTP-date, and
-treats `429/503/504/529` as retryable — so injection reaches a caller that sleeps on
-it. The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
+The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
 
 ## Mechanism
 
