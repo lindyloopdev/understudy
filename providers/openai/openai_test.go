@@ -442,9 +442,6 @@ func TestChatResponse(t *testing.T) {
 		}
 	})
 
-	// TODO: add "should leave a 503 carrying another code a generic failure" — a
-	// 503 coded e.g. "overloaded" must not match ErrServerBusy, so it keeps the
-	// ordinary 5xx path and still demotes.
 	tests.AddFunc("should report an upstream 503 coded unavailable as a busy server", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}},
 			`{"error":{"message":"server busy","code":"unavailable"}}`)
@@ -460,6 +457,25 @@ func TestChatResponse(t *testing.T) {
 					"upstream_error_type":    "server_error",
 					"upstream_error_message": "server busy",
 					"upstream_error_code":    "unavailable",
+				},
+			},
+		}
+	})
+
+	tests.AddFunc("should leave a 503 carrying another code a generic failure", func(t *testing.T) test {
+		srvURL, _ := newCapturingServer(t, http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}},
+			`{"error":{"message":"server busy","code":"overloaded"}}`)
+		return test{
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "server busy",
+			want: chatResult{
+				Status:    http.StatusServiceUnavailable,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusServiceUnavailable),
+					"upstream_error_type":    "server_error",
+					"upstream_error_message": "server busy",
+					"upstream_error_code":    "overloaded",
 				},
 			},
 		}
