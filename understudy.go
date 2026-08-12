@@ -623,9 +623,8 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 			return pick{target: t, ok: true, skipped: skipped}
 		}
 		if due := s.nextReattempt(h); now.Before(due) {
-			// When, not why: readmitAt cannot tell an upstream's terms from a bench
-			// understudy chose, so naming the cause is the demotion's job.
-			notDue := fmt.Errorf("routed around: not due until %s", due.Format(time.RFC3339))
+			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
+				due.Format(time.RFC3339), h.lastError)
 			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
 			s.noteBackendDown(logLater, id, t, h)
 			continue

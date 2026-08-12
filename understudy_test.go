@@ -2674,9 +2674,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// as an assertion failure rather than a hang.
 	// notDueUntil is the record a walk leaves for a target it stepped over: the moment
 	// it is due back, d after synctest's epoch, rendered as pickTarget renders it.
-	notDueUntil := func(d time.Duration) error {
-		return fmt.Errorf("routed around: not due until %s",
-			time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(d).Local().Format(time.RFC3339))
+	notDueUntil := func(d time.Duration, answered string) error {
+		return fmt.Errorf("routed around: not due until %s, last answered: %s",
+			time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(d).Local().Format(time.RFC3339), answered)
 	}
 
 	stall := func(r *http.Request, _ int) (*http.Response, error) {
@@ -3000,9 +3000,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/say-why-a-routed-around-target-is-out.md): "should say what a
-	// routed-around target last answered" belongs beside this case — the record names
-	// when the target returns and nothing of what it said.
 	tests.Add("should name a benched target the request routed around", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("50", "slow down")},
@@ -3014,7 +3011,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: time.Second, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{
 				Backend:       "a",
 				ModelUpstream: "ma",
-				Err:           notDueUntil(50 * time.Second), // the Retry-After the upstream named
+				Err:           notDueUntil(50*time.Second, "upstream returned status 429: slow down"),
 			}}},
 		},
 	})
@@ -3514,7 +3511,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b", wantExcluded: []Attempt{{
 				Backend:       "a",
 				ModelUpstream: "ma",
-				Err:           notDueUntil(30 * time.Second), // one recovery interval, understudy's own pacing
+				// A refusal names no moment, so the wait is one recovery interval.
+				Err: notDueUntil(30*time.Second, "upstream returned status 403: only available hosted in China and requires explicit opt in"),
 			}}},
 		},
 	})
