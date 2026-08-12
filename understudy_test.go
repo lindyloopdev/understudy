@@ -3150,6 +3150,26 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// TODO(TODO.d/understudy-server-busy-503-retryable.md): add "should start a fresh
+	// busy run once a target serves again" — a recovered backend must not stay rejected.
+	tests.Add("should reject as non-retryable once a target has been busy past the terminal threshold with nowhere to fail over", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{
+				advance:    2*time.Minute + time.Second,
+				wantStatus: http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{
+					Error:        errorDetail{Type: errTypeUpstreamUnavailable},
+					RetryAfterMS: int(maxPassthroughRetryAfter.Milliseconds()),
+				},
+			},
+		},
+	})
+
 	tests.Add("should start a fresh streak once a demotion has gone untouched past the eviction window", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},

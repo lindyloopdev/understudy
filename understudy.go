@@ -154,6 +154,11 @@ type targetHealth struct {
 	// lastTouch is when the entry was last written, the age the eviction sweep
 	// measures.
 	lastTouch time.Time
+	// busySince is when the target's current run of at-capacity answers began, or
+	// zero. It is not a failure streak — an entry carrying only this one describes
+	// a target still fit to serve — but it bounds how long the run may go on being
+	// answered with another backoff.
+	busySince time.Time
 }
 
 // healthTTL is how long a health entry may sit untouched before the
@@ -616,7 +621,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		}
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
-		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
+		// An entry with no streak is a target being tracked for something other than
+		// failure — a busy run — and is still fit to serve.
+		if !failing || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold {
 			return pick{target: t, ok: true, skipped: skipped}
 		}
 		if due := s.nextReattempt(h); now.Before(due) {
@@ -891,6 +898,24 @@ func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter tim
 	if h, owed := s.demoteFor(t, retryAfter, backends, answered); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
 	}
+}
+
+// recordBusy marks t as answering at capacity and returns when its current busy
+// run began, so a run outlasting the terminal threshold can stop being answered
+// with another backoff. The run ends when t serves a request, which drops the
+// entry.
+func (s *server) recordBusy(t Target, backends map[string]Backend) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := healthKey(t, backends)
+	now := time.Now()
+	h := s.health[id]
+	if h.busySince.IsZero() {
+		h.busySince = now
+	}
+	h.lastTouch = now
+	s.health[id] = h
+	return h.busySince
 }
 
 // failingFor reports how long t's current failure streak has run, or zero when
@@ -1552,7 +1577,7 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 				case http.StatusTooManyRequests:
 					writeRetryAfterReject(r.Context(), w, err, sig.retryAfter, errTypeUpstreamRateLimited, "upstream rate limited")
 					return
-				case http.StatusBadGateway:
+				case http.StatusBadGateway, http.StatusServiceUnavailable:
 					writeRetryAfterReject(r.Context(), w, err, sig.retryAfter, errTypeUpstreamUnavailable, "upstream unavailable")
 					return
 				}
@@ -2052,8 +2077,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				continue
 			}
 			// Nowhere to replay to: hand the client the wait instead of a verdict, so
-			// it comes back to a target that will by then have finished loading.
+			// it comes back to a target that will by then have finished loading. Past
+			// the terminal threshold it plainly is not loading, and repeating the wait
+			// would only keep the client coming back to a backend that never serves.
 			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
+			if time.Since(s.recordBusy(chosen, backend.Backends)) > s.terminalThreshold {
+				return terminalError{err}
+			}
 			return retryAfterError{error: err, at: time.Now().Add(synthesizedStallBackoff)}
 		}
 		sig := classifyLimit(err)

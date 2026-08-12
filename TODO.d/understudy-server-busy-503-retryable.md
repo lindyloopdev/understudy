@@ -14,16 +14,10 @@ in the lindy repo.
 
 ## Remaining work
 
-**Pin the health exemption with a test.** Nothing but statement order keeps the
-busy branch ahead of `recordFailure`, so a refactor can start spending the streak
-silently. Assert that a busy target accrues none.
-
-**Bound the condition** with a wall-clock budget rather than an attempt count, so
-a backend that is not swapping but broken degrades to an honest terminal failure
-instead of being told to come back forever. Size it against
-`maxPassthroughRetryAfter` rather than inventing a value. This also covers the one
-other producer of `code: "unavailable"` — kronk's `mid/authen.go`, when an external
-auth service is down, which is persistent rather than transient.
+**Pin that a busy run ends.** `busySince` clears only when the target serves a
+request and its health entry is dropped, so a refactor that stops dropping it
+would hold a target past the terminal threshold forever — a backend that recovers
+would keep being rejected. Assert a busy run resets after a success.
 
 **Jitter the interval,** so concurrent requests against one backend do not retry
 in lockstep. It stays a "don't hammer" value, **not** an estimate of swap time —
