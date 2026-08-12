@@ -2993,6 +2993,22 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should name a benched target the request routed around", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("50", "slow down")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b"},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{
+				Backend:       "a",
+				ModelUpstream: "ma",
+				Err:           errors.New("routed around: not due to be called yet"),
+			}}},
+		},
+	})
+
 	tests.Add("should show the status the walked-past target answered with", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
@@ -3485,7 +3501,11 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b", wantExcluded: []Attempt{}},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b", wantExcluded: []Attempt{{
+				Backend:       "a",
+				ModelUpstream: "ma",
+				Err:           errors.New("routed around: not due to be called yet"),
+			}}},
 		},
 	})
 

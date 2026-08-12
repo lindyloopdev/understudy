@@ -278,7 +278,6 @@ The exception is narrow. It covers the transition — this target is out, this t
 is back — and not the per-request fact that a walk routed around it. That fact is a
 skip like any other and belongs on `Excluded`, on every request that routes around
 the target, exactly as the rule above requires.
-[[record-a-benched-target-the-walk-routed-around]]
 
 **A transition is never emitted while the health map is held.** The record is decided
 under the lock and written after it, because the handler belongs to the consumer and

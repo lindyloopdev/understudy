@@ -24,6 +24,6 @@ Both outcomes of `demote`'s update path are unasserted, for all three callers:
 The second leaves the edge record naming a return moment a later bench superseded.
 [DESIGN.md §Understudy](../DESIGN.md#understudy) requires the record to say when the
 target will be tried again, so the answer is not to drop it;
-[[record-a-benched-target-the-walk-routed-around]] puts the *current* bench on every
+[[say-what-a-benched-target-is-waiting-for]] would put the *current* bench on every
 request that routes around the target, which is where an operator reading a stale edge
 would look next.
