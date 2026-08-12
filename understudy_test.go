@@ -1066,8 +1066,8 @@ func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
 }
 
 // TODO(TODO.d/degrade-past-a-misconfigured-backend.md): "should return 500 when no
-// backend configured" is the last case here that fails the listing, which reads
-// against emptiness being a valid answer whatever its cause.
+// backend configured" is the last case here that fails the listing, and it inverts:
+// zero usable backends is an empty catalog, not an error.
 func TestModels(t *testing.T) {
 	t.Parallel()
 
@@ -3162,8 +3162,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	})
 
 	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): these cases pin what the
-	// window reclaims; nothing pins what it cannot until the map has a size cap and
-	// a size a consumer can read.
+	// window reclaims. The TTL is the whole bound, and DESIGN.md does not yet say so.
 	//
 	// TODO(TODO.d/understudy-error-envelope-type.md): the refusal path takes the same
 	// sweep and re-stamp, and still no case drives it across the window, because a

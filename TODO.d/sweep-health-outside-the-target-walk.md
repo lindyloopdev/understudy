@@ -1,4 +1,4 @@
-# Bound the health map against a caller minting keys
+# State the health map's bound in DESIGN.md
 
 **Tag:** understudy / ha
 
@@ -10,20 +10,18 @@ caller named.
 
 A request naming `<backend>/<model>` directly puts a caller-supplied string in the
 health key, so the set of entries a client can mint is whatever it cares to type.
+The TTL sweep is the bound: idle entries retire, and a caller minting faster than
+`healthTTL` retires them is a hostile caller understudy does not otherwise defend
+against.
 
-- Decide whether a TTL alone is the bound. It answers the idle case but not a
-  caller minting fresh keys faster than `healthTTL` retires them; a size cap
-  answers that and needs an eviction order to go with it. The sweep is O(n) and
-  now runs on every health write, so a map a caller has inflated makes each
-  subsequent write costlier under the lock — the cap bounds latency, not just
-  memory.
-- Give the map an observable size before specifying the cap. Nothing reports how
-  many entries `s.health` holds — no metric, no control-plane read — so neither
-  the bound nor the sweep that feeds it can be stated as a behavior anyone can
-  check. A cap phrased as "evict the least-recently-touched entry once the map
-  exceeds a bound" cannot be tested against a map no consumer can see, and the
-  reason the sweep on the refusal path is untestable is the same absence.
-- State the policy in DESIGN.md, including that the sweep reclaims the whole map
-  rather than the key being written — the property the bound rests on. The
-  eviction window is a constant in the code with no design section governing it,
-  unlike the tenant registry's, which §Daemon idle eviction settles.
+- Say so in DESIGN.md, including that the sweep reclaims the whole map rather than
+  the key being written — the property the bound rests on. The eviction window is a
+  constant in the code with no design section governing it, unlike the tenant
+  registry's, which §Daemon idle eviction settles.
+
+## Out of scope
+
+- **A size cap on the map.** It would bound write latency as well as memory — the
+  sweep is O(n) under the lock on every write — but it needs an eviction order and a
+  size a consumer can read before it can be stated as a behavior anyone can check,
+  and no consumer can see the map today.

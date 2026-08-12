@@ -16,15 +16,11 @@ valid answer for the listing whatever its cause).
   status-less error yields `500` from `yerrors` if anything derives one — which has
   happened once already, green.
 
-- **Decide whether re-walking records a target again.** `pickTarget` re-walks the
-  candidate list from the start on every failover, so targets `[broken, limited,
-  good]` where `limited` fails over yield `broken, limited, broken`. The walk-log
-  reading is settled — `DESIGN.md` and the `Excluded` doc both say candidates are
-  recorded in the order they were walked, and a case pins that interleaving — but
-  nothing says whether walking past the same unusable backend twice should record it
-  twice, and no case exercises it. If it should, the field name is the problem:
-  `Excluded` reads as a set, and a set does not repeat. lindy is the only consumer
-  that could settle it, and reads none of this today.
+- **Pin that a re-walked target is recorded once per pass.** `pickTarget` re-walks
+  the candidate list from the start on every failover, so targets `[broken, limited,
+  good]` where `limited` fails over yield `broken, limited, broken`. No case
+  exercises the repeat. Say in the `Excluded` doc that a target walked past twice is
+  recorded twice — the field reads as a set, and a set does not repeat.
 
 - **A listing's failed catalog fetch reaches only the log.** The listing's two
   omission paths answer a consumer differently: a backend understudy cannot use is
@@ -32,19 +28,11 @@ valid answer for the listing whatever its cause).
   `s.logger` at ERROR and left off the record. Both are the same fact from the
   consumer's side — this backend is missing from your listing, and here is why.
 
-- **`/v1/models` with nothing configured still answers 500** (`errNoBackendConfigured`
-  on `!matched`), which reads against "emptiness is a valid answer whatever its
-  cause". Settle whether the listing may fail at all, or whether zero usable
-  backends is simply an empty catalog. Test surface: "should return 500 when no
-  backend configured". It is the sole remaining use of `errNoBackendConfigured`, so
-  retiring it retires the error too.
-
-- **Decide whether a consumer needs to tell the skip reasons apart.** `Attempt.Called`
-  separates a backend understudy never called from one it called and abandoned, but
-  the reasons within a skip — no such backend, no registered handler, no base URL —
-  are distinguishable only by reading the message, since each is unexported. Settle
-  whether that distinction is one a consumer acts on, and so whether the reasons
-  become exported sentinels and a frozen contract.
+- **Answer an empty catalog when nothing is usable.** `/v1/models` returns 500
+  (`errNoBackendConfigured` on `!matched`), against "emptiness is a valid answer
+  whatever its cause". Zero usable backends is an empty catalog, so the case
+  "should return 500 when no backend configured" inverts. It is the sole remaining
+  use of `errNoBackendConfigured`, so this retires the error too.
 
 ## Out of scope
 
@@ -54,6 +42,9 @@ valid answer for the listing whatever its cause).
 - **An unset credential under `auth = "auto"`.** The document is correct and the
   world is not supplying a key, which seeds health state rather than skipping —
   see [[auth-requirement-and-key-env-source]] and [[resolve-validate-split]].
+- **Exported sentinels for the skip reasons.** No such backend, no registered
+  handler, and no base URL all mean one thing to a consumer — this backend is
+  unusable until an operator edits config — so none becomes public API.
 - **Exposing the registered provider set** so a consumer can pre-check
   routability itself. Deliberately deferred until one needs it; a consumer can
   already enforce any rule it *can* see from its own `TokenValidator`.

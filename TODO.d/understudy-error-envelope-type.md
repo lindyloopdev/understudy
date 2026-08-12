@@ -28,9 +28,10 @@ provider's table would deepen the split rather than close it.
   `status >= 500` — so a `501` accrues a streak, demotes, and is re-probed forever
   like a `503`. §Understudy calls those statuses a standing fact, the treatment a
   refusal already gets: nothing time can clear should be waiting on time.
-- Settle the row still open: what an overloaded upstream carries once
-  `overloaded_error` stops arriving by passthrough, and whether it stays
-  distinguishable from a faulted one.
+- Add the overloaded row: an upstream that answered 503/529 exhausts as `529`
+  with type `overloaded_error`, distinct from a faulted upstream's `500`. Note
+  that `http.StatusText(529)` is empty, so anything rendering status text needs
+  its own word for it.
 - Publish it. There is no user-facing doc yet — see [[documentation]], whose
   README and library-doc restructure are where a consumer reads this.
 
