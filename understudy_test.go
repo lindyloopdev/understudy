@@ -4173,50 +4173,104 @@ func TestChatCompletionsLimiterCancelNamesTheWaitPoint(t *testing.T) {
 	})
 }
 
-func TestChatCompletionsShedsWhenProcessBudgetExhausted(t *testing.T) {
+// TestChatCompletionsProcessBudgetShed covers what a client turned away by the
+// process-wide FD budget is told. Each step is one request, advanced by the wait
+// the previous step was handed — a client doing as it was told.
+func TestChatCompletionsProcessBudgetShed(t *testing.T) {
 	t.Parallel()
 
-	synctest.Test(t, func(t *testing.T) {
-		logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	type step struct {
+		wantStatus     int
+		wantRetryAfter string
+	}
+	type test struct {
+		steps []step
+	}
 
-		// The upstream blocks so the holder keeps its process slot; with a budget of
-		// one, the next request must be shed rather than served.
-		backend := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
-			<-r.Context().Done()
-			return nil, r.Context().Err()
-		})
-		backends := map[string]Backend{
-			"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: backend}},
-		}
-		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-			return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}}}, nil
-		}}
-		// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
-		srv := New(validator, WithLogger(logger), withFDSoftLimit(66)).(*server)
+	tests := testy.NewTable[test]()
 
-		req := func(ctx context.Context) *http.Request {
-			r, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
-			if err != nil {
-				t.Fatal(err)
+	tests.Add("should turn a client away when the budget is exhausted", test{
+		steps: []step{{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"}},
+	})
+	tests.Add("should make a client wait longer the longer the budget stays full", test{
+		steps: []step{
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+		},
+	})
+
+	// TODO(TODO.d/understudy-process-budget-shed.md): add "should start the wait over
+	// once the budget has had room again" — a case needs the holder to let its slot
+	// go and a later one to take it, which the steps cannot express today.
+	// TODO(TODO.d/understudy-process-budget-shed.md): add "should not send every shed
+	// client back at the same moment". The scatter is applied here but driven only
+	// through the busy path, so dropping it here would go unnoticed.
+	tests.Add("should stop lengthening the wait once it reaches the ceiling", test{
+		steps: []step{
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+		},
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			// The upstream blocks so the holder keeps its process slot; with a budget
+			// of one, every later request must be shed rather than served.
+			backend := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			})
+			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: backend}}},
+					Models:   map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}},
+				}, nil
+			}}
+			// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
+			srv := New(validator, WithLogger(testLogger(t)), withFDSoftLimit(66)).(*server)
+			// These cases assert the advertised interval exactly; scattering it is
+			// TestChatCompletionsScattersBusyBackoff's subject.
+			srv.jitterFactor = 0
+			// The holder must keep its slot for as long as a case runs, so the stall
+			// gate must not reclaim it partway through and end the saturation.
+			srv.headerStallGate = time.Hour
+
+			req := func() *http.Request {
+				r, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.Header.Set("Authorization", "Bearer user-token")
+				r.Header.Set("Content-Type", "application/json")
+				return r
 			}
-			r.Header.Set("Authorization", "Bearer user-token")
-			r.Header.Set("Content-Type", "application/json")
-			return r
-		}
 
-		// A holder takes the single process slot and blocks in the upstream.
-		go func() { srv.ServeHTTP(httptest.NewRecorder(), req(t.Context())) }()
-		synctest.Wait()
+			go func() { srv.ServeHTTP(httptest.NewRecorder(), req()) }()
+			synctest.Wait()
 
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req(t.Context()))
+			for i, s := range tt.steps {
+				rec := httptest.NewRecorder()
+				srv.ServeHTTP(rec, req())
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
-		if got := rec.Header().Get("Retry-After"); got != "5" {
-			t.Errorf("Retry-After = %q, want %q", got, "5")
-		}
+				if rec.Code != s.wantStatus {
+					t.Errorf("step %d: status got %d, want %d", i, rec.Code, s.wantStatus)
+				}
+				if got := rec.Header().Get("Retry-After"); got != s.wantRetryAfter {
+					t.Errorf("step %d: Retry-After got %q, want %q", i, got, s.wantRetryAfter)
+				}
+
+				waited, err := strconv.Atoi(s.wantRetryAfter)
+				if err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(time.Duration(waited) * time.Second)
+				synctest.Wait()
+			}
+		})
 	})
 }
 
@@ -5048,7 +5102,7 @@ func TestUpstreamLimiterAcquire(t *testing.T) {
 // it took — the observable capacity, without reading the private limit field.
 func acquirable(l *upstreamLimiter) int {
 	n := 0
-	for l.tryAcquire() {
+	for ok, _ := l.tryAcquire(); ok; ok, _ = l.tryAcquire() {
 		n++
 	}
 	return n
@@ -5122,7 +5176,7 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 		newLimiter: func() *upstreamLimiter {
 			l := newUpstreamLimiter(4)
 			for range 4 {
-				l.tryAcquire()
+				_, _ = l.tryAcquire()
 			}
 			l.throttle() // measures a cap of 3 and records it as known-good
 			for range 4 {
@@ -5254,7 +5308,7 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 	tests.Run(t, func(t *testing.T, tt test) {
 		l := newUpstreamLimiter(tt.start)
 		for range tt.acquire {
-			if !l.tryAcquire() {
+			if ok, _ := l.tryAcquire(); !ok {
 				t.Fatal("could not fill the limiter for the throttle setup")
 			}
 		}

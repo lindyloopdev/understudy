@@ -119,10 +119,9 @@ const defaultRecoveryInterval = 30 * time.Second
 // TODO.d/understudy-adaptive-coordinated-backoff.md.
 const defaultHeaderStallGate = 20 * time.Second
 
-// synthesizedStallBackoff is the bounded Retry-After understudy synthesizes for a
-// pre-header stall, which carries none: it benches the stalled target until the
-// interval elapses. Provisional; see
-// TODO.d/understudy-adaptive-coordinated-backoff.md.
+// synthesizedStallBackoff is how long a stalled target is benched before a probe
+// may try it again — understudy's own routing, never a wait handed to a client.
+// Provisional; see TODO.d/understudy-adaptive-coordinated-backoff.md.
 const synthesizedStallBackoff = 30 * time.Second
 
 // errHeaderStall marks an upstream attempt cancelled by the header-stall gate.
@@ -197,9 +196,11 @@ const (
 	defaultFDSoftLimitFallback uint64 = 1024
 )
 
-// TODO(TODO.d/understudy-process-budget-shed.md): grow the backoff with sustained
-// saturation instead of a fixed value.
-const processBudgetRetryAfter = 5 * time.Second
+// maxShedBackoff bounds the wait a client turned away by the process budget is
+// given. Slots free as requests finish, so this is a ceiling on backpressure, not
+// a bench: left to climb, the shed would eventually park a client for longer than
+// the reject exists to prevent.
+const maxShedBackoff = 30 * time.Second
 
 // fdSlotBudget converts an FD soft limit into a process-wide concurrent-request
 // budget, floored at 1 so an unusually small limit still admits work.
@@ -272,7 +273,13 @@ type upstreamLimiter struct {
 	// successes accrue toward the next additive step, once the cap has climbed
 	// back to the known-good boundary; a full round of them raises it by one.
 	successes int
-	ready     chan struct{}
+	// saturatedSince is when the limiter last ran out of slots, timing the squeeze
+	// for a caller that sheds rather than waits. It survives a release and is
+	// cleared by the next slot tryAcquire hands out — which is soon enough, since
+	// only a failed tryAcquire reads it and the limiter cannot fill again without
+	// handing one out first.
+	saturatedSince time.Time
+	ready          chan struct{}
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
@@ -306,15 +313,22 @@ func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
 
 // tryAcquire takes a slot if one is free and reports whether it did, never
 // blocking — the non-blocking counterpart to acquire, for callers that shed
-// rather than wait when the limiter is full.
-func (l *upstreamLimiter) tryAcquire() bool {
+// rather than wait when the limiter is full. On failure it also reports how long
+// the limiter has been full, so a caller shedding can tell a passing squeeze from
+// a process that has been pegged for a while. A slot taken ends the run: the
+// limiter had room, so whatever was holding it has cleared.
+func (l *upstreamLimiter) tryAcquire() (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.inflight < l.limit {
+		l.saturatedSince = time.Time{}
 		l.inflight++
-		return true
+		return true, 0
 	}
-	return false
+	if l.saturatedSince.IsZero() {
+		l.saturatedSince = time.Now()
+	}
+	return false, time.Since(l.saturatedSince)
 }
 
 // neverRetryableError lets the response path recognize a failure no delay can
@@ -1939,8 +1953,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	// goroutines and buffered bodies the budget exists to protect, so backpressure
 	// goes to the client instead. Acquired once for the whole request, not per
 	// failover attempt, because a request holds at most one upstream connection.
-	if !s.processLimiter.tryAcquire() {
-		w.Header().Set("Retry-After", strconv.Itoa(int(processBudgetRetryAfter/time.Second)))
+	if ok, saturatedFor := s.processLimiter.tryAcquire(); !ok {
+		shedFor := min(graduatedBackoff(saturatedFor, s.jitterFactor), maxShedBackoff)
+		w.Header().Set("Retry-After", strconv.Itoa(int(shedFor.Round(time.Second)/time.Second)))
 		return yerrors.WithHTTPStatusf(http.StatusServiceUnavailable, "process FD budget exhausted (in-flight %d)", s.processLimiter.inFlight())
 	}
 	defer s.processLimiter.release()
