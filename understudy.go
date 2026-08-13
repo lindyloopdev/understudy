@@ -923,6 +923,20 @@ func (s *server) recordBusy(t Target, backends map[string]Backend) time.Time {
 	return h.busySince
 }
 
+// withSynthesizedBackoff attaches understudy's own Retry-After to a retryable
+// failure the upstream left unbounded, grown from how long t has been failing, so
+// a client backs off understudy's interval rather than its own flat one. An
+// upstream that named its own delay keeps it, and a failure repeating cannot
+// answer gets none — a backoff would only spend the client's time. A cancellation
+// is the caller's own signal travelling back out, not a failure to come back to.
+func (s *server) withSynthesizedBackoff(ctx context.Context, t Target, backends map[string]Backend, err error) error {
+	sig := classifyLimit(err)
+	if !sig.isRetryable || sig.hasRetryAfter || errors.Is(err, context.Cause(ctx)) {
+		return err
+	}
+	return retryAfterError{error: err, at: time.Now().Add(graduatedBackoff(s.failingFor(t, backends), s.jitterFactor))}
+}
+
 // failingFor reports how long t's current failure streak has run, or zero when
 // t is healthy.
 func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration {
@@ -2225,5 +2239,5 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		f.record(r.Context())
 		answer, answering = throttled.answer, throttled.target
 	}
-	return s.terminalFailure(answering, remaining, backend.Backends, answer)
+	return s.terminalFailure(answering, remaining, backend.Backends, s.withSynthesizedBackoff(r.Context(), answering, backend.Backends, answer))
 }

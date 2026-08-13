@@ -414,7 +414,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusBadGateway,
 			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -519,7 +519,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
 		}
 	})
 
@@ -564,7 +564,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusBadGateway,
 			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -594,7 +594,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
 		}
 	})
 
@@ -724,6 +724,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
 				"Content-Type": {"application/json"},
+				"Retry-After":  {"5"},
 			},
 		}
 	})
@@ -984,6 +985,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := tt.server
+		// These cases assert the advertised interval exactly; scattering it is
+		// TestChatCompletionsScattersBusyBackoff's subject.
+		srv.jitterFactor = 0
 
 		ctx := tt.ctx
 		if ctx == nil {
@@ -2758,7 +2762,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 		},
 	})
@@ -2770,7 +2774,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -2781,7 +2785,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				model:        "a/ma",
 				advance:      2*time.Minute + time.Second,
@@ -2878,7 +2882,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a", wantRetryAfter: "20"},
 		},
 	})
 
@@ -2924,7 +2928,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
@@ -2940,7 +2944,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "60"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "20"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -3013,7 +3017,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 		},
 	})
 
@@ -3082,7 +3086,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b"},
+			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20"},
 		},
 	})
 
@@ -3098,7 +3102,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{backend: "acct-c", model: "glm"},
 		},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a", wantRetryAfter: "60"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a", wantRetryAfter: "20"},
 			// acct-b is the same account+model as the demoted acct-a, so it is
 			// benched too: failover routes to the different account acct-c.
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "acct-c"},
@@ -3142,9 +3146,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBackend: "a"},
-			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
-			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBackend: "a", wantRetryAfter: "5"},
+			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b", wantRetryAfter: "5"},
+			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b", wantRetryAfter: "20"},
 		},
 	})
 
@@ -3154,12 +3158,23 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
 				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
 			},
+		},
+	})
+
+	tests.Add("should hand a client understudy's own backoff when an upstream 5xx carries none", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "10"},
 		},
 	})
 
@@ -3216,12 +3231,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
-				advance:      24*time.Hour + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantBody:     badGateway502,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				wantRetryAfter: "5",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantBody:       badGateway502,
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
 			},
 		},
 	})
@@ -3232,7 +3248,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				model:        "a/ma",
 				advance:      23 * time.Hour,
@@ -3264,13 +3280,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
-				model:        "a/ma",
-				advance:      24*time.Hour + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantBody:     badGateway502,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				model:          "a/ma",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantBody:       badGateway502,
+				wantRetryAfter: "5",
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
 			},
 		},
 	})
@@ -3314,17 +3331,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
+	tests.Add("should carry the streak's own backoff into a terminal reject the upstream left unbounded", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
-				wantEnvelope: errorEnvelope{RetryAfterMS: 120000},
+				wantEnvelope: errorEnvelope{RetryAfterMS: 80000},
 			},
 		},
 	})
@@ -3336,13 +3353,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{
-				advance:      2*time.Minute + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
-				wantBackend:  "a",
+				wantRetryAfter: "80",
+				advance:        2*time.Minute + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				wantBackend:    "a",
 			},
 		},
 	})
@@ -3380,7 +3398,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 5 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 		},
@@ -3398,7 +3416,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 			{advance: 30 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 		},
@@ -3411,8 +3429,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
-			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "10"},
 			{advance: 11 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 		},
 	})

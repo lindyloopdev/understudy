@@ -13,6 +13,7 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
+<<<<<<< HEAD
 - **Synthesize for a 5xx at all.** The synthesis branch in the response path is
   gated on `sig.isRateLimit`, which is `status == 429`, so a `5xx` that advertised
   nothing — a plain `503`, a transport failure, an Anthropic `529` — reaches the
@@ -28,6 +29,12 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   understudy-injected `Retry-After`, on any
   retryable status, is confirmed:
   [notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md).
+=======
+- **Retire the flat 60s fallback.** `errToResponse` still sets
+  `synthesizedRateLimitRetryAfter` for a 429 that reaches it carrying no
+  `Retry-After`; no chat failure does, since the handler attaches one first.
+  Delete the branch and the constant, or name the path that still needs them.
+>>>>>>> 0ef72af (Give every failing target the same graduated wait, not just a busy one)
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
