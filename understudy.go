@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"slices"
@@ -233,6 +234,9 @@ type server struct {
 	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
 	headerStallGate   time.Duration
+	// jitterFactor scatters a synthesized backoff; zero advertises the interval
+	// exactly, which only a test asserting fixed values wants.
+	jitterFactor float64
 
 	maxConcurrentPerUpstream int
 
@@ -497,6 +501,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		providers:                make(map[string]providers.Handler),
 		failoverThreshold:        defaultFailoverThreshold,
 		terminalThreshold:        maxPassthroughRetryAfter,
+		jitterFactor:             defaultJitterFactor,
 		recoveryInterval:         defaultRecoveryInterval,
 		headerStallGate:          defaultHeaderStallGate,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
@@ -1079,6 +1084,34 @@ func isAccessRefused(err error) bool {
 // target is demoted immediately so requests fail over to a fallback instead of
 // stalling on it for the length of the advertised backoff.
 const rateLimitDemotionThreshold = 30 * time.Second
+
+// graduatedBackoffBase is the first interval advertised for a condition
+// understudy cannot time — a model swap, an upstream throttle.
+const graduatedBackoffBase = 5 * time.Second
+
+// defaultJitterFactor is the fraction of an interval a scattered value may fall
+// short of it.
+const defaultJitterFactor = 0.5
+
+// graduatedBackoff returns the interval to advertise for a condition running for
+// elapsed, doubling per interval already waited out (5 → 10 → 20 → 40 …) and
+// scattered short of it by up to jitter. Elapsed rather than a retry count,
+// because the retries are the client's and understudy sees only separate
+// requests — which also means every client on one condition derives the same
+// interval, and unscattered they would return together forever. It grows for as
+// long as it is asked; the caller decides when to stop answering with a wait.
+func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
+	interval := graduatedBackoffBase
+	for remaining := elapsed; remaining >= interval; interval *= 2 {
+		remaining -= interval
+	}
+	// Downward only: returning early costs one cheap answer, while waiting past the
+	// interval delays a condition that may already have cleared. The factor stays in
+	// (1-jitter, 1], so nobody is sent back at once.
+	//nolint:gosec // G404: the scatter separates retrying clients; it is not a
+	// secret and nothing is weakened by it being predictable.
+	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
+}
 
 // synthesizedRateLimitRetryAfter is the backoff understudy advertises to the
 // client for a 429 the upstream left unbounded (no Retry-After), so the client
@@ -2081,10 +2114,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// the terminal threshold it plainly is not loading, and repeating the wait
 			// would only keep the client coming back to a backend that never serves.
 			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
-			if time.Since(s.recordBusy(chosen, backend.Backends)) > s.terminalThreshold {
+			busyFor := time.Since(s.recordBusy(chosen, backend.Backends))
+			if busyFor > s.terminalThreshold {
 				return terminalError{err}
 			}
-			return retryAfterError{error: err, at: time.Now().Add(synthesizedStallBackoff)}
+			return retryAfterError{error: err, at: time.Now().Add(graduatedBackoff(busyFor, s.jitterFactor))}
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model

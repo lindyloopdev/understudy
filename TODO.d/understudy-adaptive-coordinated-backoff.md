@@ -20,10 +20,12 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   the header, **or a 5xx**" as the case this mechanism exists for, so this is the
   coverage gap under the graduated-interval work below, not a separate feature.
 
-- **Graduated injected backoff.** understudy still injects only a **fixed** 60s
-  `synthesizedRateLimitRetryAfter`; grow the injected interval exponentially from
-  `failingSince` (5 → 10 → 20 → 40 …, jittered, reset-on-success) — the Mechanism
-  below. That opencode honors an understudy-injected `Retry-After`, on any
+- **Adopt `graduatedBackoff` on the paths still advertising a flat interval.** It
+  grows and scatters an interval from an elapsed clock, and only the at-capacity
+  path uses it; a 429 still gets the **fixed** 60s
+  `synthesizedRateLimitRetryAfter`. Key the rest on `failingSince`, which
+  `clearFailure` already clears on success. That opencode honors an
+  understudy-injected `Retry-After`, on any
   retryable status, is confirmed:
   [notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md).
 - **Pre-header stall gate — tune constants and add the coherence budget.** The

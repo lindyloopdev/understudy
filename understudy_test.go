@@ -2963,7 +2963,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":{"message":"Service Unavailable","type":"server_error"}}`, wantRetryAfter: "30"},
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":{"message":"Service Unavailable","type":"server_error"}}`, wantRetryAfter: "5"},
 		},
 	})
 
@@ -3163,9 +3163,21 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should tell a client to wait longer each time a target is still busy", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{advance: 10 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+		},
+	})
+
 	tests.Add("should start a fresh busy run once a target serves again", test{
 		backends: map[string]backendStub{
-			"a": {baseURL: "http://a/v1", apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 2 {
 					return resp(http.StatusOK, `{"id":"from-a"}`), nil
 				}
@@ -3174,9 +3186,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
-			{advance: 2*time.Minute + time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{advance: 2*time.Minute + time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
 		},
 	})
 
@@ -3186,7 +3198,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
 			{
 				advance:    2*time.Minute + time.Second,
 				wantStatus: http.StatusBadRequest,
@@ -3695,7 +3707,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
-			srv := New(validator, WithLogger(testLogger(t)))
+			srv := New(validator, WithLogger(testLogger(t))).(*server)
+			// These cases assert the advertised interval exactly; scattering it is
+			// TestGraduatedBackoff's subject.
+			srv.jitterFactor = 0
 
 			for i, s := range tt.steps {
 				if s.advance > 0 {
@@ -5109,6 +5124,59 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 			t.Errorf("acquirable slots: got %d, want %d", got, tt.wantSlots)
 		}
 	})
+}
+
+// TestChatCompletionsScattersBusyBackoff verifies clients waiting on one busy
+// backend are not all told to return at the same instant. Every client at the
+// same moment derives its interval from one shared clock, so an unscattered
+// backoff would send them back together — and again, and again.
+func TestChatCompletionsScattersBusyBackoff(t *testing.T) {
+	t.Parallel()
+
+	client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return &BackendConfig{
+			Backends: map[string]Backend{"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: client}}},
+			Models:   map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}},
+		}, nil
+	}}
+	srv := New(validator, WithLogger(testLogger(t)))
+
+	told := make(map[int]struct{})
+	for range 20 {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer user-token")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+
+		wait, err := strconv.Atoi(rr.Header().Get("Retry-After"))
+		if err != nil {
+			t.Fatalf("client was told to return after %q: %v", rr.Header().Get("Retry-After"), err)
+		}
+		told[wait] = struct{}{}
+	}
+
+	// Scattering a 5s interval may shorten a client's wait but never lengthen it:
+	// below 1s sends it back at once, past 5s makes it sit out a swap that may
+	// already have finished.
+	for wait := range told {
+		if hi := int(graduatedBackoffBase / time.Second); wait < 1 || wait > hi {
+			t.Errorf("client was told to return after %ds, outside the 1-%ds a scattered interval may span", wait, hi)
+		}
+	}
+	if len(told) < 2 {
+		t.Errorf("every client was told to return after %v; they will come back in lockstep", told)
+	}
 }
 
 func TestUpstreamLimiterThrottle(t *testing.T) {
