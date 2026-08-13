@@ -24,28 +24,36 @@ A later run of seventeen beats crossed no targets and saw no such failure. The
 crossing mechanism fires regularly: z-ai answered 11 `429`s in five minutes, and each
 one falls the walk through to `deepseek`, last in that pool.
 
-**Settle the cause before building.** The message says a `reasoning_content` the API
-emitted was not returned — not that every assistant turn needs one. Three candidates:
+The trigger, measured against both upstreams 2026-08-12: DeepSeek in thinking mode
+rejects an assistant turn that carries `tool_calls` without `reasoning_content`, and
+that rejection alone reproduces the message verbatim. An assistant turn with ordinary
+content and no `reasoning_content` offends neither upstream, z-ai accepts a tool-call
+turn either way, and `thinking:{"type":"disabled"}` is honored by z-ai and by DeepSeek
+— on DeepSeek it also makes the offending history succeed. A tool-using beat is
+therefore the whole exposure: turns authored under `?thinking=false` carry no
+`reasoning_content`, and the first one that falls through to DeepSeek fails.
 
-- The crossing, as above.
-- The caller never echoes `reasoning_content`, and understudy only supplied the
-  occasion. One probe covers both: does a two-turn single-target DeepSeek conversation
-  through the same caller succeed? If it fails, delete this entry.
-- `?thinking=false` might be a no-op against z-ai — unverified there, but measured as
-  one against kronk in [[understudy-thinking-disable-llamacpp]], which injects the same
-  Anthropic shape. If z-ai ignores it too, GLM was thinking throughout and is the one
-  complaining. Probe: count reasoning tokens with `thinking:{"type":"disabled"}` set.
+A surplus `reasoning_content` is accepted by both upstreams with thinking disabled, so
+only the missing direction needs answering.
 
-If the crossing is the cause, three fixes, cheapest first:
+Whatever lands must not inject `thinking` blindly: Google's OpenAI-compatible endpoint
+answers `400 Unknown name "thinking": Cannot find field`, and it is first in the
+`review-standard` pool. Deciding *when* to disable needs only the history in the
+request; deciding *where the field is safe* needs a target's disposition, which
+understudy cannot know — config declares an override, never a model's default.
 
-- **Match the target to the history.** understudy already normalizes a body per
-  target; decide the mode from what the history *is*. Needs no session identity, so it
-  is the only one testable per request — but it overrides a per-model economic choice,
-  and covers only the direction where the field is missing.
+Three fixes:
+
+- **Retry on the upstream's own complaint.** The 400 names the problem and proves the
+  target understands thinking mode, so the field is safe to inject into that target
+  and no other. Needs no session identity and no disposition table; costs one spent
+  request per crossing, the same class of cost as the walk.
+- **Match the target to the history.** Disable thinking on a target whose history
+  carries a tool-call turn without `reasoning_content`. Testable per request, but it
+  overrides a per-model economic choice and cannot be applied to a target that rejects
+  the field.
 - **Bind a conversation to its target.** The session identity already staged for
   affinity, arriving earlier and for a harder reason.
-- **Strip on the way out.** Costs the byte-faithfulness the rewrite path is built
-  around, and is needed only if a surplus `reasoning_content` also offends.
 
 A pool whose targets agree about thinking would stop the symptom and is not the fix:
 thinking is a per-target economic call — enable where it is cheap, disable on a model

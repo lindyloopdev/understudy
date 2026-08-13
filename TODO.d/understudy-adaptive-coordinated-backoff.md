@@ -43,10 +43,10 @@ behavior). The circuit breaker is **this feature's binary degenerate** — same
 per-backend health state, tripping straight into the reject instead of dialling
 the interval up first.
 
-**Unresolved (v1 rung):** the **graduated** injected-backoff assumes opencode
-honors an understudy-*injected* `Retry-After` on a retryable response — still
-unconfirmed (the 2026-07-03 repro drove only the plain 502 storm, not injection).
-The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
+opencode honors an injected `Retry-After`: its bundled retry path reads
+`retry-after-ms`, falls back to `retry-after` as delta-seconds or HTTP-date, and
+treats `429/503/504/529` as retryable — so injection reaches a caller that sleeps on
+it. The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
 
 ## Mechanism
 
