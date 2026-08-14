@@ -672,9 +672,42 @@ gate it, both staged:
   OpenAI-compat call — understudy sees only the bearer token and the body. So the
   key is **inferred from the payload**: a hash of the invariant leading messages
   (system + first user turn), which is also exactly what prompt-cache coherence
-  keys on. **Feasibility-spike first** — confirm the leading-prefix hash stays
-  stable across a real session's turns (and how often context compaction breaks
-  it) before building on it.
+  keys on.
+
+  **A binding is a short-lived hint, not a lease.** It is worth holding only while
+  a conversation is turning, and there is no end-of-conversation signal on the
+  wire, so it is refreshed by use and expires on idle. Its lifetime tracks the
+  provider's prefix cache: once that has expired, staying on the target buys
+  nothing. Turns within a beat are seconds apart and separate runs are minutes or
+  hours apart, so an idle expiry scopes a binding to an active conversation
+  without understudy knowing what a conversation is — and bounds the map, since an
+  idle binding is worthless by construction rather than merely old.
+
+  **Compaction releases the binding, and should.** A compacted session continues
+  as a summary plus a recent window, so the first user turn stops being sent and
+  the key changes. That is the mechanism agreeing with the policy: the cache it
+  was preserving is cold on every target at that moment, making a compaction the
+  cheapest point to re-balance. A caller-supplied identifier would hold the
+  conversation past that point and need an explicit release to match. What
+  compaction does *not* clear is wire-format compatibility — the preserved window
+  still carries turns shaped for the target that authored them
+  ([[keep-a-conversation-on-one-thinking-mode]]).
+
+  **Concurrency on a key is the tell that it has collided.** A conversation is
+  serial: the caller cannot send a turn until the last one answers. So a key with
+  two requests in flight at once is not one conversation, whatever caused it, and
+  the later arrival takes the normal walk. This is what keeps the mechanism
+  degrading quietly rather than wrongly, because its discrimination rests on
+  caller properties understudy cannot see: distinct charters per reviewer, and
+  distinguishing content in the first user turn rather than in a tool result.
+
+  **Feasibility-spike first** — confirm the leading-prefix hash stays stable
+  across a real session's turns before building on it. Read from the shipped
+  opencode bundle (2026-08-14): compaction is a session message carrying a
+  summary, cut at a user-message boundary against a `preserve_recent_tokens`
+  budget. Still unconfirmed on the wire: that the preserved window carries raw
+  tool-call turns, and what the `ModelSwitched`/`AgentSwitched` message types mean
+  for a conversation whose model the caller changes itself.
 - **A capacity model.** To admit some and shed the rest, understudy must know how
   much of the scarce backend is free — the RPM budget from the `QuotaFailure`
   signal, plus the concurrency-limiter slots. This is a **priority-aware
