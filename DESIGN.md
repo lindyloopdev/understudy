@@ -629,8 +629,8 @@ longer for):
   (*Synthesized backoff* above). So the request goes to the next untried target
   rather than becoming an error the caller cannot act on. Demotion stays the separate
   question: a bare 429 is a capacity measurement (§Concurrency & Rate Limiting),
-  so the target keeps its place in the walk. Not yet held — the walk surfaces the
-  429 instead, [[fail-over-from-a-bare-429]].
+  so the target keeps its place in the walk. A 429 that *did* name a short delay
+  is the open half — [[fail-over-from-a-bare-429]].
 - **≤ wait budget → wait in place.** Sleep out the throttle and retry the *same*
   target; the client sees a slow success, never the 429, and the preferred model
   (its prompt cache, its coherence) is preserved. *(Staged — the transient-absorb
@@ -844,8 +844,8 @@ status, so a row reads as the rule it follows.
 target.** Relaying the final failure makes the answer depend on list order: with
 `[a: 429 for 60s, b: 401]` a caller would be told to escalate a standing refusal,
 when `a` is merely throttled and will serve once its delay elapses. Only a sustained
-`429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
-falls — so it would be the last candidate whose answer a client sees. The verdict is
+or bare `429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk
+where it falls — so it would be the last candidate whose answer a client sees. The verdict is
 instead the **most optimistic** disposition among the candidates the request had —
 including one it declined to call, because a target benched until a known time is
 as time-bound as a disposition gets.

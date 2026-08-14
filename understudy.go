@@ -1964,8 +1964,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
-	// throttled is the candidate the walk failed over from under a timed backoff; the
-	// answer is judged against whichever target it came from.
+	// throttled is the soonest candidate the walk replayed past — the delay the
+	// request can still come back to.
 	// TODO(TODO.d/weigh-every-candidates-contribution.md)
 	var throttled *failedAttempt
 	var lastFailure *failedAttempt
@@ -2181,6 +2181,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		if err != nil {
+			// Wrapping here, not at the return, is what puts every candidate on one
+			// scale for the verdict below: a delay either sent or synthesized.
+			err = s.withSynthesizedBackoff(ctx, chosen, backend.Backends, err)
 			failed := failedAttempt{
 				answer:        clientFacing(ctx, err),
 				raw:           err,
@@ -2188,16 +2191,17 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				backend:       parsedBackendName,
 				upstreamModel: upstreamModel,
 			}
-			// A sustainedRate 429 or refused access has just demoted chosen
-			// above; if another target has not yet been tried this request, replay it
-			// there rather than surface the refusal to the client.
-			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
+			// A sustainedRate 429 or refused access has just demoted chosen above; a
+			// bare 429 names no wait a client could sit out. Either way an untried
+			// target beats surfacing the failure, and a bare 429 costs chosen only
+			// its turn in this walk.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == bareRateLimit || isAccessRefused(err)) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains
 				// as of now.
-				if sig.condition == sustainedRate && sig.hasRetryAfter &&
-					(throttled == nil || sig.retryAfter < classifyLimit(throttled.raw).retryAfter) {
+				if w := classifyLimit(failed.raw); w.hasRetryAfter &&
+					(throttled == nil || w.retryAfter < classifyLimit(throttled.raw).retryAfter) {
 					throttled = &failed
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
