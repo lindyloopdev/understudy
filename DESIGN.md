@@ -502,8 +502,10 @@ retry-control for the agent) from envelope `type` (the reason for lindy, e.g.
 failure carrying **no** `Retry-After` — a 429 without the header, or a 5xx — is
 not relayed raw either. Unhandled, opencode hammers rapid retries at a failing
 upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** a
-`Retry-After` and injects it while preserving the retryable status, so opencode
-backs off *understudy's* interval instead of its flat 30s. Only the `429` half is
+`Retry-After` and injects it while preserving the retryable status, so a client
+backs off *understudy's* interval instead of its own. opencode's agent turn is
+not such a client — it calls the SDK with `maxRetries: 0` and makes one attempt,
+so nothing injected reaches it — [[fail-over-from-an-unsignalled-429]]. Only the `429` half is
 built: a `5xx` advertising nothing still reaches the client bare, and the injected
 interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
 interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is

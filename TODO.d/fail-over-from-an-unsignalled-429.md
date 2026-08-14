@@ -14,6 +14,9 @@ demote or fail over, on the premise that the client waits the advertised
 - opencode's agent turn runs at `maxRetries: input.retries ?? 0`
   (`session/llm.ts:309` at v1.15.13); the agent path passes no `retries`, so the
   AI SDK makes exactly one attempt. Only title generation sets `retries: 2`.
+  Confirmed 2026-08-14 in the shipped bundle, where the SDK's own helper defaults
+  to 2 only when the value is null, so an explicit `0` never reaches its delay
+  logic — [notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md).
 - lindy's own `beat.RetryTransient` returns immediately for any status in
   `[400,500)`, so 429 is terminal above opencode too.
 

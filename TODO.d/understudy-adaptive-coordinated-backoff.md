@@ -13,28 +13,17 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
-<<<<<<< HEAD
-- **Synthesize for a 5xx at all.** The synthesis branch in the response path is
-  gated on `sig.isRateLimit`, which is `status == 429`, so a `5xx` that advertised
-  nothing — a plain `503`, a transport failure, an Anthropic `529` — reaches the
-  client as a bare `502` with no backoff signal. §Understudy names "a 429 without
-  the header, **or a 5xx**" as the case this mechanism exists for, so this is the
-  coverage gap under the graduated-interval work below, not a separate feature.
-
-- **Adopt `graduatedBackoff` on the paths still advertising a flat interval.** It
-  grows and scatters an interval from an elapsed clock, and only the at-capacity
-  path uses it; a 429 still gets the **fixed** 60s
-  `synthesizedRateLimitRetryAfter`. Key the rest on `failingSince`, which
-  `clearFailure` already clears on success. That opencode honors an
-  understudy-injected `Retry-After`, on any
-  retryable status, is confirmed:
-  [notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md](../notes/2026-08-12-opencode-retries-any-5xx-and-honors-retry-after.md).
-=======
 - **Retire the flat 60s fallback.** `errToResponse` still sets
   `synthesizedRateLimitRetryAfter` for a 429 that reaches it carrying no
   `Retry-After`; no chat failure does, since the handler attaches one first.
   Delete the branch and the constant, or name the path that still needs them.
->>>>>>> 0ef72af (Give every failing target the same graduated wait, not just a busy one)
+- **Settle who reads the interval.** opencode's agent turn calls the AI SDK with
+  `maxRetries: a.retries ?? 0` and passes no `retries`, so it makes one attempt
+  and never consults a `Retry-After` — only title generation sets `retries: 2`.
+  Every rung of this ladder assumes a client that waits, so name the consumer
+  that does or the interval is written to nobody
+  ([[fail-over-from-an-unsignalled-429]] measures the cost: 25 dead reviewers in
+  one run).
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
@@ -59,8 +48,9 @@ The lindy-side [[review-beat-idle-timeout]] is a coarse stopgap this supersedes.
 ## Mechanism
 
 For a retryable failure that carries **no upstream `Retry-After`** (a 429 with no
-header, or a 5xx), opencode self-caps its backoff at a flat
-`RETRY_MAX_DELAY_NO_HEADERS = 30s` and retries with no ceiling. understudy
+header, or a 5xx), a client whose retry loop runs self-caps its backoff at a flat
+`RETRY_MAX_DELAY_NO_HEADERS = 30s` and retries with no ceiling — which opencode's
+agent turn is not, per the bullet above. understudy
 **synthesizes** its own `Retry-After` and injects it on the response (keeping the
 retryable status), so opencode sleeps *understudy's* interval instead of its flat
 30s. It tracks the per-`(backend, model)` failing streak (`failingSince`, a
