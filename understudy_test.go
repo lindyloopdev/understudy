@@ -3163,6 +3163,30 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	// reasoningErrorMessage is DeepSeek's verdict on a history whose assistant turns
+	// carry no reasoning_content — the prose the walk matches on.
+	const reasoningErrorMessage = `The reasoning_content in the thinking mode must be passed back to the API`
+
+	tests.Add("should serve from the next target when one rejects the request's history", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, reasoningErrorMessage))},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusBadRequest, Err: fmt.Errorf("upstream returned status 400: %s", reasoningErrorMessage), Called: true}},
+			},
+			// The rejection cost a its turn, not its health: it still leads the
+			// walk and is called again, still leaving b to serve.
+			{
+				advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusBadRequest, Err: fmt.Errorf("upstream returned status 400: %s", reasoningErrorMessage), Called: true}},
+			},
+		},
+	})
+
 	tests.Add("should route to the last target when all are failing", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
