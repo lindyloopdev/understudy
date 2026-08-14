@@ -844,8 +844,8 @@ status, so a row reads as the rule it follows.
 target.** Relaying the final failure makes the answer depend on list order: with
 `[a: 429 for 60s, b: 401]` a caller would be told to escalate a standing refusal,
 when `a` is merely throttled and will serve once its delay elapses. Only a sustained
-or bare `429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk
-where it falls — so it would be the last candidate whose answer a client sees. The verdict is
+or bare `429`, a refusal, a stall, or a history the target cannot accept replays at
+all — a plain `5xx` ends the walk where it falls — so it would be the last candidate whose answer a client sees. The verdict is
 instead the **most optimistic** disposition among the candidates the request had —
 including one it declined to call, because a target benched until a known time is
 as time-bound as a disposition gets.
@@ -860,6 +860,7 @@ break by judgement:
 | stalled before its header | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
 | refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
+| rejected the request's history | nothing; no delay will make it serve this conversation |
 | answered a `5xx` no retry can help | nothing |
 | was unusable as configured | nothing; only a config change clears it |
 
@@ -869,6 +870,16 @@ bench's remaining time. Answering in the shape of whichever failure happened to 
 the walk would tell a client to stop and to retry in the same breath. A verdict with
 no contribution at all is the stop. Not every row is weighed yet —
 [[weigh-every-candidates-contribution]].
+
+**A target that cannot serve *this* conversation is routed around, not adapted.**
+DeepSeek requires `reasoning_content` on an assistant turn carrying `tool_calls`,
+which a history authored under `?thinking=false` lacks. That says nothing about the
+target's health, so the walk replays onto the next untried candidate and leaves its
+health alone. It does not rewrite the body to suit: disabling a thinking mode the
+operator configured substitutes a capability nobody declared, and that judgment
+belongs to whoever composed the list ([[understudy-scope]]). The rejection recurs for
+every request of that conversation, so it reaches the operator on `Excluded` like any
+other skip, never understudy's own log.
 
 Optimism is the cheaper error. Guessing retryable when nothing will recover costs
 one more failed request; guessing terminal when something would have recovered

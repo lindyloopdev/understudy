@@ -36,24 +36,12 @@ therefore the whole exposure: turns authored under `?thinking=false` carry no
 A surplus `reasoning_content` is accepted by both upstreams with thinking disabled, so
 only the missing direction needs answering.
 
-**Understudy must not answer this by rewriting the body.** Disabling thinking on a
-target the operator configured with it substitutes a capability nobody declared —
-[[understudy-scope]]'s dividing line: understudy executes a list of concrete targets
-and never picks one, so a substitution belongs to whoever composed the list. Injecting
-`thinking` blindly is unsafe besides: Google's OpenAI-compatible endpoint answers
-`400 Unknown name "thinking": Cannot find field`, and it is first in the
-`review-standard` pool.
+Injecting `thinking` is not an option for the remaining work either: Google's
+OpenAI-compatible endpoint answers `400 Unknown name "thinking": Cannot find field`,
+and it is first in the `review-standard` pool.
 
 ## Work
 
-- **Route around the target that rejects the history.** Treat the rejection as *this
-  target cannot serve this conversation* — not a health verdict, not a body to fix —
-  and replay onto the next untried candidate, the shape `isAccessRefused` already has
-  in the walk's replay branch. The target keeps its place and its health.
-- **Say so where an operator will see it.** The rejection is the only signal that a
-  pool holds an incompatible pair, so it belongs on `Excluded` with its reason and in
-  the log at ERROR. What an operator does with it — `?thinking=false` on that target,
-  or a different pool order — stays their call.
 - **Bind a conversation to its target**, which is the fix rather than the guard:
   routing around only helps while something compatible remains. DESIGN
   §Affinity and admission stages this behind two dependencies, but only *admission*
