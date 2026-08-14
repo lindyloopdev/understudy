@@ -36,24 +36,30 @@ therefore the whole exposure: turns authored under `?thinking=false` carry no
 A surplus `reasoning_content` is accepted by both upstreams with thinking disabled, so
 only the missing direction needs answering.
 
-Whatever lands must not inject `thinking` blindly: Google's OpenAI-compatible endpoint
-answers `400 Unknown name "thinking": Cannot find field`, and it is first in the
-`review-standard` pool. Deciding *when* to disable needs only the history in the
-request; deciding *where the field is safe* needs a target's disposition, which
-understudy cannot know — config declares an override, never a model's default.
+**Understudy must not answer this by rewriting the body.** Disabling thinking on a
+target the operator configured with it substitutes a capability nobody declared —
+[[understudy-scope]]'s dividing line: understudy executes a list of concrete targets
+and never picks one, so a substitution belongs to whoever composed the list. Injecting
+`thinking` blindly is unsafe besides: Google's OpenAI-compatible endpoint answers
+`400 Unknown name "thinking": Cannot find field`, and it is first in the
+`review-standard` pool.
 
-Three fixes:
+## Work
 
-- **Retry on the upstream's own complaint.** The 400 names the problem and proves the
-  target understands thinking mode, so the field is safe to inject into that target
-  and no other. Needs no session identity and no disposition table; costs one spent
-  request per crossing, the same class of cost as the walk.
-- **Match the target to the history.** Disable thinking on a target whose history
-  carries a tool-call turn without `reasoning_content`. Testable per request, but it
-  overrides a per-model economic choice and cannot be applied to a target that rejects
-  the field.
-- **Bind a conversation to its target.** The session identity already staged for
-  affinity, arriving earlier and for a harder reason.
+- **Route around the target that rejects the history.** Treat the rejection as *this
+  target cannot serve this conversation* — not a health verdict, not a body to fix —
+  and replay onto the next untried candidate, the shape `isAccessRefused` already has
+  in the walk's replay branch. The target keeps its place and its health.
+- **Say so where an operator will see it.** The rejection is the only signal that a
+  pool holds an incompatible pair, so it belongs on `Excluded` with its reason and in
+  the log at ERROR. What an operator does with it — `?thinking=false` on that target,
+  or a different pool order — stays their call.
+- **Bind a conversation to its target**, which is the fix rather than the guard:
+  routing around only helps while something compatible remains. DESIGN
+  §Affinity and admission stages this behind two dependencies, but only *admission*
+  needs the capacity model — binding needs the session-identity half alone (the
+  leading-prefix hash, feasibility-spike first). This case argues for splitting that
+  dependency rather than waiting for both.
 
 A pool whose targets agree about thinking would stop the symptom and is not the fix:
 thinking is a per-target economic call — enable where it is cheap, disable on a model
