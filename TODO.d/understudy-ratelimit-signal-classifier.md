@@ -26,9 +26,9 @@ was prose-only — so the prose parse is kept as the resilient fallback. See
   signal present. Handles the ~80% of conforming providers, and unknown/new
   providers gracefully.
 - A **thin per-host override** layer supplies only what the engine can't infer —
-  e.g. z.ai's "the body/headers are useless, so for a *signal-less* 429 fall back
-  to the in-flight heuristic." The in-flight heuristic is thus a **per-host
-  opt-in**, NOT a universal rule.
+  e.g. z.ai answers a 429 with no `Retry-After` and no rate-limit headers at all,
+  so nothing in the response says which class it is or when it clears. Whatever an
+  override supplies there is a **per-host opt-in**, NOT a universal rule.
 - Overrides live in **config** (per-backend in the resolved understudy config),
   with code defaults — riding the per-session-config / daemon direction
   ([[understudy-shared-daemon-subserver]]), so a new provider is a config entry,
@@ -40,8 +40,8 @@ Classification lives in one place — `classifyLimit(err) limitClassification`
 (`understudy.go`), carrying `hasRetryAfter`/`retryAfter`/`shouldReject` plus a
 `condition` (`limitCondition`). `errToResponse` reads the reject/forward/
 synthesize fields; `chatCompletions` throttles the cap on the signal-less
-condition and derives the demote from the `condition` plus the limiter's
-in-flight count. The remaining work extends this seam.
+condition and derives the demote from the `condition`. The remaining work extends
+this seam.
 
 ## Build path
 

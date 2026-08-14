@@ -519,7 +519,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -594,7 +594,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -2767,6 +2767,30 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should attempt the same target again after a 429 with no Retry-After", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "5"},
+			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "5"},
+		},
+	})
+
+	tests.Add("should fail over from a target whose 429s with no Retry-After outlast the failover threshold", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "5"},
+			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
 	tests.Add("should route a logical model around an account a directly-named reference demoted", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
@@ -2937,18 +2961,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should demote a target on a 429 with no Retry-After", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
-			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "20"},
-			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-		},
-	})
-
 	tests.Add("should fail over within the request when a target stalls before its response header", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
@@ -3092,7 +3104,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	tests.Add("should bench a sibling backend sharing an account and model when one is demoted", test{
 		backends: map[string]backendStub{
-			"acct-a": {baseURL: mustParseURL(t, "http://shared/v1"), apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"acct-a": {baseURL: mustParseURL(t, "http://shared/v1"), apiKey: "sk-shared", resp: throttling("120", "slow down")},
 			"acct-b": {baseURL: mustParseURL(t, "http://shared/v1"), apiKey: "sk-shared", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
 			"acct-c": {baseURL: mustParseURL(t, "http://other/v1"), apiKey: "sk-other", resp: always(http.StatusOK, `{"id":"from-c"}`)},
 		},
@@ -3102,9 +3114,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{backend: "acct-c", model: "glm"},
 		},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a", wantRetryAfter: "20"},
 			// acct-b is the same account+model as the demoted acct-a, so it is
 			// benched too: failover routes to the different account acct-c.
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "acct-c"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "acct-c"},
 		},
 	})

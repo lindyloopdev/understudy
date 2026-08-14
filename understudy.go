@@ -1164,8 +1164,7 @@ const (
 	sustainedRate
 	// signalless is a 429 with no Retry-After — the ambiguous, unsignalled case
 	// (z.ai-shaped): it may be concurrency or an exhausted quota. It throttles the
-	// cap (see throttle); whether it also demotes turns on the in-flight count (see
-	// chatCompletions).
+	// cap (see throttle) and accrues a streak, but never demotes on its own.
 	signalless
 )
 
@@ -2163,15 +2162,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		case sig.condition == signalless:
 			lim.throttle()
 		}
-		// A signal-less 429 is ambiguous — a concurrency limit or an exhausted quota —
-		// and we see only this process's in-flight, not the account's global load.
-		// With others in flight here, concurrency is plausible: shrink (a cheap,
-		// reversible throttle) and stay in rotation rather than fail over. Arriving
-		// locally alone makes concurrency less likely — not ruled out, since other
-		// lindy instances share the account's limit (until a shared understudy sees
-		// the aggregate) — so lean toward demoting.
-		demote := sig.condition == sustainedRate ||
-			(sig.condition == signalless && lim.inFlight() <= 1)
+		// A signal-less 429 measures capacity, not health: the cap above has already
+		// come down to what the account allows, so only a streak outlasting the
+		// failover threshold redirects.
+		demote := sig.condition == sustainedRate
 		if chosen.backend != "" {
 			switch {
 			case err == nil:
@@ -2180,8 +2174,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
 			case demote || isAccessRefused(err):
 				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
-			// A recurring transient 429 accrues the streak so a brief-throttle storm eventually redirects; the Retry-After is honored for the client wait in the response path.
-			case sig.condition == transientRate || isFatalUpstream(err):
+			// None of these demotes. A transient 429's Retry-After is still honored
+			// for the client wait in the response path.
+			case sig.condition == transientRate || sig.condition == signalless || isFatalUpstream(err):
 				s.recordFailure(chosen, backend.Backends, err)
 			}
 		}
