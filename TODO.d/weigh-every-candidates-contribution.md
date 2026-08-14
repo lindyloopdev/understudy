@@ -22,7 +22,7 @@ is also computable. The rows below are blocked on each other, not independent:
   ignores health, so any replay calls the benched candidate anyway. Measured: with
   `[a benched, b: 401]` the walk calls `a`, so "declined to call" is far rarer than
   §Understudy implies.
-- A **plain `5xx`** and a **`429` advertising nothing** offer that endpoint's
+- A **plain `5xx`** and a **`429` with no delay** offer that endpoint's
   synthesized interval, which does not exist — [[understudy-adaptive-coordinated-backoff]].
   This blocks the bench row: the walk that leaves a bench uncalled usually ends on a
   `5xx`, so the comparison has nothing to weigh the bench against.

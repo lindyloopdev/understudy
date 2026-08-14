@@ -523,7 +523,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should not relay a delay advertised by a failure no retry can help", func(t *testing.T) test {
+	tests.AddFunc("should not relay a delay sent by a failure no retry can help", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
 				return &http.Response{
@@ -538,7 +538,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should not reject on a long delay advertised by a failure no retry can help", func(t *testing.T) test {
+	tests.AddFunc("should not reject on a long delay sent by a failure no retry can help", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
 				return &http.Response{
@@ -568,7 +568,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should relay a 503's advertised Retry-After on the 502 it answers with", func(t *testing.T) test {
+	tests.AddFunc("should relay the Retry-After a 503 sent on the 502 it answers with", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
 				return &http.Response{
@@ -985,7 +985,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := tt.server
-		// These cases assert the advertised interval exactly; scattering it is
+		// These cases assert the interval exactly; scattering it is
 		// TestChatCompletionsScattersBusyBackoff's subject.
 		srv.jitterFactor = 0
 
@@ -2730,7 +2730,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		// is one this case's behavior does not name.
 		wantEnvelope errorEnvelope
 		// wantRetryAfter is the backoff the client is handed; empty asserts that no
-		// backoff was advertised.
+		// backoff was sent.
 		wantRetryAfter string
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
@@ -2831,7 +2831,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		}
 	}
 
-	tests.Add("should route a logical model around an account a directly-named reference benched, until the advertised time elapses", test{
+	tests.Add("should route a logical model around an account a directly-named reference benched, until that time elapses", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: recovering(throttling("60", "slow down"))},
 			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -2926,7 +2926,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): the case below
+	// TODO(TODO.d/honor-an-upstream-backoff-with-nothing-left.md): the case below
 	// pins the fallback serving a target before the moment its upstream named.
 
 	tests.Add("should serve from a benched candidate rather than answer for an unusable one that sorts after it", test{
@@ -3377,7 +3377,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should advertise the upstream's own backoff when the reject is terminal", test{
+	tests.Add("should send the upstream's own backoff when the reject is terminal", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
@@ -3584,7 +3584,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should weigh what remains of each throttle, not what each advertised", test{
+	tests.Add("should weigh what remains of each throttle, not what each first named", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("40", "back in forty")},
 			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, call int) (*http.Response, error) {
@@ -3738,7 +3738,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
 			srv := New(validator, WithLogger(testLogger(t))).(*server)
-			// These cases assert the advertised interval exactly; scattering it is
+			// These cases assert the interval exactly; scattering it is
 			// TestGraduatedBackoff's subject.
 			srv.jitterFactor = 0
 
@@ -4024,7 +4024,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 0,
 	})
-	tests.Add("should say an upstream's advertised backoff holds a target back", test{
+	tests.Add("should say an upstream's own backoff holds a target back", test{
 		aBody:   badGateway,
 		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
@@ -4244,7 +4244,7 @@ func TestChatCompletionsProcessBudgetShed(t *testing.T) {
 			}}
 			// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
 			srv := New(validator, WithLogger(testLogger(t)), withFDSoftLimit(66)).(*server)
-			// These cases assert the advertised interval exactly; scattering it is
+			// These cases assert the interval exactly; scattering it is
 			// TestChatCompletionsScattersBusyBackoff's subject.
 			srv.jitterFactor = 0
 			// The holder must keep its slot for as long as a case runs, so the stall

@@ -8,7 +8,7 @@ ladder and the failover walk the replay branch reads.
 — the wait-vs-failover policy this entry disputes for the unsignalled case.
 
 `signalless` and `transientRate` both answer the client a `429` and decline to
-demote or fail over, on the premise that the client waits the advertised
+demote or fail over, on the premise that the client waits the
 `Retry-After` out. Measured in the consumer, nothing does:
 
 - opencode's agent turn runs at `maxRetries: input.retries ?? 0`
@@ -20,13 +20,13 @@ demote or fail over, on the premise that the client waits the advertised
 - lindy's own `beat.RetryTransient` returns immediately for any status in
   `[400,500)`, so 429 is terminal above opencode too.
 
-So the advertised backoff is written to a reader that does not exist, and the
+So the backoff is written to a reader that does not exist, and the
 request dies on a target understudy has judged healthy and kept in service.
 
 Measured 2026-08-11 in lindy: one `review-examine` run lost 25 requests this way,
 each a dead reviewer, while untried targets remained in the logical model. The
 responses carried `retry-after: 60` — `synthesizedRateLimitRetryAfter` exactly —
-so the upstream advertised nothing and the condition was `signalless`, the
+so the upstream sent nothing and the condition was `signalless`, the
 degenerate z.ai case [[understudy-ratelimit-signal-classifier]] describes.
 `transientRate` shares the premise and the same fate, but is not what production
 hit.
@@ -38,7 +38,7 @@ hit.
   unsignalled limit — most likely a concurrency ceiling — another target is the
   answer, and the walk already knows which are untried.
 - Decide `transientRate` on the same question rather than by analogy: a genuinely
-  brief advertised throttle may still be worth waiting *if* something waits. As
+  brief throttle it named may still be worth waiting *if* something waits. As
   long as nothing does, surfacing it is a lost request too.
 - Keep demotion out of it. Neither condition judges the target unhealthy, and
   the point is to route this request around a momentary limit, not to bench a
@@ -46,7 +46,7 @@ hit.
 - Decide what the walk answers once replay has nowhere left to go. It cannot
   simply relay the last 429 to a client that will not act on it — that is the
   same dead end one target further along, and it meets the benched-list question
-  [[honor-an-advertised-backoff-with-nothing-left]] is holding.
+  [[honor-an-upstream-backoff-with-nothing-left]] is holding.
 
 [[fail-over-in-place-from-a-demoted-target]] widens the same branch for a 5xx
 past the failover threshold; whichever lands first should leave the condition

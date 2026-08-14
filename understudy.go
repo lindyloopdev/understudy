@@ -142,7 +142,7 @@ type targetHealth struct {
 	streakBegan time.Time
 	// lastProbe is when the target was last attempted.
 	lastProbe time.Time
-	// readmitAt is a known re-admission time, from an advertised Retry-After or a
+	// readmitAt is a known re-admission time, from a Retry-After the upstream sent or a
 	// synthesized stall bench, or zero when only probe pacing holds the target back.
 	readmitAt time.Time
 	// downLogged is whether this streak's "backend down" has been reported, so the
@@ -235,7 +235,7 @@ type server struct {
 	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
 	headerStallGate   time.Duration
-	// jitterFactor scatters a synthesized backoff; zero advertises the interval
+	// jitterFactor scatters a synthesized backoff; zero sends the interval
 	// exactly, which only a test asserting fixed values wants.
 	jitterFactor float64
 
@@ -599,7 +599,7 @@ type pick struct {
 // until a recovery interval has elapsed since its last probe, at which point it
 // is offered as a single half-open probe (stamping lastProbe so concurrent
 // requests within the cooldown still skip it). A target demoted with a known
-// re-admission time (readmitAt, from an advertised Retry-After or a synthesized
+// re-admission time (readmitAt, from a Retry-After the upstream sent or a synthesized
 // stall bench) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
 // health preserved until the probe's outcome) — never half-open-probed early while
@@ -607,7 +607,7 @@ type pick struct {
 // for a probe, it returns the last one it could call so a request always has
 // somewhere to go.
 //
-// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): that fallback
+// TODO(TODO.d/honor-an-upstream-backoff-with-nothing-left.md): that fallback
 // returns a target benched until a moment that has not arrived, against the rule
 // above.
 //
@@ -881,7 +881,7 @@ func (s *server) recordFailure(t Target, backends map[string]Backend, answered e
 // backdated past the failover threshold so pickTarget routes around it on the
 // very next request, and lastProbe is seeded at the demotion moment so the first
 // half-open re-probe still waits a full recovery interval. readmitAt is the known
-// re-admission time — an advertised Retry-After, or the bench understudy synthesizes
+// re-admission time — a Retry-After the upstream sent, or the bench understudy synthesizes
 // for an upstream that answered nothing — or zero for an unbounded demotion.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 	return targetHealth{failingSince: now.Add(-s.failoverThreshold), streakBegan: now, lastProbe: now, readmitAt: readmitAt, lastTouch: now}
@@ -1027,7 +1027,7 @@ func (e retryAfterError) RetryAfter() time.Time { return e.at }
 func (e retryAfterError) Unwrap() error { return e.error }
 
 // terminalError marks an upstream failure understudy has stopped relaying. It
-// carries the verdict only — the backoff the reject advertises is the response
+// carries the verdict only — the backoff the reject sends is the response
 // path's to decide.
 type terminalError struct{ error }
 
@@ -1110,10 +1110,10 @@ func isAccessRefused(err error) bool {
 // rateLimitDemotionThreshold is the Retry-After delay at or above which a 429 is
 // treated as the target being unhealthy rather than a brief throttle: such a
 // target is demoted immediately so requests fail over to a fallback instead of
-// stalling on it for the length of the advertised backoff.
+// stalling on it for the length of the backoff it sent.
 const rateLimitDemotionThreshold = 30 * time.Second
 
-// graduatedBackoffBase is the first interval advertised for a condition
+// graduatedBackoffBase is the first interval sent for a condition
 // understudy cannot time — a model swap, an upstream throttle.
 const graduatedBackoffBase = 5 * time.Second
 
@@ -1121,7 +1121,7 @@ const graduatedBackoffBase = 5 * time.Second
 // short of it.
 const defaultJitterFactor = 0.5
 
-// graduatedBackoff returns the interval to advertise for a condition running for
+// graduatedBackoff returns the interval to send for a condition running for
 // elapsed, doubling per interval already waited out (5 → 10 → 20 → 40 …) and
 // scattered short of it by up to jitter. Elapsed rather than a retry count,
 // because the retries are the client's and understudy sees only separate
@@ -1141,7 +1141,7 @@ func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
 	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
 }
 
-// synthesizedRateLimitRetryAfter is the backoff understudy advertises to the
+// synthesizedRateLimitRetryAfter is the backoff understudy sends the
 // client for a 429 the upstream left unbounded (no Retry-After), so the client
 // waits instead of retrying immediately.
 const synthesizedRateLimitRetryAfter = 60 * time.Second
@@ -1183,8 +1183,8 @@ type limitClassification struct {
 	// upstream 5xx. Any other 4xx fails identically on repeat, so handing one a
 	// backoff would only spend the client's time.
 	isRetryable bool
-	// hasRetryAfter reports that the upstream advertised a Retry-After still
-	// outstanding; one that has elapsed counts as no advertisement.
+	// hasRetryAfter reports that the upstream sent a Retry-After still
+	// outstanding; one that has elapsed counts as none.
 	hasRetryAfter bool
 	// retryAfter is the remaining Retry-After delay (valid when hasRetryAfter).
 	retryAfter time.Duration
@@ -1210,7 +1210,7 @@ func classifyLimit(err error) limitClassification {
 		error
 		RetryAfter() time.Time
 	}](err); ok {
-		// An elapsed advertisement leaves nothing to relay, so the failure falls to
+		// An elapsed Retry-After leaves nothing to relay, so the failure falls to
 		// the synthesized path rather than handing every reader a negative delay.
 		if remaining := time.Until(ra.RetryAfter()); remaining > 0 {
 			sig.hasRetryAfter = true
@@ -1219,7 +1219,7 @@ func classifyLimit(err error) limitClassification {
 	}
 	sig.shouldReject = sig.hasRetryAfter && sig.retryAfter > maxPassthroughRetryAfter
 	// A failure the walk gave up on rejects on its own terms: the streak, not an
-	// advertised Retry-After, is what crossed the threshold.
+	// Retry-After the upstream sent, is what crossed the threshold.
 	if _, ok := errors.AsType[terminalError](err); ok {
 		sig.shouldReject = true
 		// Only a failure carrying no upstream backoff needs a synthesized one; the
@@ -1558,7 +1558,7 @@ func writeJSONError(ctx context.Context, w http.ResponseWriter, err error, errTy
 
 // errorBody is the shape every failure answer takes on the wire, so the format has
 // one declaration rather than a literal at each writer. retryAfter is understudy's
-// own decision — sometimes what an upstream advertised, sometimes a value it
+// own decision — sometimes what an upstream sent, sometimes a value it
 // synthesized — so it arrives as a duration and is rendered in milliseconds here,
 // where the wire encoding belongs.
 type errorBody struct {
@@ -1646,9 +1646,9 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 				writeRefusal(r.Context(), w, err)
 				return
 			}
-			// Any retryable failure carries its advertised backoff, not just a rate
+			// Any retryable failure carries the backoff it sent, not just a rate
 			// limit — a 503 that named its own return is worth relaying. A request the
-			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
+			// upstream faulted on (400, 404) is not retryable, so a delay it sent
 			// means nothing.
 			if sig.hasRetryAfter && sig.isRetryable {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))

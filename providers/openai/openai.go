@@ -95,7 +95,7 @@ type retryAfterError struct {
 	retryAfter time.Time
 }
 
-// RetryAfter returns the retry time advertised by the upstream.
+// RetryAfter returns the retry time the upstream sent.
 func (e retryAfterError) RetryAfter() time.Time { return e.retryAfter }
 
 func (e retryAfterError) Unwrap() error { return e.error }
@@ -162,7 +162,7 @@ func decodeErrorEnvelope(body []byte) openAIError {
 
 // quotaViolationAttrs returns the slog attrs describing apiErr's quota
 // violations: the comma-joined ids and values of every violation, and the first
-// retry delay any of them advertises. Each attr is omitted when the upstream
+// retry delay any of them sent. Each attr is omitted when the upstream
 // reported nothing for it.
 func quotaViolationAttrs(apiErr openAIError) []any {
 	var quotaIDs, quotaValues []string

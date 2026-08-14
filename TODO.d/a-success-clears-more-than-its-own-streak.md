@@ -18,11 +18,11 @@ and a success is not the provider withdrawing it. Health is shared per
 success doing the deleting need not be the request, the route, or even the client
 that learned what it erases.
 
-- **Keep an advertised `readmitAt` across a success.** An upstream answers `429
+- **Keep an upstream's `readmitAt` across a success.** An upstream answers `429
   Retry-After: 300`; a concurrent request to the same account and model returns
   200; the entry — bench included — is gone, and understudy resumes sending
   traffic the provider explicitly asked it to hold. The design already settles
-  which wins: an advertised time "supersedes the schedule entirely … there is
+  which wins: the upstream's time "supersedes the schedule entirely … there is
   nothing to discover." A success is not the provider withdrawing that
   instruction. Narrow the clear so it ends the streak and leaves `readmitAt`
   standing until it elapses. Drive it from two concurrent requests to one

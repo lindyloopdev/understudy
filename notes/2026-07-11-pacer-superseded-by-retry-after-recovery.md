@@ -33,7 +33,7 @@ Working through the actual Gemini setup (see
   Gemini re-enters rotation the instant its limit clears*.
 
 That requirement is exactly **retry-after-aware demotion recovery**: bench the
-rate-limited target for its advertised retry-after (fall back to the paid target
+rate-limited target for the retry-after it sent (fall back to the paid target
 for the gap), then re-admit it as a half-open probe when the limit clears. It
 reuses the existing demote/failover substrate and the retry-after we already
 extract — no new pacing subsystem, and it delivers the actual goal (use Gemini
