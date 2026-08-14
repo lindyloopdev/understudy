@@ -329,7 +329,7 @@ the range yields and none is implied.
 
 **Two endpoints, two answers.** `/v1/models` asks *what can you serve* — emptiness
 is a valid answer whatever its cause, so unusable backends are skipped and a usable
-backend advertising nothing contributes nothing; the listing does not fail because
+backend offering no models contributes nothing; the listing does not fail because
 some backend, or every backend, could not be reached. Chat asks understudy to
 *serve this*, and there failure is failure: a request naming a model no usable
 backend can serve is an error, and why each backend was skipped goes to the
@@ -502,9 +502,11 @@ retry-control for the agent) from envelope `type` (the reason for lindy, e.g.
 failure carrying **no** `Retry-After` — a 429 without the header, or a 5xx — is
 not relayed raw either. Unhandled, opencode hammers rapid retries at a failing
 upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** a
-`Retry-After` and injects it while preserving the retryable status, so opencode
-backs off *understudy's* interval instead of its flat 30s. Only the `429` half is
-built: a `5xx` advertising nothing still reaches the client bare, and the injected
+`Retry-After` and injects it while preserving the retryable status, so a client
+backs off *understudy's* interval instead of its own. opencode's agent turn is
+not such a client — it calls the SDK with `maxRetries: 0` and makes one attempt,
+so nothing injected reaches it — [[fail-over-from-a-bare-429]]. Only the `429` half is
+built: a `5xx` with no delay still reaches the client bare, and the injected
 interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
 interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is
 the rate-limit-reject threshold**, so on crossing it the response becomes that
@@ -524,18 +526,18 @@ sets it to hours, so that state isn't discarded and re-probed. **Disabled instal
 no guard** — the proxy runs until its context is cancelled; a positive window
 installs the guard.
 
-**Rate-limit demotion is quota-class-aware.** A 429's advertised delay is not
+**Rate-limit demotion is quota-class-aware.** The delay a 429 sends is not
 always honest about when the target recovers, so demotion keys on the *quota
 class*, read from the structured `QuotaFailure.quotaId` in the body (Gemini's
 OpenAI-compat 429 carries the native `google.rpc` details — see
 [notes/2026-07-12-gemini-compat-passes-structured-ratelimit-details.md](notes/2026-07-12-gemini-compat-passes-structured-ratelimit-details.md)).
-A **per-day** exhaustion (`…PerDay…`, e.g. free-tier RPD) advertises a misleading
+A **per-day** exhaustion (`…PerDay…`, e.g. free-tier RPD) sends a misleading
 sub-minute `retryDelay` yet does not reset until a fixed daily boundary (midnight
 Pacific for Gemini), so understudy benches the target until *that boundary*, not
-the advertised delay — instead of re-probing every ~40s into a wall it can't
+the delay it sent — instead of re-probing every ~40s into a wall it can't
 clear for hours. A **per-minute** throttle (`…PerMinute…`, RPM/TPM) keeps its
-short advertised delay: that window really does clear in seconds. The advertised
-delay stays the demotion input everywhere else; the quota-class override applies
+short delay: that window really does clear in seconds. The delay the upstream
+sent stays the demotion input everywhere else; the quota-class override applies
 only where that delay provably lies. (The delay itself is still read from message
 *prose* — the structured `retryDelay` is present but has flipped in and out across
 endpoint changes, so prose remains the resilient source; the quota id is the one
@@ -582,8 +584,8 @@ costs under a hundred free probes a day, so growth past it buys rounding error
 while making worst-case detection unbounded — worst precisely when an operator has
 just paid and expects work to resume. Jitter, for the same reason the synthesized
 backoff needs it; reset to base on success. A known `readmitAt` **supersedes the
-schedule entirely** — there is nothing to discover, the advertised time is the
-answer. A success on a concurrent request deletes the advertised time along with
+schedule entirely** — there is nothing to discover, the upstream's time is the
+answer. A success on a concurrent request deletes that time along with
 the streak today — [[a-success-clears-more-than-its-own-streak]].
 
 **Health belongs to the endpoint, not to the route that reached it.** The key is
@@ -616,10 +618,19 @@ coming; the schedule is the unattended fallback.
 
 **Request disposition: a Retry-After ladder.** Given a retryable failure and a
 healthy next target, understudy's disposition is gated by the remaining
-`Retry-After` against a **wait budget** — the tolerable in-request delay before
-switching, bounded by the client's own timeout and widened by the cost of the
-cheapest fallback (a dear fallback is worth waiting longer for):
+`Retry-After` — where the upstream sent one — against a **wait budget** — the
+tolerable in-request delay before switching, bounded by the client's own timeout
+and widened by the cost of the cheapest fallback (a dear fallback is worth waiting
+longer for):
 
+- **No delay sent → fail over.** A bare 429 gives the budget nothing to weigh:
+  understudy cannot know the wait is short, and the client will not wait out a
+  delay nobody gave it — opencode's agent turn makes a single attempt
+  (*Synthesized backoff* above). So the request goes to the next untried target
+  rather than becoming an error the caller cannot act on. Demotion stays the separate
+  question: a bare 429 is a capacity measurement (§Concurrency & Rate Limiting),
+  so the target keeps its place in the walk. A 429 that *did* name a short delay
+  is the open half — [[fail-over-from-a-bare-429]].
 - **≤ wait budget → wait in place.** Sleep out the throttle and retry the *same*
   target; the client sees a slow success, never the 429, and the preferred model
   (its prompt cache, its coherence) is preserved. *(Staged — the transient-absorb
@@ -817,14 +828,14 @@ status, so a row reads as the rule it follows.
 | --- | --- | --- | --- |
 | `400`, `404` — the *request* is at fault | relayed unchanged | `invalid_request_error` | — |
 | `401`, `402`, `403` — the account may not use this target | `400` | `upstream_refused` | none; the account's own recovery clears it |
-| `429` advertising under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
-| `429` advertising from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
-| `429` advertising beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
-| `429` advertising nothing | `429` | `rate_limit_error` | synthesized |
-| a `5xx` no retry can help | `502` | `server_error` | none, whatever it advertised |
-| any other `5xx` advertising up to the passthrough ceiling (≈2m) | `502` | `server_error` | the delay still outstanding |
-| any other `5xx` advertising beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
-| any other `5xx` advertising nothing, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
+| `429` with a delay under the demotion threshold (≈30s) — a throttle, retried in place | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` with a delay from that threshold to the passthrough ceiling (≈2m) — demotes the target | `429` | `rate_limit_error` | the delay still outstanding |
+| `429` with a delay beyond the ceiling | `400` | `upstream_rate_limited` | `retry_after_ms` in the body |
+| `429` with no delay | `429` | `rate_limit_error` | synthesized |
+| a `5xx` no retry can help | `502` | `server_error` | none, whatever it sent |
+| any other `5xx` with a delay up to the passthrough ceiling (≈2m) | `502` | `server_error` | the delay still outstanding |
+| any other `5xx` with a delay beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+| any other `5xx` with no delay, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
 | overloaded (`529` and kin) | `502` | *open* | as `5xx` |
 | every candidate stalled before its header | `504` | `server_error` | — |
 | failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
@@ -833,8 +844,8 @@ status, so a row reads as the rule it follows.
 target.** Relaying the final failure makes the answer depend on list order: with
 `[a: 429 for 60s, b: 401]` a caller would be told to escalate a standing refusal,
 when `a` is merely throttled and will serve once its delay elapses. Only a sustained
-`429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk where it
-falls — so it would be the last candidate whose answer a client sees. The verdict is
+or bare `429`, a refusal, or a stall replays at all — a plain `5xx` ends the walk
+where it falls — so it would be the last candidate whose answer a client sees. The verdict is
 instead the **most optimistic** disposition among the candidates the request had —
 including one it declined to call, because a target benched until a known time is
 as time-bound as a disposition gets.
@@ -844,8 +855,8 @@ break by judgement:
 
 | what the candidate did | contributes |
 | --- | --- |
-| advertised a `Retry-After` | what remains of it |
-| answered a retryable failure advertising none — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
+| sent a `Retry-After` | what remains of it |
+| answered a retryable failure with no delay — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
 | stalled before its header | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
 | refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
@@ -975,7 +986,7 @@ changes instrument there:
 - **At or above it — one slot per round.** Additive probing; the estimate is near the
   edge and each step must be cheap to retract.
 
-**A rejection is a measurement, not a reflex.** A signal-less 429 arriving while
+**A rejection is a measurement, not a reflex.** A bare 429 arriving while
 saturated says the account's limit is approximately the in-flight count at that moment —
 the most precise capacity reading understudy ever gets. It sets the cap just below that
 count and records it as the new known-good boundary. Halving instead would discard the
@@ -991,7 +1002,7 @@ nothing.
 
 A 429 that carries a usable signal is not a concurrency measurement at all: it is quota
 or rate exhaustion, and it routes to quota-class-aware demotion (§Understudy) rather than
-to the cap. Only the signal-less case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
+to the cap. Only the bare case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
 feeds the estimator.
 
 **Per-upstream state outlives the tenant that taught it.** The learned cap is a property

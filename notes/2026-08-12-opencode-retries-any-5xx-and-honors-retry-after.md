@@ -1,4 +1,4 @@
-# opencode retries any 5xx and honors Retry-After regardless of status
+# opencode's retry loop honors Retry-After on any status — but the agent turn never runs it
 
 **Date:** 2026-08-12
 **Subject:** whether understudy must convert a retryable upstream failure to
@@ -47,6 +47,21 @@ Note `retry-after-ms` is consulted **first**; understudy does not emit it.
 - Retiring the reject path is **not** implied. That exists because opencode
   honors a *long* `Retry-After` essentially unboundedly, which is orthogonal to
   which status carries it.
+
+## The agent turn does not run this loop (2026-08-14)
+
+All of the above describes what the retry loop does **when it runs**. On the path
+understudy actually serves, it does not. The bundle's `streamText` call passes
+`maxRetries: a.retries ?? 0`, and the agent turn supplies no `retries`; the only
+caller that does is title generation (`retries: 2`). The SDK's own
+`{maxRetries: $}` helper defaults to 2 **only when the value is null**, so an
+explicit `0` yields one attempt, and neither the retryable predicate nor the
+delay selection above is ever consulted.
+
+So the finding's conclusion — `503` + `Retry-After` behaves like `429` +
+`Retry-After` — still holds, but degenerately: on an agent turn neither is
+retried. Nothing understudy injects reaches a reader there.
+[[fail-over-from-a-bare-429]] measures what that costs.
 
 ## Caveat
 

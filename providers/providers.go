@@ -13,7 +13,7 @@ import (
 // Handler serves proxied requests for one provider type. Chat proxies a
 // chat-completions request body to the upstream identified by cfg and returns
 // its response. Models lists the models the upstream identified by cfg
-// advertises.
+// offers.
 //
 // An error a Handler returns carries the status the upstream itself returned,
 // via yerrors.HTTPStatus, and may carry further upstream detail through the
@@ -26,7 +26,7 @@ type Handler interface {
 	Models(ctx context.Context, cfg Config) ([]Model, error)
 }
 
-// RetryAfterError carries the moment the upstream advertised as its retry
+// RetryAfterError carries the moment the upstream gave as its retry
 // boundary, however the provider recovered it — a Retry-After header, a
 // structured body field, or a quota's reset time.
 type RetryAfterError interface {

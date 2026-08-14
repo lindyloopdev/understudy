@@ -10,7 +10,7 @@ failover health from the backend *name* to the canonical upstream identity.
   `canonicalUpstreamKey` helper.
 - **Failover health** keys by `Target.identity()` = `backend + "/" + model`
   (target.go) — i.e. the operator-chosen backend *name* plus the model. Demotion
-  fires on `chosen` (a `backend/model`) for: sustained-rate 429, signal-less
+  fires on `chosen` (a `backend/model`) for: sustained-rate 429, bare
   429-when-alone, rate-limit-with-Retry-After, and fatal upstream errors
   (understudy.go ~1252).
 

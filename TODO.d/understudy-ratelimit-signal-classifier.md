@@ -39,7 +39,7 @@ was prose-only — so the prose parse is kept as the resilient fallback. See
 Classification lives in one place — `classifyLimit(err) limitClassification`
 (`understudy.go`), carrying `hasRetryAfter`/`retryAfter`/`shouldReject` plus a
 `condition` (`limitCondition`). `errToResponse` reads the reject/forward/
-synthesize fields; `chatCompletions` throttles the cap on the signal-less
+synthesize fields; `chatCompletions` throttles the cap on the bare
 condition and derives the demote from the `condition`. The remaining work extends
 this seam.
 
@@ -58,5 +58,5 @@ this seam.
 
 The terminal/reject path is the stateless side of [[understudy-ratelimit-firewall]];
 the transient-rate path connects to [[understudy-adaptive-coordinated-backoff]];
-demote/fail-over feeds [[understudy-fallback]]. z.ai's signal-less 429 is a
+demote/fail-over feeds [[understudy-fallback]]. z.ai's bare 429 is a
 provider degeneracy the general path shouldn't assume away.

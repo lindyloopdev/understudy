@@ -54,7 +54,7 @@ is deliberate, so this is a question rather than a bug report.
 Two unrelated conditions under one code, then projected onto a status that fits
 neither: HTTP 429 means *this client* is sending too fast, so it tells a caller
 to slow down when slowing down cannot help. `ErrNoCapacity` in particular is a
-server-side fault — kronk advertises the model in `/v1/models` and then cannot
+server-side fault — kronk lists the model in `/v1/models` and then cannot
 load it — which reads as 5xx (503 if freeing other reservations could change the
 answer, 500 if not). `ErrAdmissionTimeout` is closer to a genuine overload
 signal, but 503 fits it better than 429 as well.

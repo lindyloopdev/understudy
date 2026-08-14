@@ -142,7 +142,7 @@ type targetHealth struct {
 	streakBegan time.Time
 	// lastProbe is when the target was last attempted.
 	lastProbe time.Time
-	// readmitAt is a known re-admission time, from an advertised Retry-After or a
+	// readmitAt is a known re-admission time, from a Retry-After the upstream sent or a
 	// synthesized stall bench, or zero when only probe pacing holds the target back.
 	readmitAt time.Time
 	// downLogged is whether this streak's "backend down" has been reported, so the
@@ -235,7 +235,7 @@ type server struct {
 	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
 	headerStallGate   time.Duration
-	// jitterFactor scatters a synthesized backoff; zero advertises the interval
+	// jitterFactor scatters a synthesized backoff; zero sends the interval
 	// exactly, which only a test asserting fixed values wants.
 	jitterFactor float64
 
@@ -365,7 +365,7 @@ func (l *upstreamLimiter) shrink() {
 	l.mu.Unlock()
 }
 
-// throttle reacts to a signal-less rate limit. A rejection arriving at
+// throttle reacts to a bare rate limit. A rejection arriving at
 // saturation is a capacity measurement — the account's limit sits just below the
 // count in flight at that moment — so the cap lands one slot under it and that
 // value is remembered as known-good. Halving is reserved for a rejection at or
@@ -599,7 +599,7 @@ type pick struct {
 // until a recovery interval has elapsed since its last probe, at which point it
 // is offered as a single half-open probe (stamping lastProbe so concurrent
 // requests within the cooldown still skip it). A target demoted with a known
-// re-admission time (readmitAt, from an advertised Retry-After or a synthesized
+// re-admission time (readmitAt, from a Retry-After the upstream sent or a synthesized
 // stall bench) is instead
 // routed around until that time, then re-admitted as a half-open probe (its
 // health preserved until the probe's outcome) — never half-open-probed early while
@@ -607,7 +607,7 @@ type pick struct {
 // for a probe, it returns the last one it could call so a request always has
 // somewhere to go.
 //
-// TODO(TODO.d/honor-an-advertised-backoff-with-nothing-left.md): that fallback
+// TODO(TODO.d/honor-an-upstream-backoff-with-nothing-left.md): that fallback
 // returns a target benched until a moment that has not arrived, against the rule
 // above.
 //
@@ -881,7 +881,7 @@ func (s *server) recordFailure(t Target, backends map[string]Backend, answered e
 // backdated past the failover threshold so pickTarget routes around it on the
 // very next request, and lastProbe is seeded at the demotion moment so the first
 // half-open re-probe still waits a full recovery interval. readmitAt is the known
-// re-admission time — an advertised Retry-After, or the bench understudy synthesizes
+// re-admission time — a Retry-After the upstream sent, or the bench understudy synthesizes
 // for an upstream that answered nothing — or zero for an unbounded demotion.
 func (s *server) demotedHealth(now, readmitAt time.Time) targetHealth {
 	return targetHealth{failingSince: now.Add(-s.failoverThreshold), streakBegan: now, lastProbe: now, readmitAt: readmitAt, lastTouch: now}
@@ -1027,7 +1027,7 @@ func (e retryAfterError) RetryAfter() time.Time { return e.at }
 func (e retryAfterError) Unwrap() error { return e.error }
 
 // terminalError marks an upstream failure understudy has stopped relaying. It
-// carries the verdict only — the backoff the reject advertises is the response
+// carries the verdict only — the backoff the reject sends is the response
 // path's to decide.
 type terminalError struct{ error }
 
@@ -1110,10 +1110,10 @@ func isAccessRefused(err error) bool {
 // rateLimitDemotionThreshold is the Retry-After delay at or above which a 429 is
 // treated as the target being unhealthy rather than a brief throttle: such a
 // target is demoted immediately so requests fail over to a fallback instead of
-// stalling on it for the length of the advertised backoff.
+// stalling on it for the length of the backoff it sent.
 const rateLimitDemotionThreshold = 30 * time.Second
 
-// graduatedBackoffBase is the first interval advertised for a condition
+// graduatedBackoffBase is the first interval sent for a condition
 // understudy cannot time — a model swap, an upstream throttle.
 const graduatedBackoffBase = 5 * time.Second
 
@@ -1121,7 +1121,7 @@ const graduatedBackoffBase = 5 * time.Second
 // short of it.
 const defaultJitterFactor = 0.5
 
-// graduatedBackoff returns the interval to advertise for a condition running for
+// graduatedBackoff returns the interval to send for a condition running for
 // elapsed, doubling per interval already waited out (5 → 10 → 20 → 40 …) and
 // scattered short of it by up to jitter. Elapsed rather than a retry count,
 // because the retries are the client's and understudy sees only separate
@@ -1141,7 +1141,7 @@ func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
 	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
 }
 
-// synthesizedRateLimitRetryAfter is the backoff understudy advertises to the
+// synthesizedRateLimitRetryAfter is the backoff understudy sends the
 // client for a 429 the upstream left unbounded (no Retry-After), so the client
 // waits instead of retrying immediately.
 const synthesizedRateLimitRetryAfter = 60 * time.Second
@@ -1162,10 +1162,10 @@ const (
 	// a timed backoff long enough to treat the target as unhealthy and demote it,
 	// but not a concurrency limit — so it does not shrink the cap.
 	sustainedRate
-	// signalless is a 429 with no Retry-After — the ambiguous, unsignalled case
+	// bareRateLimit is a 429 with no Retry-After — the ambiguous, bare case
 	// (z.ai-shaped): it may be concurrency or an exhausted quota. It throttles the
 	// cap (see throttle) and accrues a streak, but never demotes on its own.
-	signalless
+	bareRateLimit
 )
 
 // limitClassification is understudy's classification of an upstream backpressure error
@@ -1183,8 +1183,8 @@ type limitClassification struct {
 	// upstream 5xx. Any other 4xx fails identically on repeat, so handing one a
 	// backoff would only spend the client's time.
 	isRetryable bool
-	// hasRetryAfter reports that the upstream advertised a Retry-After still
-	// outstanding; one that has elapsed counts as no advertisement.
+	// hasRetryAfter reports that the upstream sent a Retry-After still
+	// outstanding; one that has elapsed counts as none.
 	hasRetryAfter bool
 	// retryAfter is the remaining Retry-After delay (valid when hasRetryAfter).
 	retryAfter time.Duration
@@ -1193,7 +1193,7 @@ type limitClassification struct {
 	// on (a terminalError), which carries no Retry-After condition at all.
 	shouldReject bool
 	// condition is the nature of the limit; the shrink path reads it to distinguish
-	// a concurrency limit (signalless) from a timed backoff.
+	// a concurrency limit (a bare rate limit) from a timed backoff.
 	condition limitCondition
 }
 
@@ -1210,7 +1210,7 @@ func classifyLimit(err error) limitClassification {
 		error
 		RetryAfter() time.Time
 	}](err); ok {
-		// An elapsed advertisement leaves nothing to relay, so the failure falls to
+		// An elapsed Retry-After leaves nothing to relay, so the failure falls to
 		// the synthesized path rather than handing every reader a negative delay.
 		if remaining := time.Until(ra.RetryAfter()); remaining > 0 {
 			sig.hasRetryAfter = true
@@ -1219,7 +1219,7 @@ func classifyLimit(err error) limitClassification {
 	}
 	sig.shouldReject = sig.hasRetryAfter && sig.retryAfter > maxPassthroughRetryAfter
 	// A failure the walk gave up on rejects on its own terms: the streak, not an
-	// advertised Retry-After, is what crossed the threshold.
+	// Retry-After the upstream sent, is what crossed the threshold.
 	if _, ok := errors.AsType[terminalError](err); ok {
 		sig.shouldReject = true
 		// Only a failure carrying no upstream backoff needs a synthesized one; the
@@ -1240,7 +1240,7 @@ func classifyLimit(err error) limitClassification {
 	case !sig.isRateLimit:
 		sig.condition = notRateLimited
 	case !sig.hasRetryAfter:
-		sig.condition = signalless
+		sig.condition = bareRateLimit
 	case sig.retryAfter >= rateLimitDemotionThreshold:
 		sig.condition = sustainedRate
 	default:
@@ -1558,7 +1558,7 @@ func writeJSONError(ctx context.Context, w http.ResponseWriter, err error, errTy
 
 // errorBody is the shape every failure answer takes on the wire, so the format has
 // one declaration rather than a literal at each writer. retryAfter is understudy's
-// own decision — sometimes what an upstream advertised, sometimes a value it
+// own decision — sometimes what an upstream sent, sometimes a value it
 // synthesized — so it arrives as a duration and is rendered in milliseconds here,
 // where the wire encoding belongs.
 type errorBody struct {
@@ -1646,9 +1646,9 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 				writeRefusal(r.Context(), w, err)
 				return
 			}
-			// Any retryable failure carries its advertised backoff, not just a rate
+			// Any retryable failure carries the backoff it sent, not just a rate
 			// limit — a 503 that named its own return is worth relaying. A request the
-			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
+			// upstream faulted on (400, 404) is not retryable, so a delay it sent
 			// means nothing.
 			if sig.hasRetryAfter && sig.isRetryable {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
@@ -1964,8 +1964,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var chosen Target
 	var logicalTargets []Target
 	var tried []string
-	// throttled is the candidate the walk failed over from under a timed backoff; the
-	// answer is judged against whichever target it came from.
+	// throttled is the soonest candidate the walk replayed past — the delay the
+	// request can still come back to.
 	// TODO(TODO.d/weigh-every-candidates-contribution.md)
 	var throttled *failedAttempt
 	var lastFailure *failedAttempt
@@ -2159,10 +2159,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if waited {
 				lim.grow()
 			}
-		case sig.condition == signalless:
+		case sig.condition == bareRateLimit:
 			lim.throttle()
 		}
-		// A signal-less 429 measures capacity, not health: the cap above has already
+		// A bare 429 measures capacity, not health: the cap above has already
 		// come down to what the account allows, so only a streak outlasting the
 		// failover threshold redirects.
 		demote := sig.condition == sustainedRate
@@ -2176,11 +2176,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
 			// None of these demotes. A transient 429's Retry-After is still honored
 			// for the client wait in the response path.
-			case sig.condition == transientRate || sig.condition == signalless || isFatalUpstream(err):
+			case sig.condition == transientRate || sig.condition == bareRateLimit || isFatalUpstream(err):
 				s.recordFailure(chosen, backend.Backends, err)
 			}
 		}
 		if err != nil {
+			// Wrapping here, not at the return, is what puts every candidate on one
+			// scale for the verdict below: a delay either sent or synthesized.
+			err = s.withSynthesizedBackoff(ctx, chosen, backend.Backends, err)
 			failed := failedAttempt{
 				answer:        clientFacing(ctx, err),
 				raw:           err,
@@ -2188,16 +2191,17 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				backend:       parsedBackendName,
 				upstreamModel: upstreamModel,
 			}
-			// A sustainedRate 429 or refused access has just demoted chosen
-			// above; if another target has not yet been tried this request, replay it
-			// there rather than surface the refusal to the client.
-			if logicalTargets != nil && (sig.condition == sustainedRate || isAccessRefused(err)) {
+			// A sustainedRate 429 or refused access has just demoted chosen above; a
+			// bare 429 names no wait a client could sit out. Either way an untried
+			// target beats surfacing the failure, and a bare 429 costs chosen only
+			// its turn in this walk.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == bareRateLimit || isAccessRefused(err)) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains
 				// as of now.
-				if sig.condition == sustainedRate && sig.hasRetryAfter &&
-					(throttled == nil || sig.retryAfter < classifyLimit(throttled.raw).retryAfter) {
+				if w := classifyLimit(failed.raw); w.hasRetryAfter &&
+					(throttled == nil || w.retryAfter < classifyLimit(throttled.raw).retryAfter) {
 					throttled = &failed
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
