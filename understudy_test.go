@@ -414,7 +414,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusBadGateway,
 			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -463,6 +463,21 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should forward an upstream 5xx's own Retry-After", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{"Retry-After": {"20"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"try later"}}`)),
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusBadGateway,
+			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
+		}
+	})
+
 	tests.AddFunc("should pass through a long-Retry-After 404 instead of rejecting it", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -504,7 +519,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
 		}
 	})
 
@@ -549,7 +564,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusBadGateway,
 			wantBody:            `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"5"}},
 		}
 	})
 
@@ -579,7 +594,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil),
 			wantStatus:          http.StatusTooManyRequests,
 			wantBody:            `{"error":{"message":"upstream returned status 429: slow down","type":"rate_limit_error"}}`,
-			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}},
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"20"}},
 		}
 	})
 
@@ -709,6 +724,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			wantBody:   `{"error":{"message":"Bad Gateway","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
 				"Content-Type": {"application/json"},
+				"Retry-After":  {"5"},
 			},
 		}
 	})
@@ -969,6 +985,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		srv := tt.server
+		// These cases assert the advertised interval exactly; scattering it is
+		// TestChatCompletionsScattersBusyBackoff's subject.
+		srv.jitterFactor = 0
 
 		ctx := tt.ctx
 		if ctx == nil {
@@ -2710,6 +2729,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		// wantEnvelope is the error response's asserted aspects; a field left zero
 		// is one this case's behavior does not name.
 		wantEnvelope errorEnvelope
+		// wantRetryAfter is the backoff the client is handed; empty asserts that no
+		// backoff was advertised.
+		wantRetryAfter string
 	}
 	// backendStub is one backend's real upstream identity — base URL and API key —
 	// plus its stubbed round-trip: given the request and the 1-based call count, it
@@ -2740,7 +2762,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 		},
 	})
@@ -2752,7 +2774,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -2763,7 +2785,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				model:        "a/ma",
 				advance:      2*time.Minute + time.Second,
@@ -2792,7 +2814,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "60"},
 			{advance: 46 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: 15 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
 		},
@@ -2860,7 +2882,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a", wantRetryAfter: "20"},
 		},
 	})
 
@@ -2891,7 +2913,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{
-				advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a",
+				wantRetryAfter: "60",
+				advance:        0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a",
 				wantExcluded: []Attempt{{Backend: "b", ModelUpstream: "mb", Err: errors.New("must provide base_url")}},
 			},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
@@ -2905,7 +2928,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
@@ -2921,7 +2944,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "20"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -2935,6 +2958,27 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	tests.Add("should answer a lone busy target with a 503 and a backoff to wait out", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":{"message":"Service Unavailable","type":"server_error"}}`, wantRetryAfter: "5"},
+		},
+	})
+
+	tests.Add("should fail over within the request when a target reports itself busy", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
 
@@ -2973,7 +3017,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 		},
 	})
 
@@ -3042,7 +3086,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b"},
+			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20"},
 		},
 	})
 
@@ -3058,7 +3102,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{backend: "acct-c", model: "glm"},
 		},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "acct-a", wantRetryAfter: "20"},
 			// acct-b is the same account+model as the demoted acct-a, so it is
 			// benched too: failover routes to the different account acct-c.
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "acct-c"},
@@ -3078,8 +3122,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
-			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
+			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
 		},
 	})
 
@@ -3102,9 +3146,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBackend: "a"},
-			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
-			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b"},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBackend: "a", wantRetryAfter: "5"},
+			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b", wantRetryAfter: "5"},
+			{advance: 16 * time.Second, wantStatus: http.StatusBadGateway, wantBackend: "b", wantRetryAfter: "20"},
 		},
 	})
 
@@ -3114,11 +3158,69 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
 				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeUpstreamUnavailable}},
+			},
+		},
+	})
+
+	tests.Add("should hand a client understudy's own backoff when an upstream 5xx carries none", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "10"},
+		},
+	})
+
+	tests.Add("should tell a client to wait longer each time a target is still busy", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{advance: 10 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+		},
+	})
+
+	tests.Add("should start a fresh busy run once a target serves again", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 2 {
+					return resp(http.StatusOK, `{"id":"from-a"}`), nil
+				}
+				return resp(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
+			{advance: 2*time.Minute + time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+		},
+	})
+
+	tests.Add("should reject as non-retryable once a target has been busy past the terminal threshold with nowhere to fail over", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{
+				advance:    2*time.Minute + time.Second,
+				wantStatus: http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{
+					Error:        errorDetail{Type: errTypeUpstreamUnavailable},
+					RetryAfterMS: int(maxPassthroughRetryAfter.Milliseconds()),
+				},
 			},
 		},
 	})
@@ -3129,12 +3231,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
-				advance:      24*time.Hour + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantBody:     badGateway502,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				wantRetryAfter: "5",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantBody:       badGateway502,
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
 			},
 		},
 	})
@@ -3145,7 +3248,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
 				model:        "a/ma",
 				advance:      23 * time.Hour,
@@ -3177,13 +3280,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{model: "a/ma", wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{
-				model:        "a/ma",
-				advance:      24*time.Hour + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantBody:     badGateway502,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				model:          "a/ma",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantBody:       badGateway502,
+				wantRetryAfter: "5",
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
 			},
 		},
 	})
@@ -3200,12 +3304,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{model: "a/ma", wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 			{
-				model:      "a/ma",
-				advance:    24*time.Hour + time.Second,
-				wantStatus: http.StatusTooManyRequests,
-				wantBody:   rateLimit429,
+				wantRetryAfter: "60",
+				model:          "a/ma",
+				advance:        24*time.Hour + time.Second,
+				wantStatus:     http.StatusTooManyRequests,
+				wantBody:       rateLimit429,
 			},
 		},
 	})
@@ -3226,17 +3331,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should advertise the capped backoff when the terminal reject has no upstream Retry-After to relay", test{
+	tests.Add("should carry the streak's own backoff into a terminal reject the upstream left unbounded", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantRetryAfter: "5"},
 			{
 				advance:      2*time.Minute + time.Second,
 				wantStatus:   http.StatusBadRequest,
-				wantEnvelope: errorEnvelope{RetryAfterMS: 120000},
+				wantEnvelope: errorEnvelope{RetryAfterMS: 80000},
 			},
 		},
 	})
@@ -3248,13 +3353,14 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a"},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{
-				advance:      2*time.Minute + time.Second,
-				wantStatus:   http.StatusBadGateway,
-				wantEnvelope: errorEnvelope{Error: errorDetail{Type: errTypeServer}},
-				wantBackend:  "a",
+				wantRetryAfter: "80",
+				advance:        2*time.Minute + time.Second,
+				wantStatus:     http.StatusBadGateway,
+				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
+				wantBackend:    "a",
 			},
 		},
 	})
@@ -3292,7 +3398,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 5 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 		},
@@ -3310,7 +3416,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 			{advance: 30 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
 		},
@@ -3323,8 +3429,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
-			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502},
+			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5"},
+			{advance: 5 * time.Second, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "10"},
 			{advance: 11 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`},
 		},
 	})
@@ -3396,7 +3502,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3413,7 +3519,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantExcluded: []Attempt{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "60", wantExcluded: []Attempt{
 				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 				{Backend: "b", ModelUpstream: "mb", UpstreamStatus: http.StatusUnauthorized, Err: errors.New("upstream returned status 401: invalid api key"), Called: true},
 			}},
@@ -3436,9 +3542,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 			{advance: 61 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
-			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 61 * time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3451,7 +3557,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}, {backend: "d", model: "md"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3462,7 +3568,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in a minute","type":"rate_limit_error"}}`, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3480,7 +3586,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in forty","type":"rate_limit_error"}}`},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in forty","type":"rate_limit_error"}}`, wantRetryAfter: "25"},
 		},
 	})
 
@@ -3529,7 +3635,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "10"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 		},
 	})
@@ -3599,7 +3705,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "60"},
 		},
 	})
 
@@ -3619,7 +3725,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
-			srv := New(validator, WithLogger(testLogger(t)))
+			srv := New(validator, WithLogger(testLogger(t))).(*server)
+			// These cases assert the advertised interval exactly; scattering it is
+			// TestGraduatedBackoff's subject.
+			srv.jitterFactor = 0
 
 			for i, s := range tt.steps {
 				if s.advance > 0 {
@@ -3659,6 +3768,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				if d := gocmp.Diff(s.wantEnvelope, envelope, assertedFields); d != "" {
 					t.Errorf("step %d envelope (-want +got):\n%s", i, d)
 				}
+				if got := rr.Header().Get("Retry-After"); got != s.wantRetryAfter {
+					t.Errorf("step %d Retry-After: got %q want %q", i, got, s.wantRetryAfter)
+				}
 				if s.wantBackend != "" && lastDialed != s.wantBackend {
 					t.Errorf("step %d dialed %q want %q", i, lastDialed, s.wantBackend)
 				}
@@ -3683,12 +3795,18 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		}
 		return http.StatusBadGateway
 	}
+	const badGateway = `{"error":{"message":"bad gateway"}}`
+	bothTargets := []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}
 
 	type test struct {
-		aStatus    func(call int, clientLeaves context.CancelFunc) int
+		aStatus func(call int, clientLeaves context.CancelFunc) int
+		// aBody is the error body a answers with.
+		aBody      string
 		retryAfter time.Duration
-		advances   []time.Duration
-		wantDown   int
+		// targets is the logical model's candidate list.
+		targets  []Target
+		advances []time.Duration
+		wantDown int
 		// downFields are additional fields the "backend down" records must carry.
 		downFields map[string]any
 		wantUp     int
@@ -3702,29 +3820,39 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 
 	tests.Add("should log a target down once when it crosses the failover threshold", test{
 		aStatus:  always502,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, time.Second},
 		wantDown: 1,
 		wantUp:   0,
 	})
 	tests.Add("should re-log a target down after it recovers and fails again", test{
 		aStatus:  recoverOnProbe,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, 30 * time.Second, time.Second, 16 * time.Second},
 		wantDown: 2,
 		wantUp:   1,
 	})
 	tests.Add("should log a target up when a demoted target recovers", test{
 		aStatus:  recoverOnProbe,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{16 * time.Second, 30 * time.Second},
 		wantDown: 1,
 		wantUp:   1,
 	})
 	tests.Add("should not log a target up that was never down", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusOK },
 		advances: []time.Duration{time.Second},
 		wantDown: 0,
 		wantUp:   0,
 	})
 	tests.Add("should log a target down that the departed client's walk discovered", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
 			if call == 1 {
 				clientLeaves()
@@ -3737,6 +3865,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should date a refused target's streak at the refusal", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		advances: []time.Duration{time.Second},
 		wantDown: 1,
@@ -3747,6 +3877,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should announce a demotion the streak never reported", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
@@ -3760,6 +3892,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should stay silent when a target is demoted twice in one streak", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusUnauthorized
@@ -3772,6 +3906,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:     0,
 	})
 	tests.Add("should report a refused target when it is refused, not when a walk later finds it", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
 		downFields: map[string]any{
@@ -3781,6 +3917,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should report a throttled target when it is throttled, not when a walk later finds it", test{
+		aBody:      badGateway,
+		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: 50 * time.Second,
 		wantDown:   1,
@@ -3792,6 +3930,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say understudy benched a target that answered nothing", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(int, context.CancelFunc) int {
 			time.Sleep(defaultHeaderStallGate + time.Second)
 			return http.StatusOK
@@ -3805,6 +3945,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should log a transition the departed client discovered", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, clientLeaves context.CancelFunc) int {
 			if call < 2 {
 				return http.StatusBadGateway
@@ -3818,6 +3960,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	})
 	tests.Add("should not log a transition when a target recovers within the failover threshold", test{
 		aStatus:  recoverWithinGrace,
+		aBody:    badGateway,
+		targets:  bothTargets,
 		advances: []time.Duration{5 * time.Second},
 		wantDown: 0,
 		wantUp:   0,
@@ -3829,6 +3973,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 			return http.StatusOK
 		},
+		aBody:      badGateway,
+		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
 		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
 		wantDown:   1,
@@ -3841,6 +3987,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 			return http.StatusBadGateway
 		},
+		aBody:      badGateway,
+		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
 		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
 		wantDown:   1,
@@ -3849,6 +3997,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 	// synctest's clock starts at midnight UTC 2000-01-01, so every moment below is
 	// an offset from it; slog renders them local.
 	tests.Add("should say understudy's own probe pacing holds a target back", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  always502,
 		advances: []time.Duration{16 * time.Second, time.Second},
 		wantDown: 1,
@@ -3863,6 +4013,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say an upstream's advertised backoff holds a target back", test{
+		aBody:   badGateway,
+		targets: bothTargets,
 		aStatus: func(call int, _ context.CancelFunc) int {
 			if call == 1 {
 				return http.StatusTooManyRequests
@@ -3880,6 +4032,8 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 1,
 	})
 	tests.Add("should say what a target answered when a walk discovers its streak", test{
+		aBody:      badGateway,
+		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: time.Second,
 		advances:   []time.Duration{16 * time.Second},
@@ -3891,12 +4045,23 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 	tests.Add("should say what a backend answered when it went down", test{
+		aBody:    badGateway,
+		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
 		wantDown: 1,
 		downFields: map[string]any{
 			"upstream_error": "upstream returned status 401: bad gateway",
 		},
 		wantUp: 0,
+	})
+
+	tests.Add("should not announce a lone target down while it is only swapping models", test{
+		aStatus:  func(int, context.CancelFunc) int { return http.StatusServiceUnavailable },
+		aBody:    `{"error":{"message":"server busy","code":"unavailable"}}`,
+		targets:  []Target{{backend: "a", model: "ma"}},
+		advances: []time.Duration{16 * time.Second, 16 * time.Second},
+		wantDown: 0,
+		wantUp:   0,
 	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
@@ -3909,7 +4074,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			clientA := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 				callsA++
 				status := tt.aStatus(callsA, clientGone)
-				body := `{"error":{"message":"bad gateway"}}`
+				body := tt.aBody
 				if status == http.StatusOK {
 					body = `{"id":"from-a"}`
 				}
@@ -3927,7 +4092,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 				"b": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
 			}
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}}}, nil
+				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
 			srv := New(validator, WithLogger(logger))
 
@@ -4008,50 +4173,104 @@ func TestChatCompletionsLimiterCancelNamesTheWaitPoint(t *testing.T) {
 	})
 }
 
-func TestChatCompletionsShedsWhenProcessBudgetExhausted(t *testing.T) {
+// TestChatCompletionsProcessBudgetShed covers what a client turned away by the
+// process-wide FD budget is told. Each step is one request, advanced by the wait
+// the previous step was handed — a client doing as it was told.
+func TestChatCompletionsProcessBudgetShed(t *testing.T) {
 	t.Parallel()
 
-	synctest.Test(t, func(t *testing.T) {
-		logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	type step struct {
+		wantStatus     int
+		wantRetryAfter string
+	}
+	type test struct {
+		steps []step
+	}
 
-		// The upstream blocks so the holder keeps its process slot; with a budget of
-		// one, the next request must be shed rather than served.
-		backend := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
-			<-r.Context().Done()
-			return nil, r.Context().Err()
-		})
-		backends := map[string]Backend{
-			"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: backend}},
-		}
-		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-			return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}}}, nil
-		}}
-		// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
-		srv := New(validator, WithLogger(logger), withFDSoftLimit(66)).(*server)
+	tests := testy.NewTable[test]()
 
-		req := func(ctx context.Context) *http.Request {
-			r, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
-			if err != nil {
-				t.Fatal(err)
+	tests.Add("should turn a client away when the budget is exhausted", test{
+		steps: []step{{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"}},
+	})
+	tests.Add("should make a client wait longer the longer the budget stays full", test{
+		steps: []step{
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+		},
+	})
+
+	// TODO(TODO.d/understudy-process-budget-shed.md): add "should start the wait over
+	// once the budget has had room again" — a case needs the holder to let its slot
+	// go and a later one to take it, which the steps cannot express today.
+	// TODO(TODO.d/understudy-process-budget-shed.md): add "should not send every shed
+	// client back at the same moment". The scatter is applied here but driven only
+	// through the busy path, so dropping it here would go unnoticed.
+	tests.Add("should stop lengthening the wait once it reaches the ceiling", test{
+		steps: []step{
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+			{wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "30"},
+		},
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			// The upstream blocks so the holder keeps its process slot; with a budget
+			// of one, every later request must be shed rather than served.
+			backend := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			})
+			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: backend}}},
+					Models:   map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}},
+				}, nil
+			}}
+			// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
+			srv := New(validator, WithLogger(testLogger(t)), withFDSoftLimit(66)).(*server)
+			// These cases assert the advertised interval exactly; scattering it is
+			// TestChatCompletionsScattersBusyBackoff's subject.
+			srv.jitterFactor = 0
+			// The holder must keep its slot for as long as a case runs, so the stall
+			// gate must not reclaim it partway through and end the saturation.
+			srv.headerStallGate = time.Hour
+
+			req := func() *http.Request {
+				r, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.Header.Set("Authorization", "Bearer user-token")
+				r.Header.Set("Content-Type", "application/json")
+				return r
 			}
-			r.Header.Set("Authorization", "Bearer user-token")
-			r.Header.Set("Content-Type", "application/json")
-			return r
-		}
 
-		// A holder takes the single process slot and blocks in the upstream.
-		go func() { srv.ServeHTTP(httptest.NewRecorder(), req(t.Context())) }()
-		synctest.Wait()
+			go func() { srv.ServeHTTP(httptest.NewRecorder(), req()) }()
+			synctest.Wait()
 
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req(t.Context()))
+			for i, s := range tt.steps {
+				rec := httptest.NewRecorder()
+				srv.ServeHTTP(rec, req())
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
-		if got := rec.Header().Get("Retry-After"); got != "5" {
-			t.Errorf("Retry-After = %q, want %q", got, "5")
-		}
+				if rec.Code != s.wantStatus {
+					t.Errorf("step %d: status got %d, want %d", i, rec.Code, s.wantStatus)
+				}
+				if got := rec.Header().Get("Retry-After"); got != s.wantRetryAfter {
+					t.Errorf("step %d: Retry-After got %q, want %q", i, got, s.wantRetryAfter)
+				}
+
+				waited, err := strconv.Atoi(s.wantRetryAfter)
+				if err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(time.Duration(waited) * time.Second)
+				synctest.Wait()
+			}
+		})
 	})
 }
 
@@ -4883,7 +5102,7 @@ func TestUpstreamLimiterAcquire(t *testing.T) {
 // it took — the observable capacity, without reading the private limit field.
 func acquirable(l *upstreamLimiter) int {
 	n := 0
-	for l.tryAcquire() {
+	for ok, _ := l.tryAcquire(); ok; ok, _ = l.tryAcquire() {
 		n++
 	}
 	return n
@@ -4957,7 +5176,7 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 		newLimiter: func() *upstreamLimiter {
 			l := newUpstreamLimiter(4)
 			for range 4 {
-				l.tryAcquire()
+				_, _ = l.tryAcquire()
 			}
 			l.throttle() // measures a cap of 3 and records it as known-good
 			for range 4 {
@@ -4977,6 +5196,59 @@ func TestUpstreamLimiterGrow(t *testing.T) {
 			t.Errorf("acquirable slots: got %d, want %d", got, tt.wantSlots)
 		}
 	})
+}
+
+// TestChatCompletionsScattersBusyBackoff verifies clients waiting on one busy
+// backend are not all told to return at the same instant. Every client at the
+// same moment derives its interval from one shared clock, so an unscattered
+// backoff would send them back together — and again, and again.
+func TestChatCompletionsScattersBusyBackoff(t *testing.T) {
+	t.Parallel()
+
+	client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return &BackendConfig{
+			Backends: map[string]Backend{"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: client}}},
+			Models:   map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}},
+		}, nil
+	}}
+	srv := New(validator, WithLogger(testLogger(t)))
+
+	told := make(map[int]struct{})
+	for range 20 {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer user-token")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+
+		wait, err := strconv.Atoi(rr.Header().Get("Retry-After"))
+		if err != nil {
+			t.Fatalf("client was told to return after %q: %v", rr.Header().Get("Retry-After"), err)
+		}
+		told[wait] = struct{}{}
+	}
+
+	// Scattering a 5s interval may shorten a client's wait but never lengthen it:
+	// below 1s sends it back at once, past 5s makes it sit out a swap that may
+	// already have finished.
+	for wait := range told {
+		if hi := int(graduatedBackoffBase / time.Second); wait < 1 || wait > hi {
+			t.Errorf("client was told to return after %ds, outside the 1-%ds a scattered interval may span", wait, hi)
+		}
+	}
+	if len(told) < 2 {
+		t.Errorf("every client was told to return after %v; they will come back in lockstep", told)
+	}
 }
 
 func TestUpstreamLimiterThrottle(t *testing.T) {
@@ -5036,7 +5308,7 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 	tests.Run(t, func(t *testing.T, tt test) {
 		l := newUpstreamLimiter(tt.start)
 		for range tt.acquire {
-			if !l.tryAcquire() {
+			if ok, _ := l.tryAcquire(); !ok {
 				t.Fatal("could not fill the limiter for the throttle setup")
 			}
 		}
@@ -5124,16 +5396,6 @@ func TestServerProcessSlotBudget(t *testing.T) {
 	})
 }
 
-// retryAfterErr wraps an error with a fixed RetryAfter deadline, satisfying the
-// interface classifyLimit looks up via errors.AsType.
-type retryAfterErr struct {
-	error
-	at time.Time
-}
-
-func (e retryAfterErr) RetryAfter() time.Time { return e.at }
-func (e retryAfterErr) Unwrap() error         { return e.error }
-
 func TestClassifyLimit(t *testing.T) {
 	t.Parallel()
 
@@ -5155,6 +5417,7 @@ func TestClassifyLimit(t *testing.T) {
 		want: limitClassification{
 			status:      http.StatusBadGateway,
 			isRateLimit: false,
+			isRetryable: true,
 			condition:   notRateLimited,
 		},
 	})
@@ -5165,13 +5428,14 @@ func TestClassifyLimit(t *testing.T) {
 		want: limitClassification{
 			status:      http.StatusTooManyRequests,
 			isRateLimit: true,
+			isRetryable: true,
 			condition:   signalless,
 		},
 	})
 	tests.AddFunc("should classify a 429 with a Retry-After at the sustained-rate threshold as sustainedRate", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(rateLimitDemotionThreshold),
 				}
@@ -5179,6 +5443,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    rateLimitDemotionThreshold,
 				condition:     sustainedRate,
@@ -5188,7 +5453,7 @@ func TestClassifyLimit(t *testing.T) {
 	tests.AddFunc("should classify a 429 with a Retry-After just below the sustained-rate threshold as transientRate", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(rateLimitDemotionThreshold - time.Second),
 				}
@@ -5196,6 +5461,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    rateLimitDemotionThreshold - time.Second,
 				condition:     transientRate,
@@ -5205,7 +5471,7 @@ func TestClassifyLimit(t *testing.T) {
 	tests.AddFunc("should reject a 429 with a Retry-After beyond the passthrough ceiling", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
-				return retryAfterErr{
+				return retryAfterError{
 					error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited")),
 					at:    time.Now().Add(maxPassthroughRetryAfter + time.Second),
 				}
@@ -5213,6 +5479,7 @@ func TestClassifyLimit(t *testing.T) {
 			want: limitClassification{
 				status:        http.StatusTooManyRequests,
 				isRateLimit:   true,
+				isRetryable:   true,
 				hasRetryAfter: true,
 				retryAfter:    maxPassthroughRetryAfter + time.Second,
 				shouldReject:  true,

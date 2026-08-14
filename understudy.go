@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"slices"
@@ -118,10 +119,9 @@ const defaultRecoveryInterval = 30 * time.Second
 // TODO.d/understudy-adaptive-coordinated-backoff.md.
 const defaultHeaderStallGate = 20 * time.Second
 
-// synthesizedStallBackoff is the bounded Retry-After understudy synthesizes for a
-// pre-header stall, which carries none: it benches the stalled target until the
-// interval elapses. Provisional; see
-// TODO.d/understudy-adaptive-coordinated-backoff.md.
+// synthesizedStallBackoff is how long a stalled target is benched before a probe
+// may try it again — understudy's own routing, never a wait handed to a client.
+// Provisional; see TODO.d/understudy-adaptive-coordinated-backoff.md.
 const synthesizedStallBackoff = 30 * time.Second
 
 // errHeaderStall marks an upstream attempt cancelled by the header-stall gate.
@@ -154,6 +154,11 @@ type targetHealth struct {
 	// lastTouch is when the entry was last written, the age the eviction sweep
 	// measures.
 	lastTouch time.Time
+	// busySince is when the target's current run of at-capacity answers began, or
+	// zero. It is not a failure streak — an entry carrying only this one describes
+	// a target still fit to serve — but it bounds how long the run may go on being
+	// answered with another backoff.
+	busySince time.Time
 }
 
 // healthTTL is how long a health entry may sit untouched before the
@@ -191,9 +196,11 @@ const (
 	defaultFDSoftLimitFallback uint64 = 1024
 )
 
-// TODO(TODO.d/understudy-process-budget-shed.md): grow the backoff with sustained
-// saturation instead of a fixed value.
-const processBudgetRetryAfter = 5 * time.Second
+// maxShedBackoff bounds the wait a client turned away by the process budget is
+// given. Slots free as requests finish, so this is a ceiling on backpressure, not
+// a bench: left to climb, the shed would eventually park a client for longer than
+// the reject exists to prevent.
+const maxShedBackoff = 30 * time.Second
 
 // fdSlotBudget converts an FD soft limit into a process-wide concurrent-request
 // budget, floored at 1 so an unusually small limit still admits work.
@@ -228,6 +235,9 @@ type server struct {
 	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
 	headerStallGate   time.Duration
+	// jitterFactor scatters a synthesized backoff; zero advertises the interval
+	// exactly, which only a test asserting fixed values wants.
+	jitterFactor float64
 
 	maxConcurrentPerUpstream int
 
@@ -263,7 +273,13 @@ type upstreamLimiter struct {
 	// successes accrue toward the next additive step, once the cap has climbed
 	// back to the known-good boundary; a full round of them raises it by one.
 	successes int
-	ready     chan struct{}
+	// saturatedSince is when the limiter last ran out of slots, timing the squeeze
+	// for a caller that sheds rather than waits. It survives a release and is
+	// cleared by the next slot tryAcquire hands out — which is soon enough, since
+	// only a failed tryAcquire reads it and the limiter cannot fill again without
+	// handing one out first.
+	saturatedSince time.Time
+	ready          chan struct{}
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
@@ -297,15 +313,22 @@ func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
 
 // tryAcquire takes a slot if one is free and reports whether it did, never
 // blocking — the non-blocking counterpart to acquire, for callers that shed
-// rather than wait when the limiter is full.
-func (l *upstreamLimiter) tryAcquire() bool {
+// rather than wait when the limiter is full. On failure it also reports how long
+// the limiter has been full, so a caller shedding can tell a passing squeeze from
+// a process that has been pegged for a while. A slot taken ends the run: the
+// limiter had room, so whatever was holding it has cleared.
+func (l *upstreamLimiter) tryAcquire() (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.inflight < l.limit {
+		l.saturatedSince = time.Time{}
 		l.inflight++
-		return true
+		return true, 0
 	}
-	return false
+	if l.saturatedSince.IsZero() {
+		l.saturatedSince = time.Now()
+	}
+	return false, time.Since(l.saturatedSince)
 }
 
 // neverRetryableError lets the response path recognize a failure no delay can
@@ -492,6 +515,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		providers:                make(map[string]providers.Handler),
 		failoverThreshold:        defaultFailoverThreshold,
 		terminalThreshold:        maxPassthroughRetryAfter,
+		jitterFactor:             defaultJitterFactor,
 		recoveryInterval:         defaultRecoveryInterval,
 		headerStallGate:          defaultHeaderStallGate,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
@@ -616,7 +640,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		}
 		id := healthKey(t, backends)
 		h, failing := s.health[id]
-		if !failing || now.Sub(h.failingSince) <= s.failoverThreshold {
+		// An entry with no streak is a target being tracked for something other than
+		// failure — a busy run — and is still fit to serve.
+		if !failing || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold {
 			return pick{target: t, ok: true, skipped: skipped}
 		}
 		if due := s.nextReattempt(h); now.Before(due) {
@@ -893,6 +919,38 @@ func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter tim
 	}
 }
 
+// recordBusy marks t as answering at capacity and returns when its current busy
+// run began, so a run outlasting the terminal threshold can stop being answered
+// with another backoff. The run ends when t serves a request, which drops the
+// entry.
+func (s *server) recordBusy(t Target, backends map[string]Backend) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := healthKey(t, backends)
+	now := time.Now()
+	h := s.health[id]
+	if h.busySince.IsZero() {
+		h.busySince = now
+	}
+	h.lastTouch = now
+	s.health[id] = h
+	return h.busySince
+}
+
+// withSynthesizedBackoff attaches understudy's own Retry-After to a retryable
+// failure the upstream left unbounded, grown from how long t has been failing, so
+// a client backs off understudy's interval rather than its own flat one. An
+// upstream that named its own delay keeps it, and a failure repeating cannot
+// answer gets none — a backoff would only spend the client's time. A cancellation
+// is the caller's own signal travelling back out, not a failure to come back to.
+func (s *server) withSynthesizedBackoff(ctx context.Context, t Target, backends map[string]Backend, err error) error {
+	sig := classifyLimit(err)
+	if !sig.isRetryable || sig.hasRetryAfter || errors.Is(err, context.Cause(ctx)) {
+		return err
+	}
+	return retryAfterError{error: err, at: time.Now().Add(graduatedBackoff(s.failingFor(t, backends), s.jitterFactor))}
+}
+
 // failingFor reports how long t's current failure streak has run, or zero when
 // t is healthy.
 func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration {
@@ -952,6 +1010,21 @@ func (s *server) terminalFailure(t Target, remaining []Target, backends map[stri
 	}
 	return terminalError{err}
 }
+
+// retryAfterError attaches a Retry-After deadline to an error carrying none, so
+// classifyLimit and the response path read a backoff understudy synthesized
+// exactly as they read an upstream's own.
+type retryAfterError struct {
+	error
+	at time.Time
+}
+
+// RetryAfter returns the moment understudy is asking the client to come back.
+func (e retryAfterError) RetryAfter() time.Time { return e.at }
+
+// Unwrap returns the underlying error so that errors.Is/As and
+// yerrors.HTTPStatus can still traverse the chain.
+func (e retryAfterError) Unwrap() error { return e.error }
 
 // terminalError marks an upstream failure understudy has stopped relaying. It
 // carries the verdict only — the backoff the reject advertises is the response
@@ -1040,6 +1113,34 @@ func isAccessRefused(err error) bool {
 // stalling on it for the length of the advertised backoff.
 const rateLimitDemotionThreshold = 30 * time.Second
 
+// graduatedBackoffBase is the first interval advertised for a condition
+// understudy cannot time — a model swap, an upstream throttle.
+const graduatedBackoffBase = 5 * time.Second
+
+// defaultJitterFactor is the fraction of an interval a scattered value may fall
+// short of it.
+const defaultJitterFactor = 0.5
+
+// graduatedBackoff returns the interval to advertise for a condition running for
+// elapsed, doubling per interval already waited out (5 → 10 → 20 → 40 …) and
+// scattered short of it by up to jitter. Elapsed rather than a retry count,
+// because the retries are the client's and understudy sees only separate
+// requests — which also means every client on one condition derives the same
+// interval, and unscattered they would return together forever. It grows for as
+// long as it is asked; the caller decides when to stop answering with a wait.
+func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
+	interval := graduatedBackoffBase
+	for remaining := elapsed; remaining >= interval; interval *= 2 {
+		remaining -= interval
+	}
+	// Downward only: returning early costs one cheap answer, while waiting past the
+	// interval delays a condition that may already have cleared. The factor stays in
+	// (1-jitter, 1], so nobody is sent back at once.
+	//nolint:gosec // G404: the scatter separates retrying clients; it is not a
+	// secret and nothing is weakened by it being predictable.
+	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
+}
+
 // synthesizedRateLimitRetryAfter is the backoff understudy advertises to the
 // client for a 429 the upstream left unbounded (no Retry-After), so the client
 // waits instead of retrying immediately.
@@ -1079,6 +1180,10 @@ type limitClassification struct {
 	status int
 	// isRateLimit reports status == 429 Too Many Requests.
 	isRateLimit bool
+	// isRetryable reports a failure repeating could answer: a rate limit, or an
+	// upstream 5xx. Any other 4xx fails identically on repeat, so handing one a
+	// backoff would only spend the client's time.
+	isRetryable bool
 	// hasRetryAfter reports that the upstream advertised a Retry-After still
 	// outstanding; one that has elapsed counts as no advertisement.
 	hasRetryAfter bool
@@ -1101,6 +1206,7 @@ func classifyLimit(err error) limitClassification {
 	}
 	sig := limitClassification{status: responseStatus(err)}
 	sig.isRateLimit = sig.status == http.StatusTooManyRequests
+	sig.isRetryable = sig.isRateLimit || sig.status >= http.StatusInternalServerError
 	if ra, ok := errors.AsType[interface {
 		error
 		RetryAfter() time.Time
@@ -1532,7 +1638,7 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 				case http.StatusTooManyRequests:
 					writeRetryAfterReject(r.Context(), w, err, sig.retryAfter, errTypeUpstreamRateLimited, "upstream rate limited")
 					return
-				case http.StatusBadGateway:
+				case http.StatusBadGateway, http.StatusServiceUnavailable:
 					writeRetryAfterReject(r.Context(), w, err, sig.retryAfter, errTypeUpstreamUnavailable, "upstream unavailable")
 					return
 				}
@@ -1545,7 +1651,7 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 			// limit — a 503 that named its own return is worth relaying. A request the
 			// upstream faulted on (400, 404) is not retryable, so a delay it advertised
 			// means nothing.
-			if sig.hasRetryAfter && (sig.isRateLimit || isFatalUpstream(err)) {
+			if sig.hasRetryAfter && sig.isRetryable {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
 			}
 			// A rate limit the upstream left unbounded still needs a client backoff.
@@ -1847,8 +1953,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	// goroutines and buffered bodies the budget exists to protect, so backpressure
 	// goes to the client instead. Acquired once for the whole request, not per
 	// failover attempt, because a request holds at most one upstream connection.
-	if !s.processLimiter.tryAcquire() {
-		w.Header().Set("Retry-After", strconv.Itoa(int(processBudgetRetryAfter/time.Second)))
+	if ok, saturatedFor := s.processLimiter.tryAcquire(); !ok {
+		shedFor := min(graduatedBackoff(saturatedFor, s.jitterFactor), maxShedBackoff)
+		w.Header().Set("Retry-After", strconv.Itoa(int(shedFor.Round(time.Second)/time.Second)))
 		return yerrors.WithHTTPStatusf(http.StatusServiceUnavailable, "process FD budget exhausted (in-flight %d)", s.processLimiter.inFlight())
 	}
 	defer s.processLimiter.release()
@@ -2014,6 +2121,34 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			return stalled
 		}
+		// errHeaderStall's disposition, told rather than inferred. Ahead of
+		// recordFailure: a loading target spends no streak.
+		if logicalTargets != nil && errors.Is(err, providers.ErrServerBusy) {
+			tried = append(tried, healthKey(chosen, backend.Backends))
+			releaseHeld()
+			cancel(nil)
+			if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
+				s.recordRateLimited(r.Context(), chosen, synthesizedStallBackoff, backend.Backends, err)
+				lastFailure = &failedAttempt{
+					answer:        clientFacing(ctx, err),
+					raw:           err,
+					target:        chosen,
+					backend:       parsedBackendName,
+					upstreamModel: upstreamModel,
+				}
+				continue
+			}
+			// Nowhere to replay to: hand the client the wait instead of a verdict, so
+			// it comes back to a target that will by then have finished loading. Past
+			// the terminal threshold it plainly is not loading, and repeating the wait
+			// would only keep the client coming back to a backend that never serves.
+			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
+			busyFor := time.Since(s.recordBusy(chosen, backend.Backends))
+			if busyFor > s.terminalThreshold {
+				return terminalError{err}
+			}
+			return retryAfterError{error: err, at: time.Now().Add(graduatedBackoff(busyFor, s.jitterFactor))}
+		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen
@@ -2119,5 +2254,5 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		f.record(r.Context())
 		answer, answering = throttled.answer, throttled.target
 	}
-	return s.terminalFailure(answering, remaining, backend.Backends, answer)
+	return s.terminalFailure(answering, remaining, backend.Backends, s.withSynthesizedBackoff(r.Context(), answering, backend.Backends, answer))
 }

@@ -146,6 +146,35 @@ func TestModelsBoundsCallWithinTimeout(t *testing.T) {
 	}
 }
 
+type chatResult struct {
+	Status     int
+	ServerBusy bool
+	RetryAfter time.Time
+	ErrorType  string
+	Attrs      map[string]any
+}
+
+func newChatResult(resp *http.Response, err error) chatResult {
+	got := chatResult{
+		Status:     yerrors.HTTPStatus(err),
+		ServerBusy: errors.Is(err, providers.ErrServerBusy),
+		Attrs:      map[string]any{},
+	}
+	if err == nil {
+		got.Status = resp.StatusCode
+	}
+	if ra, ok := yerrors.AsType[interface{ RetryAfter() time.Time }](err); ok {
+		got.RetryAfter = ra.RetryAfter()
+	}
+	if et, ok := yerrors.AsType[interface{ ErrorType() string }](err); ok {
+		got.ErrorType = et.ErrorType()
+	}
+	for _, a := range yerrors.Attrs(err) {
+		got.Attrs[a.Key] = a.Value.Any()
+	}
+	return got
+}
+
 // TestChatResponse verifies what Chat surfaces to the caller given the
 // backend's behavior. Cases vary backend status, headers, reachability, ctx,
 // and custom client.
@@ -155,13 +184,10 @@ func TestChatResponse(t *testing.T) {
 	type test struct {
 		cfg             providers.Config
 		ctx             context.Context
-		wantStatus      int
+		want            chatResult
 		wantHeaders     http.Header
 		wantErr         string
 		wantErrExcludes string
-		wantRetryAfter  time.Time
-		wantErrorType   string
-		wantAttrs       map[string]any
 	}
 
 	tests := testy.NewTable[test]()
@@ -169,34 +195,38 @@ func TestChatResponse(t *testing.T) {
 	tests.AddFunc("should propagate backend's 200 status", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusOK, nil, "")
 		return test{
-			cfg:        providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantStatus: http.StatusOK,
+			cfg:  providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			want: chatResult{Status: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should return error carrying upstream message on non-2xx", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusUnauthorized, http.Header{"Content-Type": {"application/json"}}, `{"error":{"message":"invalid api key"}}`)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "invalid api key",
-			wantStatus:    http.StatusUnauthorized,
-			wantErrorType: "server_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusUnauthorized),
-				"upstream_error_type":    "server_error",
-				"upstream_error_message": "invalid api key",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "invalid api key",
+			want: chatResult{
+				Status:    http.StatusUnauthorized,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusUnauthorized),
+					"upstream_error_type":    "server_error",
+					"upstream_error_message": "invalid api key",
+				},
 			},
 		}
 	})
 	tests.AddFunc("should fall back to raw body when error is not the JSON envelope", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusBadGateway, http.Header{"Content-Type": {"text/html"}}, "<html>502 Bad Gateway</html>")
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "502 Bad Gateway",
-			wantStatus:    http.StatusBadGateway,
-			wantErrorType: "server_error",
-			wantAttrs: map[string]any{
-				"upstream_status":     int64(http.StatusBadGateway),
-				"upstream_error_type": "server_error",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "502 Bad Gateway",
+			want: chatResult{
+				Status:    http.StatusBadGateway,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":     int64(http.StatusBadGateway),
+					"upstream_error_type": "server_error",
+				},
 			},
 		}
 	})
@@ -205,15 +235,17 @@ func TestChatResponse(t *testing.T) {
 			http.Header{"Content-Type": {"application/json"}, "Retry-After": {"Wed, 21 Oct 2026 07:28:00 GMT"}},
 			`{"error":{"message":"rate limited"}}`)
 		return test{
-			cfg:            providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:        "rate limited",
-			wantStatus:     http.StatusTooManyRequests,
-			wantRetryAfter: time.Date(2026, time.October, 21, 7, 28, 0, 0, time.UTC),
-			wantErrorType:  "rate_limit_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusTooManyRequests),
-				"upstream_error_type":    "rate_limit_error",
-				"upstream_error_message": "rate limited",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "rate limited",
+			want: chatResult{
+				Status:     http.StatusTooManyRequests,
+				RetryAfter: time.Date(2026, time.October, 21, 7, 28, 0, 0, time.UTC),
+				ErrorType:  "rate_limit_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusTooManyRequests),
+					"upstream_error_type":    "rate_limit_error",
+					"upstream_error_message": "rate limited",
+				},
 			},
 		}
 	})
@@ -227,8 +259,8 @@ func TestChatResponse(t *testing.T) {
 		}
 		srvURL, _ := newCapturingServer(t, http.StatusOK, hdrs, "")
 		return test{
-			cfg:        providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantStatus: http.StatusOK,
+			cfg:  providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			want: chatResult{Status: http.StatusOK},
 			wantHeaders: http.Header{
 				"Content-Type":        {"text/event-stream"},
 				"Retry-After":         {"30"},
@@ -237,19 +269,19 @@ func TestChatResponse(t *testing.T) {
 		}
 	})
 	tests.Add("should return error when backend is unreachable", test{
-		cfg:        providers.Config{BaseURL: mustParseURL(t, "http://127.0.0.1:1"), APIKey: "sk-test"},
-		wantErr:    "connect",
-		wantStatus: http.StatusBadGateway,
+		cfg:     providers.Config{BaseURL: mustParseURL(t, "http://127.0.0.1:1"), APIKey: "sk-test"},
+		wantErr: "connect",
+		want:    chatResult{Status: http.StatusBadGateway},
 	})
 	tests.AddFunc("should return ctx.Err() when context is cancelled", func(t *testing.T) test {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		srvURL, _ := newCapturingServer(t, http.StatusOK, nil, "")
 		return test{
-			cfg:        providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			ctx:        ctx,
-			wantErr:    "context canceled",
-			wantStatus: http.StatusInternalServerError,
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			ctx:     ctx,
+			wantErr: "context canceled",
+			want:    chatResult{Status: http.StatusInternalServerError},
 		}
 	})
 	tests.AddFunc("should leave a custom-caused cancellation status-less", func(t *testing.T) test {
@@ -258,10 +290,10 @@ func TestChatResponse(t *testing.T) {
 		cancel(errCustom)
 		srvURL, _ := newCapturingServer(t, http.StatusOK, nil, "")
 		return test{
-			cfg:        providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			ctx:        ctx,
-			wantErr:    "custom shutdown",
-			wantStatus: http.StatusInternalServerError,
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			ctx:     ctx,
+			wantErr: "custom shutdown",
+			want:    chatResult{Status: http.StatusInternalServerError},
 		}
 	})
 	tests.AddFunc("should use Config.Client when provided", func(t *testing.T) test {
@@ -273,50 +305,56 @@ func TestChatResponse(t *testing.T) {
 			}, nil
 		})
 		return test{
-			cfg:        providers.Config{BaseURL: mustParseURL(t, "http://nonexistent.invalid"), APIKey: "sk-test", HTTPClient: client},
-			wantStatus: http.StatusOK,
+			cfg:  providers.Config{BaseURL: mustParseURL(t, "http://nonexistent.invalid"), APIKey: "sk-test", HTTPClient: client},
+			want: chatResult{Status: http.StatusOK},
 		}
 	})
 
 	tests.AddFunc("should carry an upstream 5xx as the status the upstream sent", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusInternalServerError, http.Header{"Content-Type": {"application/json"}}, `{"error":{"message":"kaboom"}}`)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "upstream returned status 500",
-			wantStatus:    http.StatusInternalServerError,
-			wantErrorType: "server_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusInternalServerError),
-				"upstream_error_type":    "server_error",
-				"upstream_error_message": "kaboom",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "upstream returned status 500",
+			want: chatResult{
+				Status:    http.StatusInternalServerError,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusInternalServerError),
+					"upstream_error_type":    "server_error",
+					"upstream_error_message": "kaboom",
+				},
 			},
 		}
 	})
 	tests.AddFunc("should type an upstream 400 as invalid_request_error", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusBadRequest, http.Header{"Content-Type": {"application/json"}}, `{"error":{"message":"bad input"}}`)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "bad input",
-			wantStatus:    http.StatusBadRequest,
-			wantErrorType: "invalid_request_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusBadRequest),
-				"upstream_error_type":    "invalid_request_error",
-				"upstream_error_message": "bad input",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "bad input",
+			want: chatResult{
+				Status:    http.StatusBadRequest,
+				ErrorType: "invalid_request_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusBadRequest),
+					"upstream_error_type":    "invalid_request_error",
+					"upstream_error_message": "bad input",
+				},
 			},
 		}
 	})
 	tests.AddFunc("should type an upstream 404 as invalid_request_error", func(t *testing.T) test {
 		srvURL, _ := newCapturingServer(t, http.StatusNotFound, http.Header{"Content-Type": {"application/json"}}, `{"error":{"message":"model not found"}}`)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "model not found",
-			wantStatus:    http.StatusNotFound,
-			wantErrorType: "invalid_request_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusNotFound),
-				"upstream_error_type":    "invalid_request_error",
-				"upstream_error_message": "model not found",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "model not found",
+			want: chatResult{
+				Status:    http.StatusNotFound,
+				ErrorType: "invalid_request_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusNotFound),
+					"upstream_error_type":    "invalid_request_error",
+					"upstream_error_message": "model not found",
+				},
 			},
 		}
 	})
@@ -325,15 +363,17 @@ func TestChatResponse(t *testing.T) {
 		srvURL, _ := newCapturingServer(t, http.StatusUnauthorized, http.Header{"Content-Type": {"application/json"}},
 			`{"error":{"message":"invalid api key","type":"authentication_error","code":"invalid_api_key"}}`)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "invalid api key",
-			wantStatus:    http.StatusUnauthorized,
-			wantErrorType: "authentication_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusUnauthorized),
-				"upstream_error_type":    "authentication_error",
-				"upstream_error_message": "invalid api key",
-				"upstream_error_code":    "invalid_api_key",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "invalid api key",
+			want: chatResult{
+				Status:    http.StatusUnauthorized,
+				ErrorType: "authentication_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusUnauthorized),
+					"upstream_error_type":    "authentication_error",
+					"upstream_error_message": "invalid api key",
+					"upstream_error_code":    "invalid_api_key",
+				},
 			},
 		}
 	})
@@ -342,17 +382,19 @@ func TestChatResponse(t *testing.T) {
 		body := `{"error":{"code":429,"message":"quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaValue":"20"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}`
 		srvURL, _ := newCapturingServer(t, http.StatusTooManyRequests, http.Header{"Content-Type": {"application/json"}}, body)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "quota exceeded",
-			wantStatus:    http.StatusTooManyRequests,
-			wantErrorType: "rate_limit_error",
-			wantAttrs: map[string]any{
-				"upstream_status":            int64(http.StatusTooManyRequests),
-				"upstream_error_type":        "rate_limit_error",
-				"upstream_error_message":     "quota exceeded",
-				"upstream_quota_id":          "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
-				"upstream_quota_value":       "20",
-				"upstream_quota_retry_delay": "42s",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "quota exceeded",
+			want: chatResult{
+				Status:    http.StatusTooManyRequests,
+				ErrorType: "rate_limit_error",
+				Attrs: map[string]any{
+					"upstream_status":            int64(http.StatusTooManyRequests),
+					"upstream_error_type":        "rate_limit_error",
+					"upstream_error_message":     "quota exceeded",
+					"upstream_quota_id":          "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+					"upstream_quota_value":       "20",
+					"upstream_quota_retry_delay": "42s",
+				},
 			},
 		}
 	})
@@ -361,16 +403,18 @@ func TestChatResponse(t *testing.T) {
 		body := `{"error":{"code":429,"message":"quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaValue":"5"},{"quotaId":"GenerateContentInputTokensPerModelPerMinute-FreeTier","quotaValue":"250000"}]}]}}`
 		srvURL, _ := newCapturingServer(t, http.StatusTooManyRequests, http.Header{"Content-Type": {"application/json"}}, body)
 		return test{
-			cfg:           providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
-			wantErr:       "quota exceeded",
-			wantStatus:    http.StatusTooManyRequests,
-			wantErrorType: "rate_limit_error",
-			wantAttrs: map[string]any{
-				"upstream_status":        int64(http.StatusTooManyRequests),
-				"upstream_error_type":    "rate_limit_error",
-				"upstream_error_message": "quota exceeded",
-				"upstream_quota_id":      "GenerateRequestsPerMinutePerProjectPerModel-FreeTier,GenerateContentInputTokensPerModelPerMinute-FreeTier",
-				"upstream_quota_value":   "5,250000",
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "quota exceeded",
+			want: chatResult{
+				Status:    http.StatusTooManyRequests,
+				ErrorType: "rate_limit_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusTooManyRequests),
+					"upstream_error_type":    "rate_limit_error",
+					"upstream_error_message": "quota exceeded",
+					"upstream_quota_id":      "GenerateRequestsPerMinutePerProjectPerModel-FreeTier,GenerateContentInputTokensPerModelPerMinute-FreeTier",
+					"upstream_quota_value":   "5,250000",
+				},
 			},
 		}
 	})
@@ -382,16 +426,57 @@ func TestChatResponse(t *testing.T) {
 			cfg:             providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
 			wantErr:         "quota exceeded",
 			wantErrExcludes: "type.googleapis.com",
-			wantStatus:      http.StatusTooManyRequests,
-			wantErrorType:   "rate_limit_error",
-			wantAttrs: map[string]any{
-				"upstream_status":            int64(http.StatusTooManyRequests),
-				"upstream_error_type":        "rate_limit_error",
-				"upstream_error_message":     "quota exceeded",
-				"upstream_error_code":        "429",
-				"upstream_quota_id":          "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
-				"upstream_quota_value":       "20",
-				"upstream_quota_retry_delay": "42s",
+			want: chatResult{
+				Status:    http.StatusTooManyRequests,
+				ErrorType: "rate_limit_error",
+				Attrs: map[string]any{
+					"upstream_status":            int64(http.StatusTooManyRequests),
+					"upstream_error_type":        "rate_limit_error",
+					"upstream_error_message":     "quota exceeded",
+					"upstream_error_code":        "429",
+					"upstream_quota_id":          "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+					"upstream_quota_value":       "20",
+					"upstream_quota_retry_delay": "42s",
+				},
+			},
+		}
+	})
+
+	tests.AddFunc("should report an upstream 503 coded unavailable as a busy server", func(t *testing.T) test {
+		srvURL, _ := newCapturingServer(t, http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}},
+			`{"error":{"message":"server busy","code":"unavailable"}}`)
+		return test{
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "server busy",
+			want: chatResult{
+				Status:     http.StatusServiceUnavailable,
+				ServerBusy: true,
+				ErrorType:  "server_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusServiceUnavailable),
+					"upstream_error_type":    "server_error",
+					"upstream_error_message": "server busy",
+					"upstream_error_code":    "unavailable",
+				},
+			},
+		}
+	})
+
+	tests.AddFunc("should leave a 503 carrying another code a generic failure", func(t *testing.T) test {
+		srvURL, _ := newCapturingServer(t, http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}},
+			`{"error":{"message":"server busy","code":"overloaded"}}`)
+		return test{
+			cfg:     providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
+			wantErr: "server busy",
+			want: chatResult{
+				Status:    http.StatusServiceUnavailable,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":        int64(http.StatusServiceUnavailable),
+					"upstream_error_type":    "server_error",
+					"upstream_error_message": "server busy",
+					"upstream_error_code":    "overloaded",
+				},
 			},
 		}
 	})
@@ -403,11 +488,13 @@ func TestChatResponse(t *testing.T) {
 			cfg:             providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"},
 			wantErr:         "x",
 			wantErrExcludes: "OVERFLOW_PAST_CAP",
-			wantStatus:      http.StatusBadGateway,
-			wantErrorType:   "server_error",
-			wantAttrs: map[string]any{
-				"upstream_status":     int64(http.StatusBadGateway),
-				"upstream_error_type": "server_error",
+			want: chatResult{
+				Status:    http.StatusBadGateway,
+				ErrorType: "server_error",
+				Attrs: map[string]any{
+					"upstream_status":     int64(http.StatusBadGateway),
+					"upstream_error_type": "server_error",
+				},
 			},
 		}
 	})
@@ -422,33 +509,10 @@ func TestChatResponse(t *testing.T) {
 		if !testy.ErrorMatchesRE(tt.wantErr, err) {
 			t.Errorf("unexpected error: got %v, want /%s/", err, tt.wantErr)
 		}
-		gotStatus := yerrors.HTTPStatus(err)
-		if err == nil {
-			gotStatus = resp.StatusCode
-		}
-		if want := cmp.Or(tt.wantStatus, http.StatusOK); gotStatus != want {
-			t.Errorf("status: got %d, want %d", gotStatus, want)
-		}
-		var gotRetryAfter time.Time
-		if ra, ok := yerrors.AsType[interface{ RetryAfter() time.Time }](err); ok {
-			gotRetryAfter = ra.RetryAfter()
-		}
-		if !gotRetryAfter.Equal(tt.wantRetryAfter) {
-			t.Errorf("RetryAfter: got %v, want %v", gotRetryAfter, tt.wantRetryAfter)
-		}
-		var gotErrorType string
-		if et, ok := yerrors.AsType[interface{ ErrorType() string }](err); ok {
-			gotErrorType = et.ErrorType()
-		}
-		if gotErrorType != tt.wantErrorType {
-			t.Errorf("ErrorType: got %q, want %q", gotErrorType, tt.wantErrorType)
-		}
-		gotAttrs := make(map[string]any)
-		for _, a := range yerrors.Attrs(err) {
-			gotAttrs[a.Key] = a.Value.Any()
-		}
-		if d := gocmp.Diff(tt.wantAttrs, gotAttrs, cmpopts.EquateEmpty()); d != "" {
-			t.Errorf("unexpected error attrs (-want +got):\n%s", d)
+		want := tt.want
+		want.Status = cmp.Or(want.Status, http.StatusOK) // a case that names no status expects 200
+		if d := gocmp.Diff(want, newChatResult(resp, err), cmpopts.EquateEmpty()); d != "" {
+			t.Errorf("unexpected result of the call (-want +got):\n%s", d)
 		}
 		if err != nil {
 			if tt.wantErrExcludes != "" && strings.Contains(err.Error(), tt.wantErrExcludes) {
