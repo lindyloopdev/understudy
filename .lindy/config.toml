@@ -1,0 +1,3 @@
+# The dev image lindy's own beats run in (DESIGN.md §Project Dev Image).
+[container]
+dockerfile = ".lindy/Dockerfile"
