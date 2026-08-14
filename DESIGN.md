@@ -618,10 +618,19 @@ coming; the schedule is the unattended fallback.
 
 **Request disposition: a Retry-After ladder.** Given a retryable failure and a
 healthy next target, understudy's disposition is gated by the remaining
-`Retry-After` against a **wait budget** — the tolerable in-request delay before
-switching, bounded by the client's own timeout and widened by the cost of the
-cheapest fallback (a dear fallback is worth waiting longer for):
+`Retry-After` — where the upstream sent one — against a **wait budget** — the
+tolerable in-request delay before switching, bounded by the client's own timeout
+and widened by the cost of the cheapest fallback (a dear fallback is worth waiting
+longer for):
 
+- **No delay sent → fail over.** A bare 429 gives the budget nothing to weigh:
+  understudy cannot know the wait is short, and the client will not wait out a
+  delay nobody gave it — opencode's agent turn makes a single attempt
+  (*Synthesized backoff* above). So the request goes to the next untried target
+  rather than becoming an error the caller cannot act on. Demotion stays the separate
+  question: a bare 429 is a capacity measurement (§Concurrency & Rate Limiting),
+  so the target keeps its place in the walk. Not yet held — the walk surfaces the
+  429 instead, [[fail-over-from-a-bare-429]].
 - **≤ wait budget → wait in place.** Sleep out the throttle and retry the *same*
   target; the client sees a slow success, never the 429, and the preferred model
   (its prompt cache, its coherence) is preserved. *(Staged — the transient-absorb

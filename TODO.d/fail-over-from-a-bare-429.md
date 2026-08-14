@@ -5,7 +5,8 @@
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — the Retry-After
 ladder and the failover walk the replay branch reads.
 [DESIGN.md §Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting)
-— the wait-vs-failover policy this entry disputes for the bare case.
+— a bare 429 as a capacity measurement, which is why this replay leaves the
+target's health alone.
 
 `bareRateLimit` and `transientRate` both answer the client a `429` and decline to
 demote or fail over, on the premise that the client waits the
