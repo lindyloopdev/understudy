@@ -365,7 +365,7 @@ func (l *upstreamLimiter) shrink() {
 	l.mu.Unlock()
 }
 
-// throttle reacts to a signal-less rate limit. A rejection arriving at
+// throttle reacts to a bare rate limit. A rejection arriving at
 // saturation is a capacity measurement — the account's limit sits just below the
 // count in flight at that moment — so the cap lands one slot under it and that
 // value is remembered as known-good. Halving is reserved for a rejection at or
@@ -1162,10 +1162,10 @@ const (
 	// a timed backoff long enough to treat the target as unhealthy and demote it,
 	// but not a concurrency limit — so it does not shrink the cap.
 	sustainedRate
-	// signalless is a 429 with no Retry-After — the ambiguous, unsignalled case
+	// bareRateLimit is a 429 with no Retry-After — the ambiguous, bare case
 	// (z.ai-shaped): it may be concurrency or an exhausted quota. It throttles the
 	// cap (see throttle) and accrues a streak, but never demotes on its own.
-	signalless
+	bareRateLimit
 )
 
 // limitClassification is understudy's classification of an upstream backpressure error
@@ -1193,7 +1193,7 @@ type limitClassification struct {
 	// on (a terminalError), which carries no Retry-After condition at all.
 	shouldReject bool
 	// condition is the nature of the limit; the shrink path reads it to distinguish
-	// a concurrency limit (signalless) from a timed backoff.
+	// a concurrency limit (a bare rate limit) from a timed backoff.
 	condition limitCondition
 }
 
@@ -1240,7 +1240,7 @@ func classifyLimit(err error) limitClassification {
 	case !sig.isRateLimit:
 		sig.condition = notRateLimited
 	case !sig.hasRetryAfter:
-		sig.condition = signalless
+		sig.condition = bareRateLimit
 	case sig.retryAfter >= rateLimitDemotionThreshold:
 		sig.condition = sustainedRate
 	default:
@@ -2159,10 +2159,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			if waited {
 				lim.grow()
 			}
-		case sig.condition == signalless:
+		case sig.condition == bareRateLimit:
 			lim.throttle()
 		}
-		// A signal-less 429 measures capacity, not health: the cap above has already
+		// A bare 429 measures capacity, not health: the cap above has already
 		// come down to what the account allows, so only a streak outlasting the
 		// failover threshold redirects.
 		demote := sig.condition == sustainedRate
@@ -2176,7 +2176,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				s.recordImmediateFailure(r.Context(), chosen, backend.Backends, err)
 			// None of these demotes. A transient 429's Retry-After is still honored
 			// for the client wait in the response path.
-			case sig.condition == transientRate || sig.condition == signalless || isFatalUpstream(err):
+			case sig.condition == transientRate || sig.condition == bareRateLimit || isFatalUpstream(err):
 				s.recordFailure(chosen, backend.Backends, err)
 			}
 		}

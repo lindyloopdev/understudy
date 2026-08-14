@@ -22,7 +22,7 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   and never consults a `Retry-After` — only title generation sets `retries: 2`.
   Every rung of this ladder assumes a client that waits, so name the consumer
   that does or the interval is written to nobody
-  ([[fail-over-from-an-unsignalled-429]] measures the cost: 25 dead reviewers in
+  ([[fail-over-from-a-bare-429]] measures the cost: 25 dead reviewers in
   one run).
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
@@ -135,6 +135,6 @@ circuit breaker (the binary degenerate of this backoff). Together they are the
 post-v1 **per-host availability layer**, all capped by the same threshold the
 stateless reject uses.
 
-The interval is also what a `5xx` or a signal-less `429` contributes to a walk's
+The interval is also what a `5xx` or a bare `429` contributes to a walk's
 verdict, so the rest of that comparison waits on this —
 [[weigh-every-candidates-contribution]].

@@ -505,7 +505,7 @@ upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** 
 `Retry-After` and injects it while preserving the retryable status, so a client
 backs off *understudy's* interval instead of its own. opencode's agent turn is
 not such a client — it calls the SDK with `maxRetries: 0` and makes one attempt,
-so nothing injected reaches it — [[fail-over-from-an-unsignalled-429]]. Only the `429` half is
+so nothing injected reaches it — [[fail-over-from-a-bare-429]]. Only the `429` half is
 built: a `5xx` with no delay still reaches the client bare, and the injected
 interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
 interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is
@@ -977,7 +977,7 @@ changes instrument there:
 - **At or above it — one slot per round.** Additive probing; the estimate is near the
   edge and each step must be cheap to retract.
 
-**A rejection is a measurement, not a reflex.** A signal-less 429 arriving while
+**A rejection is a measurement, not a reflex.** A bare 429 arriving while
 saturated says the account's limit is approximately the in-flight count at that moment —
 the most precise capacity reading understudy ever gets. It sets the cap just below that
 count and records it as the new known-good boundary. Halving instead would discard the
@@ -993,7 +993,7 @@ nothing.
 
 A 429 that carries a usable signal is not a concurrency measurement at all: it is quota
 or rate exhaustion, and it routes to quota-class-aware demotion (§Understudy) rather than
-to the cap. Only the signal-less case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
+to the cap. Only the bare case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
 feeds the estimator.
 
 **Per-upstream state outlives the tenant that taught it.** The learned cap is a property

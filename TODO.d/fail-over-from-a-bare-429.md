@@ -1,13 +1,13 @@
-# Fail over from a 429 the client will never wait out
+# Fail over from a bare 429 the client will never wait out
 
 **Tag:** understudy / ratelimit / fallback
 
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — the Retry-After
 ladder and the failover walk the replay branch reads.
 [DESIGN.md §Concurrency & Rate Limiting](../DESIGN.md#concurrency-rate-limiting)
-— the wait-vs-failover policy this entry disputes for the unsignalled case.
+— the wait-vs-failover policy this entry disputes for the bare case.
 
-`signalless` and `transientRate` both answer the client a `429` and decline to
+`bareRateLimit` and `transientRate` both answer the client a `429` and decline to
 demote or fail over, on the premise that the client waits the
 `Retry-After` out. Measured in the consumer, nothing does:
 
@@ -26,7 +26,7 @@ request dies on a target understudy has judged healthy and kept in service.
 Measured 2026-08-11 in lindy: one `review-examine` run lost 25 requests this way,
 each a dead reviewer, while untried targets remained in the logical model. The
 responses carried `retry-after: 60` — `synthesizedRateLimitRetryAfter` exactly —
-so the upstream sent nothing and the condition was `signalless`, the
+so the upstream sent nothing and the condition was `bareRateLimit`, the
 degenerate z.ai case [[understudy-ratelimit-signal-classifier]] describes.
 `transientRate` shares the premise and the same fate, but is not what production
 hit.
@@ -34,8 +34,8 @@ hit.
 ## Work
 
 - Widen the within-request replay branch (`sustainedRate || isAccessRefused` in
-  `chatCompletions`) to replay a `signalless` 429 onto an untried target. For an
-  unsignalled limit — most likely a concurrency ceiling — another target is the
+  `chatCompletions`) to replay a `bareRateLimit` 429 onto an untried target. For an
+  bare limit — most likely a concurrency ceiling — another target is the
   answer, and the walk already knows which are untried.
 - Decide `transientRate` on the same question rather than by analogy: a genuinely
   brief throttle it named may still be worth waiting *if* something waits. As

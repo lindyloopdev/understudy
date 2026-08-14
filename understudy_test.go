@@ -4387,7 +4387,7 @@ func TestChatCompletionsRetryAfterOverridesUnboundedDemotion(t *testing.T) {
 			return rec
 		}
 
-		// t=0: request 1 hits a, gets a signal-less 429, demoting a with readmitAt zero.
+		// t=0: request 1 hits a, gets a bare 429, demoting a with readmitAt zero.
 		doRequest()
 
 		// t=30: advance past the fixed 30s recovery interval so a is half-open-probed.
@@ -4607,7 +4607,7 @@ func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.
 
 		mu.Lock()
 		if maxInFlight != 1 {
-			t.Errorf("after seeding on the first signal-less 429: maxInFlight=%d, want 1", maxInFlight)
+			t.Errorf("after seeding on the first bare 429: maxInFlight=%d, want 1", maxInFlight)
 		}
 		mu.Unlock()
 
@@ -5278,7 +5278,7 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should seed the cap to the observed in-flight count on the first signal-less rate limit", test{
+	tests.Add("should seed the cap to the observed in-flight count on the first bare rate limit", test{
 		start:     8,
 		acquire:   3,
 		throttles: 1,
@@ -5290,7 +5290,7 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 2,
 		wantSlots: 3,
 	})
-	tests.Add("should set the cap just below the in-flight count when a signal-less rate limit arrives at saturation", test{
+	tests.Add("should set the cap just below the in-flight count when a bare rate limit arrives at saturation", test{
 		start:     4,
 		acquire:   4,
 		throttles: 1,
@@ -5302,7 +5302,7 @@ func TestUpstreamLimiterThrottle(t *testing.T) {
 		throttles: 2,
 		wantSlots: 3,
 	})
-	tests.Add("should hold the cap at one when a signal-less rate limit arrives at a saturated cap of one", test{
+	tests.Add("should hold the cap at one when a bare rate limit arrives at a saturated cap of one", test{
 		start:     1,
 		acquire:   1,
 		throttles: 1,
@@ -5433,7 +5433,7 @@ func TestClassifyLimit(t *testing.T) {
 			condition:   notRateLimited,
 		},
 	})
-	tests.Add("should classify a 429 with no Retry-After as signalless", test{
+	tests.Add("should classify a 429 with no Retry-After as a bare rate limit", test{
 		buildErr: func() error {
 			return yerrors.WithHTTPStatus(http.StatusTooManyRequests, errors.New("rate limited"))
 		},
@@ -5441,7 +5441,7 @@ func TestClassifyLimit(t *testing.T) {
 			status:      http.StatusTooManyRequests,
 			isRateLimit: true,
 			isRetryable: true,
-			condition:   signalless,
+			condition:   bareRateLimit,
 		},
 	})
 	tests.AddFunc("should classify a 429 with a Retry-After at the sustained-rate threshold as sustainedRate", func(*testing.T) test {
