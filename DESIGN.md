@@ -670,28 +670,43 @@ gate it, both staged:
 - **Session identity.** understudy must recognize which requests belong to one
   conversation. opencode holds a session id internally but passes **none** on the
   OpenAI-compat call — understudy sees only the bearer token and the body. So the
-  key is **inferred from the payload**: a hash of the invariant leading messages
-  (system + first user turn), which is also exactly what prompt-cache coherence
-  keys on.
+  key is **inferred from the payload and scoped to the token**: a hash of the
+  invariant leading messages (system + first user turn), which is also exactly
+  what prompt-cache coherence keys on, mixed with the bearer token so one
+  tenant's affinity cannot steer another's routing in the shared daemon. The
+  token is hashed, never stored raw, so understudy's own state cannot be read
+  back into a credential.
 
-  **A binding is a short-lived hint, not a lease.** It is worth holding only while
-  a conversation is turning, and there is no end-of-conversation signal on the
-  wire, so it is refreshed by use and expires on idle. Its lifetime tracks the
-  provider's prefix cache: once that has expired, staying on the target buys
-  nothing. Turns within a beat are seconds apart and separate runs are minutes or
-  hours apart, so an idle expiry scopes a binding to an active conversation
-  without understudy knowing what a conversation is — and bounds the map, since an
-  idle binding is worthless by construction rather than merely old.
+  **Affinity engages only on a request carrying a prior assistant turn.** A first
+  turn has nothing to stay coherent with, so it takes the walk as ordered — which
+  is what keeps affinity from competing with the walk's own decisions, since a
+  within-threshold target and a probe-due one are both reached by first turns. A
+  first turn still *records* the target its later turns prefer.
 
-  **Compaction releases the binding, and should.** A compacted session continues
-  as a summary plus a recent window, so the first user turn stops being sent and
-  the key changes. That is the mechanism agreeing with the policy: the cache it
-  was preserving is cold on every target at that moment, making a compaction the
-  cheapest point to re-balance. A caller-supplied identifier would hold the
-  conversation past that point and need an explicit release to match. What
-  compaction does *not* clear is wire-format compatibility — the preserved window
-  still carries turns shaped for the target that authored them
-  ([[keep-a-conversation-on-one-thinking-mode]]).
+  **Affinity is a short-lived hint, not a lease.** No end-of-conversation signal
+  reaches the wire, so it is refreshed by use and expires on idle, its lifetime
+  tracking the provider's prefix cache: once that is cold, staying buys nothing.
+  Turns are seconds apart and runs minutes or hours, so idle expiry scopes
+  affinity to an active conversation without understudy knowing what a
+  conversation is — and bounds the map, an idle record being worthless by
+  construction rather than merely old.
+
+  **Compaction releases affinity, and should.** A compacted session continues as a
+  summary plus a recent window, so the first user turn stops being sent and the key
+  changes — the mechanism agreeing with the policy, since the cache it preserved is
+  cold on every target at that moment, making compaction the cheapest point to
+  re-balance. A caller-supplied identifier would hold on past it and need an
+  explicit release to match. What compaction does *not* clear is wire-format
+  compatibility: the preserved window still carries turns shaped for the target
+  that authored them ([[keep-a-conversation-on-one-thinking-mode]]).
+
+  **Affinity is tenant state, not account state.** Health and the concurrency cap
+  describe an upstream account and outlive the tenant that taught them; affinity
+  describes a caller's conversation, so it goes when that tenant is deregistered or
+  idles out (§Shared understudy daemon, *Two lifecycles*). It is therefore grouped
+  per tenant rather than keyed on it — the conversation key says which conversation,
+  the group says whose — which is what lets a teardown find them. Until a registry
+  exists to call it, the idle TTL is the only reclamation.
 
   **Concurrency on a key is the tell that it has collided.** A conversation is
   serial: the caller cannot send a turn until the last one answers. So a key with

@@ -2717,7 +2717,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	}
 	type step struct {
 		// model is what the request names; empty means the logical model "m".
-		model        string
+		model string
+		// messages overrides the body's messages array; empty is the single user
+		// message a first turn sends, so only a later turn names one.
+		messages string
+		// token overrides the bearer the step presents; empty is the user-token
+		// every other step sends, so a case can speak as a second caller.
+		token        string
 		advance      time.Duration
 		wantStatus   int
 		wantBody     string
@@ -2781,6 +2787,98 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{
 				advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
 				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+		},
+	})
+
+	// TODO(TODO.d/bind-a-conversation-to-its-target.md): a conversation should
+	// follow its target when the recorded one fails, rebinding where it lands.
+	//
+	// TODO(TODO.d/bind-a-conversation-to-its-target.md): a conversation should
+	// still be served when its recorded target is benched — affinity prefers,
+	// it never strands.
+	tests.Add("should serve a conversation's next turn from the target that served its first", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				// A momentary throttle: by the second turn a would serve.
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			// First turn: a is throttled, so b serves and the conversation learns b.
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// Second turn: b serves again, though a is healthy and first in the list.
+			{
+				advance:    time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+			},
+		},
+	})
+
+	tests.Add("should take the normal walk when a conversation returns after its affinity has gone idle", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				// A momentary throttle: by the second turn a would serve.
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			// First turn: a is throttled, so b serves and the conversation learns b.
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// Second turn, but past the idle TTL: the prefix cache affinity keyed
+			// on is cold, so staying on b buys nothing and a serves.
+			{
+				advance:    affinityIdleTTL + time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
+			},
+		},
+	})
+
+	tests.Add("should not share conversation affinity between two tokens", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				// A momentary throttle: by the second turn a would serve.
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			// First turn, as caller A: a is throttled, so b serves and A's
+			// conversation learns b.
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// Second turn with the same leading messages, but as caller B: B's
+			// conversation has learned nothing, so the walk starts at a rather
+			// than inheriting A's affinity.
+			{
+				advance:    time.Second,
+				token:      "other-token",
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
 			},
 		},
 	})
@@ -3804,12 +3902,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 					time.Sleep(s.advance)
 					synctest.Wait()
 				}
-				body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, cmp.Or(s.model, "m"))
+				body := fmt.Sprintf(`{"model":%q,"messages":%s}`, cmp.Or(s.model, "m"), cmp.Or(s.messages, `[{"role":"user","content":"hi"}]`))
 				req, err := http.NewRequestWithContext(cmp.Or(tt.ctx, t.Context()), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 				if err != nil {
 					t.Fatal(err)
 				}
-				req.Header.Set("Authorization", "Bearer user-token")
+				req.Header.Set("Authorization", "Bearer "+cmp.Or(s.token, "user-token"))
 				req.Header.Set("Content-Type", "application/json")
 				rr := httptest.NewRecorder()
 				ctx := WithLogCtx(req.Context())
