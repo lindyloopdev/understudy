@@ -1,23 +1,17 @@
-# Pin what the walk records for what it skipped
+# Pin what a walk of nothing but stalls reports
 
 **Tag:** understudy / fallback / ha
 
-**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "The reason travels
-with the skip" (each reason reaches the operator through `Excluded`, never the
-client) and "A list emptied by misconfiguration answers 404, not 500" (which ending
-an exhausted walk gets).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "A list emptied by
+misconfiguration answers 404, not 500" (which ending an exhausted walk gets) and
+"The reason travels with the skip" (the record, not the client, is where a reason
+lands).
 
 - **Pin what a walk of nothing but stalls reports.** When every candidate stalls the
   walk exhausts, and the status it reports for the attempt it answers for lands on
   the record's own fields rather than on `Excluded`. Nothing asserts it, and a
   status-less error yields `500` from `yerrors` if anything derives one — which has
   happened once already, green.
-
-- **Pin that a re-walked target is recorded once per pass.** `pickTarget` re-walks
-  the candidate list from the start on every failover, so targets `[broken, limited,
-  good]` where `limited` fails over yield `broken, limited, broken`. No case
-  exercises the repeat. Say in the `Excluded` doc that a target walked past twice is
-  recorded twice — the field reads as a set, and a set does not repeat.
 
 ## Out of scope
 

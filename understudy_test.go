@@ -2463,6 +2463,46 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should record a backend twice when the walk stepped over it on two passes", func(*testing.T) test {
+		limited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serving := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-good"}`)), Header: http.Header{}}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"broken":  {ProviderType: "openai", Config: providers.Config{APIKey: "sk-b"}},
+						"limited": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "limited", Path: "/v1"}, APIKey: "sk-l", HTTPClient: limited}},
+						"good":    {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "good", Path: "/v1"}, APIKey: "sk-g", HTTPClient: serving}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "broken", model: "mb"},
+						{backend: "limited", model: "ml"},
+						{backend: "good", model: "mg"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			// The replay re-walks from the start, so the unusable candidate ahead of
+			// the throttled one is stepped over on both passes.
+			want: map[string]any{
+				"backend_name": "good",
+				"excluded": []Attempt{
+					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
+					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
+					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
+				},
+			},
+		}
+	})
+
 	tests.AddFunc("should record an abandoned target and an excluded one in the order it walked them", func(*testing.T) test {
 		limited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -3271,7 +3311,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20"},
+			{
+				advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20",
+				// The walk answers for the last candidate it stalled on, so the record
+				// names it and the stall, not an upstream status it never received.
+				wantLogged: loggedAnswer{Backend: "b", ModelUpstream: "mb", Err: errors.New("upstream produced no response header before the stall gate")},
+			},
 		},
 	})
 

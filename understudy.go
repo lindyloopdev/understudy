@@ -1413,8 +1413,8 @@ type LogRecord struct {
 	// failover abandoned, targets excluded as unusable before any call, and the
 	// backends a listing could not use or could not reach. A chat request records
 	// them in the order it walked its candidates, so an exclusion and a failover
-	// interleave as they happened; a listing ranges a map and has no order to
-	// report. It is empty for a request that
+	// interleave as they happened — and a candidate the walk stepped over on two
+	// passes appears twice; a listing ranges a map and has no order to report. It is empty for a request that
 	// served from its first target. A demotion is attributable through it: the
 	// target it demoted is here when the request moved on, and in the fields above
 	// when there was nowhere left to go. A skipped backend appears on every request
