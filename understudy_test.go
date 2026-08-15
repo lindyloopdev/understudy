@@ -2584,9 +2584,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the case below pins what a
-	// stall the walk moved past records. A walk of nothing but stalls reports through
-	// the record's own fields instead, and nothing drives that.
+	// TODO(TODO.d/assert-an-absent-upstream-status.md): a stall records no upstream
+	// status, and no case can say so — the comparer reads a zero want as unasserted.
 
 	tests.AddFunc("should record a stalled attempt as having answered nothing", func(t *testing.T) test {
 		stalling := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
@@ -3518,9 +3517,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): these cases pin what the
-	// window reclaims. The TTL is the whole bound, and DESIGN.md does not yet say so.
-	//
 	// TODO(TODO.d/understudy-error-envelope-type.md): the refusal path takes the same
 	// sweep and re-stamp, and still no case drives it across the window, because a
 	// refusal's answer does not vary with age: writeRefusal renders before any streak

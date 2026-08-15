@@ -32,5 +32,5 @@ a bound request would otherwise divert.
 ## Constraint
 
 The idle sweep that reclaims affinity cannot be pinned by a test — no consumer
-reads the map's size, the absence [[sweep-health-outside-the-target-walk]] records
-for health — so it rests on review. Keep it visible in the code.
+reads the map's size, the same absence the health map has — so it rests on review.
+Keep it visible in the code.
