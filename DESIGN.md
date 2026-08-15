@@ -518,7 +518,7 @@ upstream (or, on its unbounded path, hangs). understudy instead **synthesizes** 
 `Retry-After` and injects it while preserving the retryable status, so a client
 backs off *understudy's* interval instead of its own. opencode's agent turn is
 not such a client — it calls the SDK with `maxRetries: 0` and makes one attempt,
-so nothing injected reaches it — [[fail-over-from-a-bare-429]]. Only the `429` half is
+so nothing injected reaches it. Only the `429` half is
 built: a `5xx` with no delay still reaches the client bare, and the injected
 interval is a fixed constant — [[understudy-adaptive-coordinated-backoff]]. The
 interval grows exponentially per backend, is jittered, and resets on success; its ceiling **is
@@ -636,20 +636,23 @@ tolerable in-request delay before switching, bounded by the client's own timeout
 and widened by the cost of the cheapest fallback (a dear fallback is worth waiting
 longer for):
 
-- **No delay sent → fail over.** A bare 429 gives the budget nothing to weigh:
-  understudy cannot know the wait is short, and the client will not wait out a
-  delay nobody gave it — opencode's agent turn makes a single attempt
-  (*Synthesized backoff* above). So the request goes to the next untried target
-  rather than becoming an error the caller cannot act on. Demotion stays the separate
-  question: a bare 429 is a capacity measurement (§Concurrency & Rate Limiting),
-  so the target keeps its place in the walk. A 429 that *did* name a short delay
-  is the open half — [[fail-over-from-a-bare-429]].
+- **No delay sent, or a short one nothing waits out → fail over.** A bare 429
+  gives the budget nothing to weigh: understudy cannot know the wait is short,
+  and the client will not wait out a delay nobody gave it — opencode's agent
+  turn makes a single attempt (*Synthesized backoff* above). A 429 that *did*
+  name a short delay fails the same way today: nothing downstream of understudy
+  waits out a relayed `Retry-After` either, so relaying one loses the request
+  just as surely as a bare 429 would. Either way the request goes to the next
+  untried target rather than becoming an error the caller cannot act on. Demotion stays the separate question: neither
+  case is a health verdict (a bare 429 is a capacity measurement,
+  §Concurrency & Rate Limiting; a short Retry-After is a momentary throttle),
+  so the target keeps its place in the walk.
 - **≤ wait budget → wait in place.** Sleep out the throttle and retry the *same*
   target; the client sees a slow success, never the 429, and the preferred model
   (its prompt cache, its coherence) is preserved. *(Staged — the transient-absorb
   refinement. `T_wait` is decided empirically against held-connection cost, not
-  guessed; today a short throttle is instead relayed with the synthesized backoff
-  above.)*
+  guessed; until it lands, a short throttle takes the fail-over rung above
+  instead.)*
 - **> wait budget, next target healthy → fail over in place.** Serve *this*
   request from the next target rather than returning the error — this is what
   makes a sustained-rate-limited or per-day-benched target invisible to the

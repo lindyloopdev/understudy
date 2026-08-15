@@ -3351,8 +3351,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
-			{advance: time.Second, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "a", wantRetryAfter: "10"},
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// Still inside a's 10s Retry-After window, yet a leads the walk again:
+			// the transient 429 cost it its turn in each request, not its place.
+			{
+				advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
 		},
 	})
 
@@ -3703,6 +3711,23 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should fail over within the request when a target returns a transientRate 429", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("5", "slow down")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+		},
+	})
+
+	// TODO(TODO.d/pin-a-transient-429-with-no-targets-left.md): add "should relay a
+	// transientRate 429 to the client when the walk exhausts every target" — every
+	// case above pairs the transientRate 429 with a healthy fallback; none covers
+	// the walk running out of candidates with a transientRate 429 as the last
+	// failure.
+
 	tests.Add("should fail over within the request when a target's credential is out of funds", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusPaymentRequired, `{"error":{"message":"Insufficient Balance"}}`)},
@@ -3906,8 +3931,17 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "10"},
-			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			// The transient 429 fails this request over to b without benching a.
+			{
+				advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// The recurring streak is what benches a across requests: it now leads
+			// nowhere, the walk goes straight to b without dialing a.
+			{
+				advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: notDueUntil(45*time.Second, "upstream returned status 429: slow down")}},
+			},
 		},
 	})
 
