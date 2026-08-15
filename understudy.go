@@ -1411,8 +1411,7 @@ type LogRecord struct {
 	UpstreamStatus int
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
-	// backends a listing could not use. A listing whose catalog fetch fails is not
-	// here — that reaches understudy's own logger alone. A chat request records
+	// backends a listing could not use or could not reach. A chat request records
 	// them in the order it walked its candidates, so an exclusion and a failover
 	// interleave as they happened; a listing ranges a map and has no order to
 	// report. It is empty for a request that
@@ -1871,13 +1870,11 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 		}
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
-			// The listing answers what understudy can serve, so a backend that cannot
-			// answer contributes nothing rather than failing the request. The reason is
-			// the operator's fact and reaches the log alone.
-			s.logger.ErrorContext(r.Context(), "backend catalog unavailable",
-				slog.String("backend", name),
-				slog.Any("error", err),
-			)
+			// A backend that cannot answer contributes nothing rather than failing
+			// the listing. The failure recurs while the backend is down, so it
+			// belongs on the record, not understudy's own log; a catalog fetch names
+			// no upstream model.
+			addLogCalled(r.Context(), name, "", yerrors.HTTPStatus(err), err)
 			continue
 		}
 		for i := range data {

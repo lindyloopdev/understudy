@@ -1101,9 +1101,11 @@ func TestModels(t *testing.T) {
 		authHeader string
 		validator  TokenValidator
 		opts       []Option
-		wantLogged []map[string]any
 		wantStatus int
 		wantBody   string
+		// wantExcluded is what the request's LogRecord should name on Excluded;
+		// nil asserts nothing, so only a case about a left-out backend sets it.
+		wantExcluded []Attempt
 	}
 
 	tests := testy.NewTable[test]()
@@ -1344,7 +1346,7 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
 	})
 
-	tests.AddFunc("should list the models of the backends that answer when another backend's catalog fetch fails", func(t *testing.T) test {
+	tests.AddFunc("should record a backend whose catalog fetch failed as an attempt it made", func(t *testing.T) test {
 		sick := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusInternalServerError,
@@ -1371,19 +1373,20 @@ func TestModels(t *testing.T) {
 			},
 			wantStatus: http.StatusOK,
 			wantBody:   `{"object":"list","data":[{"id":"good/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
-			// The listing does not fail, so the operator is the only one who learns
-			// the catalog fetch did.
-			wantLogged: []map[string]any{{
-				"level":   "ERROR",
-				"backend": "down",
+			// The listing does not fail; the operator reads the failure on Excluded,
+			// where an unusable backend is already recorded.
+			wantExcluded: []Attempt{{
+				Backend:        "down",
+				Called:         true,
+				UpstreamStatus: http.StatusInternalServerError,
+				Err:            errors.New("upstream returned status 500: catalog unavailable"),
 			}},
 		}
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		var logged bytes.Buffer
-		srv := New(tt.validator, append([]Option{WithLogger(slog.New(slog.NewJSONHandler(io.MultiWriter(&logged, t.Output()), nil)))}, tt.opts...)...)
+		srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
 
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/models", nil)
 		if err != nil {
@@ -1392,7 +1395,8 @@ func TestModels(t *testing.T) {
 		req.Header.Set("Authorization", cmp.Or(tt.authHeader, "Bearer user-token"))
 
 		rr := httptest.NewRecorder()
-		srv.ServeHTTP(rr, req)
+		ctx := WithLogCtx(req.Context())
+		srv.ServeHTTP(rr, req.WithContext(ctx))
 
 		if rr.Code != tt.wantStatus {
 			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
@@ -1400,10 +1404,9 @@ func TestModels(t *testing.T) {
 		if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
 			t.Errorf("unexpected body: %s", d)
 		}
-		for _, want := range tt.wantLogged {
-			if !slogdiff.JSONContains(logged.Bytes(), want) {
-				t.Errorf("operator was not told %v, logged:\n%s", want, logged.String())
-			}
+		rec, _ := LogRecordFromContext(ctx)
+		if d := gocmp.Diff(tt.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty(), assertedFields); d != "" {
+			t.Errorf("excluded attempts (-want +got):\n%s", d)
 		}
 	})
 }

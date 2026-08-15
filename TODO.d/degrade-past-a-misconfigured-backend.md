@@ -1,14 +1,11 @@
-# Report every omission the same way
+# Pin what the walk records for what it skipped
 
 **Tag:** understudy / fallback / ha
 
-**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Operator and caller
-learn different things" (the skip reason reaches the operator through the request's
-`LogRecord`), "The reason travels with the skip" (each reason reaches the
-operator through `Excluded`, never the client), "A list emptied by misconfiguration answers
-404, not 500" (which ending each exhaustion gets, and that the rule is about usable
-targets however the list emptied), and "Two endpoints, two answers" (emptiness is a
-valid answer for the listing whatever its cause).
+**Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "The reason travels
+with the skip" (each reason reaches the operator through `Excluded`, never the
+client) and "A list emptied by misconfiguration answers 404, not 500" (which ending
+an exhausted walk gets).
 
 - **Pin what a walk of nothing but stalls reports.** When every candidate stalls the
   walk exhausts, and the status it reports for the attempt it answers for lands on
@@ -21,12 +18,6 @@ valid answer for the listing whatever its cause).
   good]` where `limited` fails over yield `broken, limited, broken`. No case
   exercises the repeat. Say in the `Excluded` doc that a target walked past twice is
   recorded twice — the field reads as a set, and a set does not repeat.
-
-- **A listing's failed catalog fetch reaches only the log.** The listing's two
-  omission paths answer a consumer differently: a backend understudy cannot use is
-  recorded on `Excluded`, while one whose catalog fetch fails is written to
-  `s.logger` at ERROR and left off the record. Both are the same fact from the
-  consumer's side — this backend is missing from your listing, and here is why.
 
 ## Out of scope
 

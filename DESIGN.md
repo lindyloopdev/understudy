@@ -335,10 +335,7 @@ some backend, or every backend, could not be reached. Chat asks understudy to
 backend can serve is an error, and why each backend was skipped goes to the
 operator with it. The consequence is deliberate —
 a total upstream outage renders as an empty catalog rather than an error, and the
-operator learns of it from the log rather than the response. The listing does not
-yet hold to this: a config resolving to no usable backend still fails, and a
-backend dropped by a failed catalog fetch reaches no consumer —
-[[degrade-past-a-misconfigured-backend]].
+operator learns of it from the record rather than the response.
 
 A consumer wanting stricter behavior enforces it in its own `TokenValidator`,
 before handing understudy a configuration. Routability as *understudy* defines it
