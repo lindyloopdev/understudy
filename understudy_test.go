@@ -2584,9 +2584,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/assert-an-absent-upstream-status.md): a stall records no upstream
-	// status, and no case can say so — the comparer reads a zero want as unasserted.
-
 	tests.AddFunc("should record a stalled attempt as having answered nothing", func(t *testing.T) test {
 		stalling := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
 			<-r.Context().Done()
@@ -2749,9 +2746,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// loggedAnswer is the part of a LogRecord that names the candidate a request
 	// answered from, so a case can assert it without the walk's Excluded list.
 	type loggedAnswer struct {
-		Backend        string
-		ModelUpstream  string
-		UpstreamStatus int
+		Backend       string
+		ModelUpstream string
+		// UpstreamStatus is a pointer so a case can assert that none was
+		// recorded: nil asserts nothing, and &0 asserts the absence itself,
+		// which a bare 0 cannot say — assertedFields reads that as unasserted.
+		UpstreamStatus *int
 		Err            error
 	}
 	type step struct {
@@ -3314,7 +3314,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20",
 				// The walk answers for the last candidate it stalled on, so the record
 				// names it and the stall, not an upstream status it never received.
-				wantLogged: loggedAnswer{Backend: "b", ModelUpstream: "mb", Err: errors.New("upstream produced no response header before the stall gate")},
+				wantLogged: loggedAnswer{Backend: "b", ModelUpstream: "mb", UpstreamStatus: new(0), Err: errors.New("upstream produced no response header before the stall gate")},
 			},
 		},
 	})
@@ -3950,7 +3950,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				wantLogged: loggedAnswer{
 					Backend:        "b",
 					ModelUpstream:  "mb",
-					UpstreamStatus: http.StatusForbidden,
+					UpstreamStatus: new(http.StatusForbidden),
 					Err:            errors.New("upstream returned status 403: not permitted"),
 				},
 			},
@@ -4023,7 +4023,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty(), assertedFields); d != "" {
 					t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
 				}
-				answered := loggedAnswer{Backend: rec.BackendName, ModelUpstream: rec.ModelUpstream, UpstreamStatus: rec.UpstreamStatus, Err: rec.Err}
+				answered := loggedAnswer{Backend: rec.BackendName, ModelUpstream: rec.ModelUpstream, UpstreamStatus: new(rec.UpstreamStatus), Err: rec.Err}
 				if d := gocmp.Diff(s.wantLogged, answered, errorText, assertedFields); d != "" {
 					t.Errorf("step %d log record (-want +got):\n%s", i, d)
 				}
