@@ -2791,12 +2791,77 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/bind-a-conversation-to-its-target.md): a conversation should
-	// follow its target when the recorded one fails, rebinding where it lands.
-	//
-	// TODO(TODO.d/bind-a-conversation-to-its-target.md): a conversation should
-	// still be served when its recorded target is benched — affinity prefers,
-	// it never strands.
+	tests.Add("should serve a conversation whose recorded target is benched", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call <= 2 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, call int) (*http.Response, error) {
+				// A second conversation benches b, leaving the first recorded
+				// against it.
+				if call == 2 {
+					return throttling("120", "slow down")(r, call)
+				}
+				return resp(http.StatusOK, `{"id":"from-b"}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			{
+				messages:   `[{"role":"user","content":"a different conversation"}]`,
+				wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "b", wantRetryAfter: "120",
+			},
+			{
+				advance:    time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
+			},
+		},
+	})
+
+	tests.Add("should follow a conversation to the target that takes over when its own fails", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 2 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-b"}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			{
+				advance:    time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
+				wantExcluded: []Attempt{{Backend: "b", ModelUpstream: "mb", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			// Still a, though b answers again and is first in the list.
+			{
+				advance:    time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"},{"role":"assistant","content":"more"},{"role":"user","content":"go on"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
+			},
+		},
+	})
+
 	tests.Add("should serve a conversation's next turn from the target that served its first", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
@@ -2810,7 +2875,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			// First turn: a is throttled, so b serves and the conversation learns b.
 			{
 				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
 				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
@@ -2837,7 +2901,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			// First turn: a is throttled, so b serves and the conversation learns b.
 			{
 				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
 				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
