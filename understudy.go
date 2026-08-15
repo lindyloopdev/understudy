@@ -1598,12 +1598,6 @@ func cause(ctx context.Context, err error) error {
 	return err
 }
 
-// errNoBackendConfigured is returned when no backend in the resolved
-// [BackendConfig] is usable — because it declares none, or because
-// [server.resolveBackend] rejects every one it declares. It carries HTTP 500 so
-// the error seam renders it as Internal Server Error.
-var errNoBackendConfigured = yerrors.WithHTTPStatus(http.StatusInternalServerError, errors.New("no backend configured"))
-
 // Error envelope `type` values. The first three are OpenAI-spec, written by
 // [writeJSONError]; the upstream_* values are understudy's own, written by the
 // rejects that end a request rather than relay it.
@@ -1868,15 +1862,13 @@ func (s *server) resolveBackend(backends map[string]Backend, name string) (selec
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
-	var all []providers.Model
-	matched := false
+	all := []providers.Model{}
 	for name := range backend.Backends {
 		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
 			addLogSkipped(r.Context(), Attempt{Backend: name, Err: err})
 			continue
 		}
-		matched = true
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
 			// The listing answers what understudy can serve, so a backend that cannot
@@ -1892,9 +1884,6 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 			data[i].ID = name + "/" + data[i].ID
 		}
 		all = append(all, data...)
-	}
-	if !matched {
-		return errNoBackendConfigured
 	}
 
 	w.Header().Set("Content-Type", "application/json")

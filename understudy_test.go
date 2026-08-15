@@ -1084,9 +1084,6 @@ func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
 	})
 }
 
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): "should return 500 when no
-// backend configured" is the last case here that fails the listing, and it inverts:
-// zero usable backends is an empty catalog, not an error.
 func TestModels(t *testing.T) {
 	t.Parallel()
 
@@ -1201,7 +1198,7 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
 	})
 
-	tests.Add("should return 500 when a configured backend has no base URL", test{
+	tests.Add("should answer an empty catalog when the only backend has no base URL", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: map[string]Backend{
@@ -1209,18 +1206,18 @@ func TestModels(t *testing.T) {
 				}}, nil
 			},
 		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+		wantStatus: http.StatusOK,
+		wantBody:   `{"object":"list","data":[]}`,
 	})
 
-	tests.Add("should return 500 when no backend configured", test{
+	tests.Add("should answer an empty catalog when no backend can be used", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: nil}, nil
 			},
 		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+		wantStatus: http.StatusOK,
+		wantBody:   `{"object":"list","data":[]}`,
 	})
 
 	tests.AddFunc("should list the usable backend's models when another backend has a nil config", func(t *testing.T) test {
@@ -1274,7 +1271,7 @@ func TestModels(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   `{"object":"list","data":null}`,
+			wantBody:   `{"object":"list","data":[]}`,
 		}
 	})
 
@@ -1290,7 +1287,7 @@ func TestModels(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   `{"object":"list","data":null}`,
+			wantBody:   `{"object":"list","data":[]}`,
 		}
 	})
 

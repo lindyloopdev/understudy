@@ -1,4 +1,4 @@
-# Answer when nothing is usable, and report the skip everywhere
+# Report every omission the same way
 
 **Tag:** understudy / fallback / ha
 
@@ -27,12 +27,6 @@ valid answer for the listing whatever its cause).
   recorded on `Excluded`, while one whose catalog fetch fails is written to
   `s.logger` at ERROR and left off the record. Both are the same fact from the
   consumer's side — this backend is missing from your listing, and here is why.
-
-- **Answer an empty catalog when nothing is usable.** `/v1/models` returns 500
-  (`errNoBackendConfigured` on `!matched`), against "emptiness is a valid answer
-  whatever its cause". Zero usable backends is an empty catalog, so the case
-  "should return 500 when no backend configured" inverts. It is the sole remaining
-  use of `errNoBackendConfigured`, so this retires the error too.
 
 ## Out of scope
 
