@@ -60,8 +60,9 @@ delay selection above is ever consulted.
 
 So the finding's conclusion — `503` + `Retry-After` behaves like `429` +
 `Retry-After` — still holds, but degenerately: on an agent turn neither is
-retried. Nothing understudy injects reaches a reader there.
-[[fail-over-from-a-bare-429]] measures what that costs.
+retried. Nothing understudy injects reaches a reader there. DESIGN.md
+§Understudy's Retry-After ladder settles what that costs: a delay nothing
+waits out fails the request over rather than surfacing it.
 
 ## Caveat
 

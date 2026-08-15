@@ -2314,9 +2314,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				upstreamModel: upstreamModel,
 			}
 			// A sustainedRate 429 or refused access has just demoted chosen above; a
-			// bare 429 and a rejected history leave it healthy, costing it only its
-			// turn here. In every case an untried target beats surfacing the failure.
-			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err)) {
+			// bare or transient 429 and a rejected history leave it healthy, costing
+			// it only its turn here. In every case an untried target beats surfacing
+			// the failure.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err)) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains

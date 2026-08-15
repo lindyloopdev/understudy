@@ -21,9 +21,10 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   `maxRetries: a.retries ?? 0` and passes no `retries`, so it makes one attempt
   and never consults a `Retry-After` — only title generation sets `retries: 2`.
   Every rung of this ladder assumes a client that waits, so name the consumer
-  that does or the interval is written to nobody
-  ([[fail-over-from-a-bare-429]] measures the cost: 25 dead reviewers in
-  one run).
+  that does or the interval is written to nobody (a bare or short-Retry-After
+  429 measured this cost directly: 25 dead reviewers in one `review-examine`
+  run on a target understudy kept in service — settled by routing both around
+  the target instead of relaying either, §Understudy's Retry-After ladder).
 - **Pre-header stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
