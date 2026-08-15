@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"maps"
@@ -255,6 +256,11 @@ type server struct {
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
 	health map[string]targetHealth
+	// affinity records, per token and conversation, the target that last served
+	// it, so a later turn keeps its prefix cache. It is a hint, not a lease: it
+	// reorders candidates pickTarget would accept, and expires once idle. The
+	// token groups the records so a tenant's can be dropped with it.
+	affinity map[string]map[string]lastServed
 	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
 	// identity, bounding concurrent in-flight requests to each account.
 	upstreamLimiters map[string]*upstreamLimiter
@@ -521,6 +527,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
 		fdLimitReader:            readFDSoftLimit,
 		health:                   make(map[string]targetHealth),
+		affinity:                 make(map[string]map[string]lastServed),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}
 	for _, opt := range opts {
@@ -690,6 +697,115 @@ func untriedTargets(targets []Target, tried []string, backends map[string]Backen
 		}
 	}
 	return remaining
+}
+
+// leadingMessages returns the messages before the first assistant turn — the
+// invariant prefix a later turn resends unchanged — and whether one followed.
+// A body it cannot read has no prefix and no history.
+func leadingMessages(body []byte) (prefix []json.RawMessage, hasHistory bool) {
+	var parsed struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, false
+	}
+	for i, raw := range parsed.Messages {
+		// An unparseable role is no assistant turn, so it stays in the prefix.
+		var m struct {
+			Role string `json:"role"`
+		}
+		_ = json.Unmarshal(raw, &m)
+		if m.Role == "assistant" {
+			return parsed.Messages[:i], true
+		}
+	}
+	return parsed.Messages, false
+}
+
+// conversationKey hashes a conversation's leading messages — what identifies the
+// conversation itself. Whose it is groups the records, and stays out of this. An
+// empty prefix has no key, and so no affinity.
+func conversationKey(prefix []json.RawMessage) string {
+	if len(prefix) == 0 {
+		return ""
+	}
+	// Raw message bytes as sent, never re-serialized; JSON objects are
+	// self-delimiting, so concatenating them hashes a unique split.
+	h := fnv.New64a()
+	for _, raw := range prefix {
+		h.Write(raw)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// lastServed is a conversation's target and when it last served — the age the
+// idle TTL measures.
+type lastServed struct {
+	target  Target
+	lastUse time.Time
+}
+
+// affinityIdleTTL is how long affinity survives its last use. The provider's
+// prefix cache sets the value — once it is cold, staying buys nothing — and five
+// minutes is the order of Anthropic's default. Expiring also bounds a map keyed
+// on caller-supplied content.
+const affinityIdleTTL = 5 * time.Minute
+
+// recordServe records t as the conversation's target and refreshes lastUse. The
+// sweep before each write is the only thing that reclaims an idle record — no
+// reader names one again.
+func (s *server) recordServe(tenant, key string, t Target) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.evictIdleAffinity()
+	if s.affinity[tenant] == nil {
+		s.affinity[tenant] = make(map[string]lastServed)
+	}
+	s.affinity[tenant][key] = lastServed{target: t, lastUse: now}
+}
+
+// evictIdleAffinity drops every record idle past affinityIdleTTL and returns the
+// sweep time, so a caller's write agrees with it. Caller holds s.mu.
+func (s *server) evictIdleAffinity() time.Time {
+	now := time.Now()
+	for tenant, conversations := range s.affinity {
+		for key, b := range conversations {
+			if now.Sub(b.lastUse) >= affinityIdleTTL {
+				delete(conversations, key)
+			}
+		}
+		// A tenant with nothing left is a group with nothing to name it.
+		if len(conversations) == 0 {
+			delete(s.affinity, tenant)
+		}
+	}
+	return now
+}
+
+// preferLastServed moves key's recorded target to the front of candidates, and
+// nothing more: pickTarget still applies every usability and health check, so a
+// stale record costs only its place in line and can resurrect nothing. A record
+// idle past affinityIdleTTL is ignored.
+func (s *server) preferLastServed(candidates []Target, tenant, key string) []Target {
+	s.mu.Lock()
+	bound, ok := s.affinity[tenant][key]
+	s.mu.Unlock()
+	if !ok || time.Since(bound.lastUse) >= affinityIdleTTL {
+		return candidates
+	}
+	var preferred []Target
+	rest := make([]Target, 0, len(candidates))
+	for _, t := range candidates {
+		if t.backend == bound.target.backend && t.model == bound.target.model {
+			preferred = append(preferred, t)
+		} else {
+			rest = append(rest, t)
+		}
+	}
+	return append(preferred, rest...)
 }
 
 // msgBackendDown announces a target leaving rotation. Its pair is "backend up".
@@ -1968,6 +2084,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer s.processLimiter.release()
 
+	// Which conversation this is, from the buffered body, scoped to its token.
+	prefix, carriesHistory := leadingMessages(bodyBytes)
+	convKey, convTenant := conversationKey(prefix), tokenFromContext(r.Context())
+
 	var requestedModel, upstreamModel string
 	var parsedBackendName string
 	var chosen Target
@@ -2001,7 +2121,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// pickTarget still tolerates it at the demotion instant (before
 				// virtual time advances past the failover threshold), so pick from
 				// the targets not yet tried this request.
-				p := s.pickTarget(r.Context(), untriedTargets(lm.Targets, tried, backend.Backends), backend.Backends)
+				candidates := untriedTargets(lm.Targets, tried, backend.Backends)
+				// A first turn has nothing to stay coherent with, so it takes the
+				// walk as ordered, probes and all.
+				if carriesHistory {
+					candidates = s.preferLastServed(candidates, convTenant, convKey)
+				}
+				p := s.pickTarget(r.Context(), candidates, backend.Backends)
 				if p.ok && lastFailure != nil {
 					// Somewhere else to go, so the request did move past the last
 					// candidate — recorded before this pick's skips, which is the
@@ -2179,6 +2305,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			switch {
 			case err == nil:
 				s.clearFailure(r.Context(), chosen, backend.Backends)
+				s.recordServe(convTenant, convKey, chosen)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
 			case demote || isAccessRefused(err):

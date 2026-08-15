@@ -42,12 +42,11 @@ and it is first in the `review-standard` pool.
 
 ## Work
 
-- **Bind a conversation to its target**, which is the fix rather than the guard:
-  routing around only helps while something compatible remains. DESIGN
-  §Affinity and admission stages this behind two dependencies, but only *admission*
-  needs the capacity model — binding needs the session-identity half alone (the
-  leading-prefix hash, feasibility-spike first). This case argues for splitting that
-  dependency rather than waiting for both.
+- **Bind a conversation to its target** — the fix rather than the guard, since
+  routing around only helps while something compatible remains. Tracked in
+  [[bind-a-conversation-to-its-target]]; this case is why it wants the
+  session-identity half without waiting for the capacity model that only
+  *admission* needs.
 
 A pool whose targets agree about thinking would stop the symptom and is not the fix:
 thinking is a per-target economic call — enable where it is cheap, disable on a model
