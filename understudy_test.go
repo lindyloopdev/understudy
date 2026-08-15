@@ -1084,9 +1084,6 @@ func TestChatCompletionsStillServesRequestsAfterOnePanics(t *testing.T) {
 	})
 }
 
-// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): "should return 500 when no
-// backend configured" is the last case here that fails the listing, and it inverts:
-// zero usable backends is an empty catalog, not an error.
 func TestModels(t *testing.T) {
 	t.Parallel()
 
@@ -1104,9 +1101,11 @@ func TestModels(t *testing.T) {
 		authHeader string
 		validator  TokenValidator
 		opts       []Option
-		wantLogged []map[string]any
 		wantStatus int
 		wantBody   string
+		// wantExcluded is what the request's LogRecord should name on Excluded;
+		// nil asserts nothing, so only a case about a left-out backend sets it.
+		wantExcluded []Attempt
 	}
 
 	tests := testy.NewTable[test]()
@@ -1201,7 +1200,7 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
 	})
 
-	tests.Add("should return 500 when a configured backend has no base URL", test{
+	tests.Add("should answer an empty catalog when the only backend has no base URL", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: map[string]Backend{
@@ -1209,18 +1208,18 @@ func TestModels(t *testing.T) {
 				}}, nil
 			},
 		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+		wantStatus: http.StatusOK,
+		wantBody:   `{"object":"list","data":[]}`,
 	})
 
-	tests.Add("should return 500 when no backend configured", test{
+	tests.Add("should answer an empty catalog when no backend can be used", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: nil}, nil
 			},
 		},
-		wantStatus: http.StatusInternalServerError,
-		wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
+		wantStatus: http.StatusOK,
+		wantBody:   `{"object":"list","data":[]}`,
 	})
 
 	tests.AddFunc("should list the usable backend's models when another backend has a nil config", func(t *testing.T) test {
@@ -1274,7 +1273,7 @@ func TestModels(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   `{"object":"list","data":null}`,
+			wantBody:   `{"object":"list","data":[]}`,
 		}
 	})
 
@@ -1290,7 +1289,7 @@ func TestModels(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   `{"object":"list","data":null}`,
+			wantBody:   `{"object":"list","data":[]}`,
 		}
 	})
 
@@ -1347,7 +1346,7 @@ func TestModels(t *testing.T) {
 		wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
 	})
 
-	tests.AddFunc("should list the models of the backends that answer when another backend's catalog fetch fails", func(t *testing.T) test {
+	tests.AddFunc("should record a backend whose catalog fetch failed as an attempt it made", func(t *testing.T) test {
 		sick := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusInternalServerError,
@@ -1374,19 +1373,20 @@ func TestModels(t *testing.T) {
 			},
 			wantStatus: http.StatusOK,
 			wantBody:   `{"object":"list","data":[{"id":"good/gpt-4","created":1234567890,"owned_by":"openai"}]}`,
-			// The listing does not fail, so the operator is the only one who learns
-			// the catalog fetch did.
-			wantLogged: []map[string]any{{
-				"level":   "ERROR",
-				"backend": "down",
+			// The listing does not fail; the operator reads the failure on Excluded,
+			// where an unusable backend is already recorded.
+			wantExcluded: []Attempt{{
+				Backend:        "down",
+				Called:         true,
+				UpstreamStatus: http.StatusInternalServerError,
+				Err:            errors.New("upstream returned status 500: catalog unavailable"),
 			}},
 		}
 	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		var logged bytes.Buffer
-		srv := New(tt.validator, append([]Option{WithLogger(slog.New(slog.NewJSONHandler(io.MultiWriter(&logged, t.Output()), nil)))}, tt.opts...)...)
+		srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
 
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/models", nil)
 		if err != nil {
@@ -1395,7 +1395,8 @@ func TestModels(t *testing.T) {
 		req.Header.Set("Authorization", cmp.Or(tt.authHeader, "Bearer user-token"))
 
 		rr := httptest.NewRecorder()
-		srv.ServeHTTP(rr, req)
+		ctx := WithLogCtx(req.Context())
+		srv.ServeHTTP(rr, req.WithContext(ctx))
 
 		if rr.Code != tt.wantStatus {
 			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
@@ -1403,10 +1404,9 @@ func TestModels(t *testing.T) {
 		if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
 			t.Errorf("unexpected body: %s", d)
 		}
-		for _, want := range tt.wantLogged {
-			if !slogdiff.JSONContains(logged.Bytes(), want) {
-				t.Errorf("operator was not told %v, logged:\n%s", want, logged.String())
-			}
+		rec, _ := LogRecordFromContext(ctx)
+		if d := gocmp.Diff(tt.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty(), assertedFields); d != "" {
+			t.Errorf("excluded attempts (-want +got):\n%s", d)
 		}
 	})
 }
@@ -2463,6 +2463,46 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should record a backend twice when the walk stepped over it on two passes", func(*testing.T) test {
+		limited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serving := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-good"}`)), Header: http.Header{}}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"broken":  {ProviderType: "openai", Config: providers.Config{APIKey: "sk-b"}},
+						"limited": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "limited", Path: "/v1"}, APIKey: "sk-l", HTTPClient: limited}},
+						"good":    {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "good", Path: "/v1"}, APIKey: "sk-g", HTTPClient: serving}},
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "broken", model: "mb"},
+						{backend: "limited", model: "ml"},
+						{backend: "good", model: "mg"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			// The replay re-walks from the start, so the unusable candidate ahead of
+			// the throttled one is stepped over on both passes.
+			want: map[string]any{
+				"backend_name": "good",
+				"excluded": []Attempt{
+					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
+					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
+					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
+				},
+			},
+		}
+	})
+
 	tests.AddFunc("should record an abandoned target and an excluded one in the order it walked them", func(*testing.T) test {
 		limited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2543,10 +2583,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		}
 	})
-
-	// TODO(TODO.d/degrade-past-a-misconfigured-backend.md): the case below pins what a
-	// stall the walk moved past records. A walk of nothing but stalls reports through
-	// the record's own fields instead, and nothing drives that.
 
 	tests.AddFunc("should record a stalled attempt as having answered nothing", func(t *testing.T) test {
 		stalling := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
@@ -2710,9 +2746,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// loggedAnswer is the part of a LogRecord that names the candidate a request
 	// answered from, so a case can assert it without the walk's Excluded list.
 	type loggedAnswer struct {
-		Backend        string
-		ModelUpstream  string
-		UpstreamStatus int
+		Backend       string
+		ModelUpstream string
+		// UpstreamStatus is a pointer so a case can assert that none was
+		// recorded: nil asserts nothing, and &0 asserts the absence itself,
+		// which a bare 0 cannot say — assertedFields reads that as unasserted.
+		UpstreamStatus *int
 		Err            error
 	}
 	type step struct {
@@ -3271,7 +3310,12 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20"},
+			{
+				advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20",
+				// The walk answers for the last candidate it stalled on, so the record
+				// names it and the stall, not an upstream status it never received.
+				wantLogged: loggedAnswer{Backend: "b", ModelUpstream: "mb", UpstreamStatus: new(0), Err: errors.New("upstream produced no response header before the stall gate")},
+			},
 		},
 	})
 
@@ -3473,9 +3517,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/sweep-health-outside-the-target-walk.md): these cases pin what the
-	// window reclaims. The TTL is the whole bound, and DESIGN.md does not yet say so.
-	//
 	// TODO(TODO.d/understudy-error-envelope-type.md): the refusal path takes the same
 	// sweep and re-stamp, and still no case drives it across the window, because a
 	// refusal's answer does not vary with age: writeRefusal renders before any streak
@@ -3909,7 +3950,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				wantLogged: loggedAnswer{
 					Backend:        "b",
 					ModelUpstream:  "mb",
-					UpstreamStatus: http.StatusForbidden,
+					UpstreamStatus: new(http.StatusForbidden),
 					Err:            errors.New("upstream returned status 403: not permitted"),
 				},
 			},
@@ -3982,7 +4023,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				if d := gocmp.Diff(s.wantExcluded, rec.Excluded, errorText, cmpopts.EquateEmpty(), assertedFields); d != "" {
 					t.Errorf("step %d abandoned attempts (-want +got):\n%s", i, d)
 				}
-				answered := loggedAnswer{Backend: rec.BackendName, ModelUpstream: rec.ModelUpstream, UpstreamStatus: rec.UpstreamStatus, Err: rec.Err}
+				answered := loggedAnswer{Backend: rec.BackendName, ModelUpstream: rec.ModelUpstream, UpstreamStatus: new(rec.UpstreamStatus), Err: rec.Err}
 				if d := gocmp.Diff(s.wantLogged, answered, errorText, assertedFields); d != "" {
 					t.Errorf("step %d log record (-want +got):\n%s", i, d)
 				}

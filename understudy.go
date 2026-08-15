@@ -1411,11 +1411,10 @@ type LogRecord struct {
 	UpstreamStatus int
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
-	// backends a listing could not use. A listing whose catalog fetch fails is not
-	// here — that reaches understudy's own logger alone. A chat request records
+	// backends a listing could not use or could not reach. A chat request records
 	// them in the order it walked its candidates, so an exclusion and a failover
-	// interleave as they happened; a listing ranges a map and has no order to
-	// report. It is empty for a request that
+	// interleave as they happened — and a candidate the walk stepped over on two
+	// passes appears twice; a listing ranges a map and has no order to report. It is empty for a request that
 	// served from its first target. A demotion is attributable through it: the
 	// target it demoted is here when the request moved on, and in the fields above
 	// when there was nowhere left to go. A skipped backend appears on every request
@@ -1597,12 +1596,6 @@ func cause(ctx context.Context, err error) error {
 	}
 	return err
 }
-
-// errNoBackendConfigured is returned when no backend in the resolved
-// [BackendConfig] is usable — because it declares none, or because
-// [server.resolveBackend] rejects every one it declares. It carries HTTP 500 so
-// the error seam renders it as Internal Server Error.
-var errNoBackendConfigured = yerrors.WithHTTPStatus(http.StatusInternalServerError, errors.New("no backend configured"))
 
 // Error envelope `type` values. The first three are OpenAI-spec, written by
 // [writeJSONError]; the upstream_* values are understudy's own, written by the
@@ -1868,33 +1861,26 @@ func (s *server) resolveBackend(backends map[string]Backend, name string) (selec
 func (s *server) models(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
-	var all []providers.Model
-	matched := false
+	all := []providers.Model{}
 	for name := range backend.Backends {
 		sel, err := s.resolveBackend(backend.Backends, name)
 		if err != nil {
 			addLogSkipped(r.Context(), Attempt{Backend: name, Err: err})
 			continue
 		}
-		matched = true
 		data, err := sel.handler.Models(r.Context(), sel.cfg)
 		if err != nil {
-			// The listing answers what understudy can serve, so a backend that cannot
-			// answer contributes nothing rather than failing the request. The reason is
-			// the operator's fact and reaches the log alone.
-			s.logger.ErrorContext(r.Context(), "backend catalog unavailable",
-				slog.String("backend", name),
-				slog.Any("error", err),
-			)
+			// A backend that cannot answer contributes nothing rather than failing
+			// the listing. The failure recurs while the backend is down, so it
+			// belongs on the record, not understudy's own log; a catalog fetch names
+			// no upstream model.
+			addLogCalled(r.Context(), name, "", yerrors.HTTPStatus(err), err)
 			continue
 		}
 		for i := range data {
 			data[i].ID = name + "/" + data[i].ID
 		}
 		all = append(all, data...)
-	}
-	if !matched {
-		return errNoBackendConfigured
 	}
 
 	w.Header().Set("Content-Type", "application/json")

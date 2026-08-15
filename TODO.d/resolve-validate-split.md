@@ -53,9 +53,9 @@ about the world.
 - **Nothing here prunes.** A backend whose credential did not load stays in the
   configuration; `auth = "auto"` makes it *unavailable*, not absent — see
   [[auth-requirement-and-key-env-source]]. This is about credentials, and does not
-  bear on the routing-time skip in [[degrade-past-a-misconfigured-backend]]: a
-  backend understudy cannot route to is passed over where a target is chosen, which
-  removes it from no configuration.
+  bear on the routing-time skip DESIGN.md §Understudy settles ("The reason travels
+  with the skip"): a backend understudy cannot route to is passed over where a
+  target is chosen, which removes it from no configuration.
 - **`base_url` stays a `string`.** Giving it a type with `UnmarshalText` moves the
   failure to decode time, which reads like an improvement and is not: the
   string-only `required,url` tag is what enforces an absolute URL with a scheme,

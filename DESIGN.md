@@ -218,7 +218,12 @@ own errors into falsehoods — a caller told a configured-but-unusable backend i
 the operator, through the request's `Excluded`. It does not reach the client: a
 caller told a backend "must provide base_url" has been handed a diagnostic it cannot
 act on about a deployment it never named, so it is answered in understudy's own
-words instead.
+words instead. The reasons stay messages: no such backend, no registered handler
+and no base URL all mean one thing to a consumer — unusable until an operator edits
+config — so none becomes an exported sentinel and a frozen contract. For the same
+reason the registered provider set is not exposed for a consumer to pre-check
+routability against; one that wants a stricter rule enforces what it can already
+see from its own `TokenValidator`.
 
 **A list emptied by misconfiguration answers 404, not 500.** The two ways a
 candidate list runs out are not the same ending. Emptied by *health*, something is
@@ -287,6 +292,17 @@ lock, so exactly one record is written per streak and the pair is never doubled 
 dropped. Ordering the writes too would mean one serialization point outside the lock,
 paid on every transition to correct a reading that the next event corrects anyway.
 
+**Idle health entries are reclaimed because they are worthless, not to hold a
+line.** A request may name `<backend>/<model>` directly, so the model half of a
+health key is whatever a caller typed, and the map is swept on every write:
+entries untouched for `healthTTL` go, and the sweep reclaims the whole map rather
+than the key being written, which is what makes the bound hold at all. No size cap
+guards it, and the flooding it would guard against is not worth guarding: minting
+entries takes a valid token, and anyone holding one can spend the operator's
+upstream credit, which is a better use of a stolen credential than filling a map.
+A cap would also need an eviction order and a size a consumer can read before it
+could be stated as behavior anyone can check.
+
 **A transition is never emitted while the health map is held.** The record is decided
 under the lock and written after it, because the handler belongs to the consumer and
 may be slow: a file, a socket, a shipper with a full buffer. Every request's routing
@@ -335,10 +351,7 @@ some backend, or every backend, could not be reached. Chat asks understudy to
 backend can serve is an error, and why each backend was skipped goes to the
 operator with it. The consequence is deliberate —
 a total upstream outage renders as an empty catalog rather than an error, and the
-operator learns of it from the log rather than the response. The listing does not
-yet hold to this: a config resolving to no usable backend still fails, and a
-backend dropped by a failed catalog fetch reaches no consumer —
-[[degrade-past-a-misconfigured-backend]].
+operator learns of it from the record rather than the response.
 
 A consumer wanting stricter behavior enforces it in its own `TokenValidator`,
 before handing understudy a configuration. Routability as *understudy* defines it
