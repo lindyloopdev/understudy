@@ -4701,6 +4701,94 @@ func TestChatCompletionsRetryAfterOverridesUnboundedDemotion(t *testing.T) {
 	})
 }
 
+func TestChatCompletionsConcurrentSuccessKeepsReadmitBench(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		// TODO: should not log "backend up" when a concurrent success lands while
+		// the target is still benched by readmitAt. Capture logs here (as
+		// TestChatCompletionsTransitionLogging does) instead of discarding them, and
+		// assert zero "backend up" records once recSucceeded is read below.
+		logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+		// The success is gated so the demotion's health write lands first: the
+		// demoting request answers only after demoting, so its completion is the
+		// signal that the bench is in the map.
+		release := make(chan struct{})
+		clientA := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "bench-me") {
+				h := make(http.Header)
+				h.Set("Retry-After", "300")
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"slow down"}}`)), Header: h}, nil
+			}
+			<-release
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-a"}`)), Header: make(http.Header)}, nil
+		})
+		clientB := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: make(http.Header)}, nil
+		})
+		backends := map[string]Backend{
+			"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA}},
+			"b": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
+		}
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}}}, nil
+		}}
+		srv := New(validator, WithLogger(logger))
+
+		newReq := func(model, content string) *http.Request {
+			body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, content)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+			return req
+		}
+		serve := func(req *http.Request) *httptest.ResponseRecorder {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			return rec
+		}
+
+		// Two concurrent requests against account "a", one per route to it: the
+		// logical model's walk is demoted by a 429 with Retry-After:300 while a
+		// request naming a/ma directly succeeds against the same canonical account.
+		demoted := make(chan *httptest.ResponseRecorder, 1)
+		succeeded := make(chan *httptest.ResponseRecorder, 1)
+		go func() { demoted <- serve(newReq("m", "bench-me")) }()
+		go func() { succeeded <- serve(newReq("a/ma", "concurrent success")) }()
+
+		recDemoted := <-demoted
+		if d := testy.DiffJSON([]byte(`{"id":"from-b"}`), recDemoted.Body.Bytes()); d != nil {
+			t.Errorf("demoting request answered from the wrong backend: %s", d)
+		}
+		close(release)
+		recSucceeded := <-succeeded
+		if d := testy.DiffJSON([]byte(`{"id":"from-a"}`), recSucceeded.Body.Bytes()); d != nil {
+			t.Errorf("concurrent request answered from the wrong backend: %s", d)
+		}
+		synctest.Wait()
+
+		// Past the 30s recovery interval, well before the 300s readmitAt: the
+		// account stays benched, so the walk must keep serving from b.
+		time.Sleep(60 * time.Second)
+		synctest.Wait()
+
+		rec := serve(newReq("m", "after the race"))
+		if d := testy.DiffJSON([]byte(`{"id":"from-b"}`), rec.Body.Bytes()); d != nil {
+			t.Errorf("request routed to the wrong backend: %s", d)
+		}
+
+		// TODO: should log exactly one "backend up" once readmitAt elapses and a
+		// later probe against a actually succeeds. Advance past the 300s readmitAt,
+		// have clientA answer 200 on the next call, issue one more request, and
+		// assert the transition log (see the first TODO above for the harness).
+	})
+}
+
 func TestWriteJSONError(t *testing.T) {
 	t.Parallel()
 

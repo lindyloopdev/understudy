@@ -1151,13 +1151,14 @@ type terminalError struct{ error }
 // yerrors.HTTPStatus can still traverse the chain.
 func (e terminalError) Unwrap() error { return e.error }
 
-// clearFailure marks t healthy, ending any failure streak. It emits the
-// "backend up" transition iff the streak was previously logged "backend
-// down", keeping the up/down log pair symmetric.
+// clearFailure records a success against t, ending its failure streak. It emits
+// the "backend up" transition iff the streak was previously logged "backend
+// down" and t is actually healthy again — not merely done failing, since a bench
+// the upstream asked for outlives the streak that led to it.
 func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
-	// Logged after dropHealth returns, so the consumer's handler does not block
+	// Logged after recordSuccess returns, so the consumer's handler does not block
 	// every other request's walk behind s.mu.
-	if s.dropHealth(t, backends) {
+	if s.recordSuccess(t, backends) {
 		s.logTransition(ctx, "backend up",
 			slog.String("backend", t.backend),
 			slog.String("model", t.model),
@@ -1174,15 +1175,35 @@ func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
 	s.logger.InfoContext(context.WithoutCancel(ctx), msg, args...)
 }
 
-// dropHealth forgets t's health and reports whether its failure had been logged, so
-// the "backend up" that pairs with it is logged outside the lock.
-func (s *server) dropHealth(t Target, backends map[string]Backend) bool {
+// recordSuccess ends t's failure streak and reports whether its failure had been
+// logged, so the "backend up" that pairs with it is logged outside the lock. A
+// bench the upstream asked for is not a success's to lift: while readmitAt has
+// not elapsed, the entry survives the streak's end — failingSince backdated past
+// the failover threshold so the walk still routes around it — and no "backend
+// up" is owed yet, the target not being back.
+func (s *server) recordSuccess(t Target, backends map[string]Backend) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
 	h, ok := s.health[id]
+	if !ok {
+		return false
+	}
+	if now.Before(h.readmitAt) {
+		s.health[id] = targetHealth{
+			failingSince: now.Add(-s.failoverThreshold),
+			streakBegan:  h.streakBegan,
+			lastProbe:    now,
+			readmitAt:    h.readmitAt,
+			downLogged:   h.downLogged,
+			lastError:    h.lastError,
+			lastTouch:    now,
+		}
+		return false
+	}
 	delete(s.health, id)
-	return ok && h.downLogged
+	return h.downLogged
 }
 
 // clientFacing maps an error returned by a provider call into the status the

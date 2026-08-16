@@ -402,8 +402,13 @@ longer. A later, larger threshold (≈2m) hard-fails to the terminal reject when
 alternate remains.
 
 **A success clears the streak, so only a target failing outright is routed
-around.** Any success on an account deletes its failure record, so crossing the
-threshold takes a window in which *nothing* succeeded. A target failing a fraction
+around.** Any success on an account ends its failure streak, so crossing the
+threshold takes a window in which *nothing* succeeded — but it ends the streak
+and nothing more. A bench the upstream asked for survives: a known `readmitAt`
+stands until it elapses, so a target held at the provider's asking stays routed
+around however many requests succeed against the account in the meantime; a
+success is one request's answer, not the provider withdrawing the hold it gave
+the account (§Recovery probing). A target failing a fraction
 of its requests keeps receiving them, and how fast one demotes depends on how busy
 the account is — the volume dependence the duration threshold otherwise avoids.
 That is accepted, not overlooked: a partly-serving target still beats no target,
@@ -598,8 +603,8 @@ while making worst-case detection unbounded — worst precisely when an operator
 just paid and expects work to resume. Jitter, for the same reason the synthesized
 backoff needs it; reset to base on success. A known `readmitAt` **supersedes the
 schedule entirely** — there is nothing to discover, the upstream's time is the
-answer. A success on a concurrent request deletes that time along with
-the streak today — [[a-success-clears-more-than-its-own-streak]].
+answer. A success on a concurrent request ends the failure streak but not that
+time: the bench stands until it elapses.
 
 **Health belongs to the endpoint, not to the route that reached it.** The key is
 the canonical `(url + key + model)` and nothing else — not the logical model walked
