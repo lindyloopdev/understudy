@@ -13,10 +13,6 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
 
 ## Remaining work
 
-- **Retire the flat 60s fallback.** `errToResponse` still sets
-  `synthesizedRateLimitRetryAfter` for a 429 that reaches it carrying no
-  `Retry-After`; no chat failure does, since the handler attaches one first.
-  Delete the branch and the constant, or name the path that still needs them.
 - **Settle who reads the interval.** opencode's agent turn calls the AI SDK with
   `maxRetries: a.retries ?? 0` and passes no `retries`, so it makes one attempt
   and never consults a `Retry-After` — only title generation sets `retries: 2`.

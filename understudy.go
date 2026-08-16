@@ -1293,11 +1293,6 @@ func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
 	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
 }
 
-// synthesizedRateLimitRetryAfter is the backoff understudy sends the
-// client for a 429 the upstream left unbounded (no Retry-After), so the client
-// waits instead of retrying immediately.
-const synthesizedRateLimitRetryAfter = 60 * time.Second
-
 // limitCondition classifies a backpressure error by the nature of the limit the
 // upstream signalled, so callers derive the response and concurrency handling
 // from one condition rather than re-reading the Retry-After facts.
@@ -1797,10 +1792,6 @@ func errToResponse(h apiHandler) http.HandlerFunc {
 			// means nothing.
 			if sig.hasRetryAfter && sig.isRetryable {
 				w.Header().Set("Retry-After", strconv.Itoa(int(sig.retryAfter.Round(time.Second)/time.Second)))
-			}
-			// A rate limit the upstream left unbounded still needs a client backoff.
-			if sig.isRateLimit && w.Header().Get("Retry-After") == "" {
-				w.Header().Set("Retry-After", strconv.Itoa(int(synthesizedRateLimitRetryAfter/time.Second)))
 			}
 			writeJSONError(r.Context(), w, yerrors.WithHTTPStatus(responseStatus(err), err), errorType(err))
 		}
