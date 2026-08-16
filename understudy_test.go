@@ -4139,7 +4139,12 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		// targets is the logical model's candidate list.
 		targets  []Target
 		advances []time.Duration
-		wantDown int
+		// firstRequestModel overrides the model the very first request names;
+		// empty means the logical model "m". A direct backend/model reference
+		// ("a/shared") lets that first request fail a backend outside targets
+		// that still canonicalizes to the same account and model as one of them.
+		firstRequestModel string
+		wantDown          int
 		// downFields are additional fields the "backend down" records must carry.
 		downFields map[string]any
 		wantUp     int
@@ -4397,6 +4402,22 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp:   0,
 	})
 
+	tests.Add("should name the target that failed, not a sibling reached later through a different config name", test{
+		aStatus:           always502,
+		aBody:             badGateway,
+		targets:           []Target{{backend: "a2", model: "shared"}, {backend: "b", model: "mb"}},
+		firstRequestModel: "a/shared",
+		advances:          []time.Duration{16 * time.Second},
+		wantDown:          1,
+		downFields:        map[string]any{"model": "shared"},
+		wantUp:            0,
+	})
+
+	// TODO: should log "backend up" naming the same backend "backend down"
+	// named for that streak, not the alias whichever later request happened
+	// to succeed through — recordSuccess discards h.backend when it deletes
+	// the entry, so clearFailure has nothing but t.backend to log today.
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			var logBuf bytes.Buffer
@@ -4420,17 +4441,25 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			clientB := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: make(http.Header)}, nil
 			})
+			// a2 canonicalizes to the same account as a (same base URL + key): a
+			// second config name a probeModel can reach the shared health entry
+			// through, without ever actually being dialed.
+			clientA2 := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+				t.Fatal("a2 dialed: it should only ever be reached as an untried alias of a's account")
+				return nil, nil
+			})
 			backends := map[string]Backend{
-				"a": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA}},
-				"b": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
+				"a":  {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA}},
+				"a2": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA2}},
+				"b":  {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "b", Path: "/v1"}, APIKey: "sk-b", HTTPClient: clientB}},
 			}
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
 			srv := New(validator, WithLogger(logger))
 
-			doRequest := func() {
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+			doRequest := func(model string) {
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -4439,11 +4468,11 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 				srv.ServeHTTP(httptest.NewRecorder(), req)
 			}
 
-			doRequest()
+			doRequest(cmp.Or(tt.firstRequestModel, "m"))
 			for _, adv := range tt.advances {
 				time.Sleep(adv)
 				synctest.Wait()
-				doRequest()
+				doRequest("m")
 			}
 
 			down := map[string]any{"msg": "backend down", "level": "INFO", "backend": "a", "model": "ma"}

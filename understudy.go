@@ -160,6 +160,11 @@ type targetHealth struct {
 	// a target still fit to serve — but it bounds how long the run may go on being
 	// answered with another backoff.
 	busySince time.Time
+	// backend is the config name of the target that was actually called when this
+	// streak was opened or last touched — never a sibling merely sharing the
+	// entry's account. A "backend down" names this, not whichever alias a later
+	// walk happens to be examining when it reaches the shared entry.
+	backend string
 }
 
 // healthTTL is how long a health entry may sit untouched before the
@@ -849,10 +854,12 @@ func pacedTo(at time.Time) downCause {
 // backendDownRecord is what every "backend down" says: which target, why it is out,
 // when it started failing, and when it is due back — the moment an upstream named, or
 // the one understudy's own pacing sets, never both. Built here so the walk and the
-// demotion paths cannot drift apart. Caller holds s.mu only if h came from the map.
+// demotion paths cannot drift apart. Names the backend that actually failed (h.backend)
+// rather than t, which — from the walk — may be a sibling alias sharing the same
+// account that was never called. Caller holds s.mu only if h came from the map.
 func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 	return []any{
-		slog.String("backend", t.backend),
+		slog.String("backend", h.backend),
 		slog.String("model", t.model),
 		slog.String("reason", cause.reason),
 		// The record's own timestamp is not this: a demotion may be reported by a
@@ -882,6 +889,7 @@ func (s *server) demote(t Target, backends map[string]Backend, bench *time.Durat
 			h := s.demotedHealth(now, readmitAt)
 			owed, h.downLogged = true, true
 			h.lastError = answered
+			h.backend = t.backend
 			written = h
 			return h
 		},
@@ -891,6 +899,7 @@ func (s *server) demote(t Target, backends map[string]Backend, bench *time.Durat
 			}
 			owed = !h.downLogged
 			h.downLogged = true
+			h.backend = t.backend
 			h.lastError = answered
 			written = h
 			return h
@@ -991,10 +1000,11 @@ func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak 
 func (s *server) recordFailure(t Target, backends map[string]Backend, answered error) {
 	s.writeHealth(t, backends,
 		func(now time.Time) targetHealth {
-			return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold), lastError: answered}
+			return targetHealth{failingSince: now, streakBegan: now, lastProbe: now.Add(s.failoverThreshold), lastError: answered, backend: t.backend}
 		},
 		func(_ time.Time, h targetHealth) targetHealth {
 			h.lastError = answered
+			h.backend = t.backend
 			return h
 		})
 }
