@@ -587,12 +587,18 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.h.ServeHTTP(w, r)
 }
 
-// pick is what choosing a target taught the walk. Its skipped list is reported
-// rather than recorded, so the walk can order its own account: it knows what it
-// abandoned before this pick, and pickTarget does not.
+// pick is pickTarget's result: the chosen target plus the candidates it passed
+// over to reach it. skipped is returned rather than logged directly by
+// pickTarget, because only the caller knows the full order of everything
+// abandoned across the request; pickTarget only sees this one call.
 type pick struct {
-	target  Target
-	ok      bool
+	target Target
+	ok     bool
+	// demoted reports whether this pick is a due half-open probe of a
+	// past-threshold target, not a fresh pick or the exhausted-list fallback
+	// (lastCallableTarget) — which also returns a past-threshold target but
+	// leaves demoted false, since nothing else was available regardless.
+	demoted bool
 	skipped []Attempt // candidates understudy could not call
 }
 
@@ -663,7 +669,7 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		h.lastProbe = now
 		h.lastTouch = now
 		s.health[id] = h
-		return pick{target: t, ok: true, skipped: skipped}
+		return pick{target: t, ok: true, demoted: true, skipped: skipped}
 	}
 	// Nothing was healthy, but a target health kept back is still worth attempting.
 	last, ok := s.lastCallableTarget(targets, backends)
@@ -2098,6 +2104,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var requestedModel, upstreamModel string
 	var parsedBackendName string
 	var chosen Target
+	// chosenDemoted mirrors pick.demoted; see its doc comment.
+	var chosenDemoted bool
 	var logicalTargets []Target
 	var tried []string
 	// throttled is the soonest candidate the walk replayed past — the delay the
@@ -2109,7 +2117,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
-		chosen, logicalTargets = Target{}, nil
+		chosen, chosenDemoted, logicalTargets = Target{}, false, nil
 
 		cr := &countingReader{ReadCloser: io.NopCloser(bytes.NewReader(bodyBytes))}
 		body, err := rewriteModel(cr, func(model string) (string, error) {
@@ -2154,6 +2162,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					return "", resolveError{noTargetsError(model)}
 				}
 				chosen = p.target
+				chosenDemoted = p.demoted
 				parsedBackendName = chosen.backend
 				upstreamModel = chosen.model
 				return chosen.model, nil
@@ -2335,10 +2344,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				upstreamModel: upstreamModel,
 			}
 			// A sustainedRate 429 or refused access has just demoted chosen above; a
-			// bare or transient 429 and a rejected history leave it healthy, costing
-			// it only its turn here. In every case an untried target beats surfacing
-			// the failure.
-			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err)) {
+			// bare or transient 429 and a rejected history leave it healthy, costing it
+			// only its turn here. A fatal failure on chosenDemoted is the same story —
+			// already routed around for future requests, so this one needn't wait
+			// either. In every case an untried target beats surfacing the failure.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(ctx)))) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains

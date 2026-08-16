@@ -3604,7 +3604,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should keep relaying the upstream failure when a long-dead target is probed but an alternate remains untried", test{
+	tests.Add("should fail over to an untried alternate even when the target probed is long-dead", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"upstream busy"}}`)},
 			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -3614,14 +3614,42 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
 			{advance: 16 * time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
 			{
-				wantRetryAfter: "80",
-				advance:        2*time.Minute + time.Second,
-				wantStatus:     http.StatusBadGateway,
-				wantEnvelope:   errorEnvelope{Error: errorDetail{Type: errTypeServer}},
-				wantBackend:    "a",
+				advance:      2*time.Minute + time.Second,
+				wantStatus:   http.StatusOK,
+				wantBody:     `{"id":"from-b"}`,
+				wantBackend:  "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusServiceUnavailable, Err: errors.New("upstream returned status 503: upstream busy"), Called: true}},
 			},
 		},
 	})
+
+	tests.AddFunc("should surface the client's own disconnect rather than fail over a demoted target's probe", func(t *testing.T) test {
+		ctx, cancel := context.WithCancel(t.Context())
+		return test{
+			ctx: ctx,
+			backends: map[string]backendStub{
+				"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(r *http.Request, call int) (*http.Response, error) {
+					if call == 1 {
+						return resp(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`), nil
+					}
+					cancel()
+					return nil, context.Cause(r.Context())
+				}},
+				"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+			},
+			targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+			steps: []step{
+				{advance: 0, wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantBackend: "a", wantRetryAfter: "5"},
+				{advance: 46 * time.Second, wantStatus: statusClientClosedRequest, wantBackend: "a"},
+			},
+		}
+	})
+
+	// TODO: should surface a non-fatal error (e.g. a 400) from a demoted
+	// target's half-open probe rather than fail over — this replay is scoped
+	// to isFatalUpstream(err) and should stay that way. Case: a always answers
+	// 400, b healthy; advance past failoverThreshold+recoveryInterval so a is
+	// probed; assert the response still comes from a with b untried.
 
 	tests.Add("should send the upstream's own backoff when the reject is terminal", test{
 		backends: map[string]backendStub{
