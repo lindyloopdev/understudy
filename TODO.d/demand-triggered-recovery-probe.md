@@ -13,8 +13,9 @@ all), [DESIGN.md §Control plane](../DESIGN.md#daemon-control-plane) (where an
 operator's "recheck now" would live).
 
 Today `pickTarget` re-admits a demoted target by handing it to a live client
-request once `recoveryInterval` (30s) has elapsed, so that client pays the failure
-latency and may be hard-failed while a healthy alternate sits in the list.
+request once `recoveryInterval` (30s) has elapsed, so that client pays the
+probe's failure latency. A fatal (5xx) failure fails over to a healthy untried
+alternate; a non-fatal one still reaches the client even with one in the list.
 
 - Serve the triggering request from the first healthy target and launch the probe
   asynchronously, so nothing on the request path waits for it.

@@ -83,10 +83,11 @@ the model that has nothing to serve it.
   today. Firing it per attempt looks equivalent — later attempts overwrite earlier
   ones, and the success path overwrites with the response's status — but that was
   reasoned, not measured. Measure it before relying on it.
-- Six cases are the guard, and none should need to change: each replay arm with an
-  unusable candidate left untried — a sustained `429`, a refusal, a pre-header stall
-  — a target failing past the terminal threshold with only an unusable one left, a
-  client that goes away mid-walk, and a host's own cancellation cause raised mid-walk.
+- Seven cases are the guard, and none should need to change: each replay arm with an
+  unusable candidate left untried — a sustained `429`, a refusal, a pre-header stall,
+  a fatal `5xx` on a demoted pick's half-open probe — a target failing past the
+  terminal threshold with only an unusable one left, a client that goes away
+  mid-walk, and a host's own cancellation cause raised mid-walk.
   The last is the one that sees where classification happens: substituting a dead
   context at the classification point turns its `503` into a `502`. A case that needs
   editing is the signal this changed behavior rather than shape.
