@@ -4137,17 +4137,23 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody      string
 		retryAfter time.Duration
 		// targets is the logical model's candidate list.
-		targets  []Target
+		targets []Target
+		// advances is the request sequence: one entry per request, slept
+		// before it fires (0 = immediate).
 		advances []time.Duration
-		// firstRequestModel overrides the model the very first request names;
-		// empty means the logical model "m". A direct backend/model reference
-		// ("a/shared") lets that first request fail a backend outside targets
-		// that still canonicalizes to the same account and model as one of them.
-		firstRequestModel string
-		wantDown          int
+		// seed drives a health transition directly through the real
+		// production methods before requests start — the Given for a case
+		// about a transition already in place, not one built up by requests.
+		seed func(srv *server, backends map[string]Backend)
+		// dialA2 lets a2 actually be dialed (and succeed); by default a2 must
+		// never be dialed, only reached as an untried alias.
+		dialA2   bool
+		wantDown int
 		// downFields are additional fields the "backend down" records must carry.
 		downFields map[string]any
 		wantUp     int
+		// upFields are additional fields the "backend up" records must carry.
+		upFields map[string]any
 	}
 
 	logTime := func(d time.Duration) string {
@@ -4160,7 +4166,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aStatus:  always502,
 		aBody:    badGateway,
 		targets:  bothTargets,
-		advances: []time.Duration{16 * time.Second, time.Second},
+		advances: []time.Duration{0, 16 * time.Second, time.Second},
 		wantDown: 1,
 		wantUp:   0,
 	})
@@ -4168,7 +4174,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aStatus:  recoverOnProbe,
 		aBody:    badGateway,
 		targets:  bothTargets,
-		advances: []time.Duration{16 * time.Second, 30 * time.Second, time.Second, 16 * time.Second},
+		advances: []time.Duration{0, 16 * time.Second, 30 * time.Second, time.Second, 16 * time.Second},
 		wantDown: 2,
 		wantUp:   1,
 	})
@@ -4176,7 +4182,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aStatus:  recoverOnProbe,
 		aBody:    badGateway,
 		targets:  bothTargets,
-		advances: []time.Duration{16 * time.Second, 30 * time.Second},
+		advances: []time.Duration{0, 16 * time.Second, 30 * time.Second},
 		wantDown: 1,
 		wantUp:   1,
 	})
@@ -4184,7 +4190,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:    badGateway,
 		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusOK },
-		advances: []time.Duration{time.Second},
+		advances: []time.Duration{0, time.Second},
 		wantDown: 0,
 		wantUp:   0,
 	})
@@ -4197,7 +4203,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			}
 			return http.StatusUnauthorized
 		},
-		advances:   []time.Duration{time.Second},
+		advances:   []time.Duration{0, time.Second},
 		wantDown:   1,
 		downFields: map[string]any{"reason": "probe not yet due"},
 		wantUp:     0,
@@ -4206,7 +4212,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:    badGateway,
 		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
-		advances: []time.Duration{time.Second},
+		advances: []time.Duration{0, time.Second},
 		wantDown: 1,
 		downFields: map[string]any{
 			"reason":        "probe not yet due",
@@ -4224,7 +4230,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			return http.StatusUnauthorized
 		},
 		retryAfter: time.Second,
-		advances:   []time.Duration{2 * time.Second},
+		advances:   []time.Duration{0, 2 * time.Second},
 		wantDown:   1,
 		downFields: map[string]any{"reason": "probe not yet due"},
 		wantUp:     0,
@@ -4239,7 +4245,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			return http.StatusTooManyRequests
 		},
 		retryAfter: 50 * time.Second,
-		advances:   []time.Duration{31 * time.Second},
+		advances:   []time.Duration{0, 31 * time.Second},
 		wantDown:   1,
 		wantUp:     0,
 	})
@@ -4247,6 +4253,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:    badGateway,
 		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
+		advances: []time.Duration{0},
 		wantDown: 1,
 		downFields: map[string]any{
 			"reason":     "probe not yet due",
@@ -4259,6 +4266,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: 50 * time.Second,
+		advances:   []time.Duration{0},
 		wantDown:   1,
 		downFields: map[string]any{
 			"reason":        "upstream retry-after",
@@ -4274,6 +4282,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			time.Sleep(defaultHeaderStallGate + time.Second)
 			return http.StatusOK
 		},
+		advances: []time.Duration{0},
 		wantDown: 1,
 		downFields: map[string]any{
 			"reason": "no response header",
@@ -4292,7 +4301,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			clientLeaves()
 			return http.StatusOK
 		},
-		advances: []time.Duration{16 * time.Second, 30 * time.Second},
+		advances: []time.Duration{0, 16 * time.Second, 30 * time.Second},
 		wantDown: 1,
 		wantUp:   1,
 	})
@@ -4300,7 +4309,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aStatus:  recoverWithinGrace,
 		aBody:    badGateway,
 		targets:  bothTargets,
-		advances: []time.Duration{5 * time.Second},
+		advances: []time.Duration{0, 5 * time.Second},
 		wantDown: 0,
 		wantUp:   0,
 	})
@@ -4314,7 +4323,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:      badGateway,
 		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
-		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
+		advances:   []time.Duration{0, 10 * time.Second, 50 * time.Second},
 		wantDown:   1,
 		wantUp:     1,
 	})
@@ -4328,7 +4337,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:      badGateway,
 		targets:    bothTargets,
 		retryAfter: 50 * time.Second,
-		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
+		advances:   []time.Duration{0, 10 * time.Second, 50 * time.Second},
 		wantDown:   1,
 		wantUp:     0,
 	})
@@ -4338,7 +4347,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:    badGateway,
 		targets:  bothTargets,
 		aStatus:  always502,
-		advances: []time.Duration{16 * time.Second, time.Second},
+		advances: []time.Duration{0, 16 * time.Second, time.Second},
 		wantDown: 1,
 		downFields: map[string]any{
 			"reason":        "probe not yet due",
@@ -4360,7 +4369,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			return http.StatusOK
 		},
 		retryAfter: 50 * time.Second,
-		advances:   []time.Duration{10 * time.Second, 50 * time.Second},
+		advances:   []time.Duration{0, 10 * time.Second, 50 * time.Second},
 		wantDown:   1,
 		downFields: map[string]any{
 			"reason":     "upstream retry-after",
@@ -4374,7 +4383,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		targets:    bothTargets,
 		aStatus:    func(int, context.CancelFunc) int { return http.StatusTooManyRequests },
 		retryAfter: time.Second,
-		advances:   []time.Duration{16 * time.Second},
+		advances:   []time.Duration{0, 16 * time.Second},
 		wantDown:   1,
 		downFields: map[string]any{
 			"reason":         "probe not yet due",
@@ -4386,6 +4395,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aBody:    badGateway,
 		targets:  bothTargets,
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusUnauthorized },
+		advances: []time.Duration{0},
 		wantDown: 1,
 		downFields: map[string]any{
 			"upstream_error": "upstream returned status 401: bad gateway",
@@ -4397,26 +4407,39 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusServiceUnavailable },
 		aBody:    `{"error":{"message":"server busy","code":"unavailable"}}`,
 		targets:  []Target{{backend: "a", model: "ma"}},
-		advances: []time.Duration{16 * time.Second, 16 * time.Second},
+		advances: []time.Duration{0, 16 * time.Second, 16 * time.Second},
 		wantDown: 0,
 		wantUp:   0,
 	})
 
 	tests.Add("should name the target that failed, not a sibling reached later through a different config name", test{
-		aStatus:           always502,
-		aBody:             badGateway,
-		targets:           []Target{{backend: "a2", model: "shared"}, {backend: "b", model: "mb"}},
-		firstRequestModel: "a/shared",
-		advances:          []time.Duration{16 * time.Second},
-		wantDown:          1,
-		downFields:        map[string]any{"model": "shared"},
-		wantUp:            0,
+		targets: []Target{{backend: "a2", model: "shared"}, {backend: "b", model: "mb"}},
+		seed: func(srv *server, backends map[string]Backend) {
+			srv.recordFailure(Target{backend: "a", model: "shared"}, backends, errors.New("bad gateway"))
+		},
+		advances:   []time.Duration{16 * time.Second},
+		wantDown:   1,
+		downFields: map[string]any{"model": "shared"},
+		wantUp:     0,
 	})
 
-	// TODO: should log "backend up" naming the same backend "backend down"
-	// named for that streak, not the alias whichever later request happened
-	// to succeed through — recordSuccess discards h.backend when it deletes
-	// the entry, so clearFailure has nothing but t.backend to log today.
+	tests.Add("should log a backend up naming the same backend a paired backend down named, not the sibling a success arrived through", test{
+		targets: []Target{{backend: "a2", model: "shared"}},
+		seed: func(srv *server, backends map[string]Backend) {
+			srv.recordImmediateFailure(context.Background(), Target{backend: "a", model: "shared"}, backends, errors.New("bad gateway"))
+		},
+		advances:   []time.Duration{0},
+		dialA2:     true,
+		wantDown:   1,
+		downFields: map[string]any{"model": "shared"},
+		wantUp:     1,
+		upFields:   map[string]any{"model": "shared"},
+	})
+
+	// TODO: should name the paired "backend down"'s backend, not empty or the
+	// sibling that succeeded, when a success arrives mid-bench (readmitAt not
+	// reached) and a later success only then ends the streak — the case above
+	// only reaches recordSuccess's delete branch, not its bench-preserving one.
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -4441,12 +4464,15 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			clientB := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: make(http.Header)}, nil
 			})
-			// a2 canonicalizes to the same account as a (same base URL + key): a
-			// second config name a probeModel can reach the shared health entry
-			// through, without ever actually being dialed.
+			// a2 shares a's account (base URL + key): a second config name
+			// reaching the same health entry. Must never be dialed unless
+			// dialA2 lets it actually serve.
 			clientA2 := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-				t.Fatal("a2 dialed: it should only ever be reached as an untried alias of a's account")
-				return nil, nil
+				if !tt.dialA2 {
+					t.Fatal("a2 dialed: it should only ever be reached as an untried alias of a's account")
+					return nil, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-a2"}`)), Header: make(http.Header)}, nil
 			})
 			backends := map[string]Backend{
 				"a":  {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "a", Path: "/v1"}, APIKey: "sk-a", HTTPClient: clientA}},
@@ -4456,7 +4482,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
-			srv := New(validator, WithLogger(logger))
+			srv := New(validator, WithLogger(logger)).(*server)
 
 			doRequest := func(model string) {
 				req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`))
@@ -4468,16 +4494,21 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 				srv.ServeHTTP(httptest.NewRecorder(), req)
 			}
 
-			doRequest(cmp.Or(tt.firstRequestModel, "m"))
+			if tt.seed != nil { // Given: a transition already in place.
+				tt.seed(srv, backends)
+			}
 			for _, adv := range tt.advances {
-				time.Sleep(adv)
-				synctest.Wait()
+				if adv > 0 {
+					time.Sleep(adv)
+					synctest.Wait()
+				}
 				doRequest("m")
 			}
 
 			down := map[string]any{"msg": "backend down", "level": "INFO", "backend": "a", "model": "ma"}
 			maps.Copy(down, tt.downFields)
 			up := map[string]any{"msg": "backend up", "level": "INFO", "backend": "a", "model": "ma"}
+			maps.Copy(up, tt.upFields)
 			if got := slogdiff.JSONCount(logBuf.Bytes(), down); got != tt.wantDown {
 				t.Errorf("%q count for backend=a model=ma: got %d, want %d; log:\n%s", "backend down", got, tt.wantDown, logBuf.String())
 			}

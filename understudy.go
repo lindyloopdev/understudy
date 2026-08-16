@@ -160,10 +160,9 @@ type targetHealth struct {
 	// a target still fit to serve — but it bounds how long the run may go on being
 	// answered with another backoff.
 	busySince time.Time
-	// backend is the config name of the target that was actually called when this
-	// streak was opened or last touched — never a sibling merely sharing the
-	// entry's account. A "backend down" names this, not whichever alias a later
-	// walk happens to be examining when it reaches the shared entry.
+	// backend is the config name actually called when this streak was opened
+	// or last touched — never a sibling merely sharing the account. Logged
+	// transitions name this, not whichever alias a later walk examines.
 	backend string
 }
 
@@ -854,9 +853,9 @@ func pacedTo(at time.Time) downCause {
 // backendDownRecord is what every "backend down" says: which target, why it is out,
 // when it started failing, and when it is due back — the moment an upstream named, or
 // the one understudy's own pacing sets, never both. Built here so the walk and the
-// demotion paths cannot drift apart. Names the backend that actually failed (h.backend)
-// rather than t, which — from the walk — may be a sibling alias sharing the same
-// account that was never called. Caller holds s.mu only if h came from the map.
+// demotion paths cannot drift apart. Names h.backend, the target that actually
+// failed — not t, which may be a sibling alias the walk never called.
+// Caller holds s.mu only if h came from the map.
 func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 	return []any{
 		slog.String("backend", h.backend),
@@ -1174,9 +1173,9 @@ func (e terminalError) Unwrap() error { return e.error }
 func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
 	// Logged after recordSuccess returns, so the consumer's handler does not block
 	// every other request's walk behind s.mu.
-	if s.recordSuccess(t, backends) {
+	if backend, shouldLogSuccess := s.recordSuccess(t, backends); shouldLogSuccess {
 		s.logTransition(ctx, "backend up",
-			slog.String("backend", t.backend),
+			slog.String("backend", backend),
 			slog.String("model", t.model),
 		)
 	}
@@ -1191,20 +1190,19 @@ func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
 	s.logger.InfoContext(context.WithoutCancel(ctx), msg, args...)
 }
 
-// recordSuccess ends t's failure streak and reports whether its failure had been
-// logged, so the "backend up" that pairs with it is logged outside the lock. A
-// bench the upstream asked for is not a success's to lift: while readmitAt has
-// not elapsed, the entry survives the streak's end — failingSince backdated past
-// the failover threshold so the walk still routes around it — and no "backend
-// up" is owed yet, the target not being back.
-func (s *server) recordSuccess(t Target, backends map[string]Backend) bool {
+// recordSuccess ends t's failure streak, returning the streak's own backend —
+// not t's, which may be a sibling alias — and whether "backend up" is owed.
+// A bench the upstream asked for outlives the streak: while readmitAt has not
+// elapsed the entry survives ("", not owed), so the walk still routes around
+// it until the bench clears.
+func (s *server) recordSuccess(t Target, backends map[string]Backend) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
 	h, ok := s.health[id]
 	if !ok {
-		return false
+		return "", false
 	}
 	if now.Before(h.readmitAt) {
 		s.health[id] = targetHealth{
@@ -1215,11 +1213,12 @@ func (s *server) recordSuccess(t Target, backends map[string]Backend) bool {
 			downLogged:   h.downLogged,
 			lastError:    h.lastError,
 			lastTouch:    now,
+			backend:      h.backend,
 		}
-		return false
+		return "", false
 	}
 	delete(s.health, id)
-	return h.downLogged
+	return h.backend, h.downLogged
 }
 
 // clientFacing maps an error returned by a provider call into the status the
