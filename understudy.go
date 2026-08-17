@@ -155,11 +155,6 @@ type targetHealth struct {
 	// lastTouch is when the entry was last written, the age the eviction sweep
 	// measures.
 	lastTouch time.Time
-	// busySince is when the target's current run of at-capacity answers began, or
-	// zero. It is not a failure streak — an entry carrying only this one describes
-	// a target still fit to serve — but it bounds how long the run may go on being
-	// answered with another backoff.
-	busySince time.Time
 	// backend is the config name actually called when this streak was opened
 	// or last touched — never a sibling merely sharing the account. Logged
 	// transitions name this, not whichever alias a later walk examines.
@@ -1050,24 +1045,6 @@ func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter tim
 	}
 }
 
-// recordBusy marks t as answering at capacity and returns when its current busy
-// run began, so a run outlasting the terminal threshold can stop being answered
-// with another backoff. The run ends when t serves a request, which drops the
-// entry.
-func (s *server) recordBusy(t Target, backends map[string]Backend) time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := healthKey(t, backends)
-	now := time.Now()
-	h := s.health[id]
-	if h.busySince.IsZero() {
-		h.busySince = now
-	}
-	h.lastTouch = now
-	s.health[id] = h
-	return h.busySince
-}
-
 // withSynthesizedBackoff attaches understudy's own Retry-After to a retryable
 // failure the upstream left unbounded, grown from how long t has been failing, so
 // a client backs off understudy's interval rather than its own flat one. An
@@ -1295,8 +1272,13 @@ func graduatedBackoff(elapsed time.Duration, jitter float64) time.Duration {
 		remaining -= interval
 	}
 	// Downward only: returning early costs one cheap answer, while waiting past the
-	// interval delays a condition that may already have cleared. The factor stays in
-	// (1-jitter, 1], so nobody is sent back at once.
+	// interval delays a condition that may already have cleared.
+	return jitteredInterval(interval, jitter)
+}
+
+// jitteredInterval scatters interval by a factor in (1-jitter, 1], so
+// concurrent clients told the same interval do not return in lockstep.
+func jitteredInterval(interval time.Duration, jitter float64) time.Duration {
 	//nolint:gosec // G404: the scatter separates retrying clients; it is not a
 	// secret and nothing is weakened by it being predictable.
 	return time.Duration(float64(interval) * (1 - jitter*rand.Float64()))
@@ -2271,33 +2253,21 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			return stalled
 		}
-		// errHeaderStall's disposition, told rather than inferred. Ahead of
-		// recordFailure: a loading target spends no streak.
-		if logicalTargets != nil && errors.Is(err, providers.ErrServerBusy) {
-			tried = append(tried, healthKey(chosen, backend.Backends))
-			releaseHeld()
-			cancel(nil)
-			if len(untriedTargets(logicalTargets, tried, backend.Backends)) > 0 {
-				s.recordRateLimited(r.Context(), chosen, synthesizedStallBackoff, backend.Backends, err)
-				lastFailure = &failedAttempt{
-					answer:        clientFacing(ctx, err),
-					raw:           err,
-					target:        chosen,
-					backend:       parsedBackendName,
-					upstreamModel: upstreamModel,
-				}
-				continue
+		// A busy refusal is kronk's own transient-backpressure signal, carrying
+		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
+		// the shape classifyLimit already reads a real sustained rate limit in
+		// — everything below (demotion, backoff, replay, terminal reject) then
+		// treats it identically, with no busy-specific branch of its own.
+		// Synthesized, not sent by kronk, so it is jittered like any interval
+		// understudy invents — but the base is scaled so jitter's floor still
+		// clears rateLimitDemotionThreshold, or a scattered draw could flip its
+		// own classification to transientRate and silently stop demoting.
+		if errors.Is(err, providers.ErrServerBusy) {
+			base := time.Duration(float64(rateLimitDemotionThreshold) / (1 - s.jitterFactor))
+			err = retryAfterError{
+				error: yerrors.WithHTTPStatus(http.StatusTooManyRequests, err),
+				at:    time.Now().Add(jitteredInterval(base, s.jitterFactor)),
 			}
-			// Nowhere to replay to: hand the client the wait instead of a verdict, so
-			// it comes back to a target that will by then have finished loading. Past
-			// the terminal threshold it plainly is not loading, and repeating the wait
-			// would only keep the client coming back to a backend that never serves.
-			setLogUpstreamStatus(r.Context(), yerrors.HTTPStatus(err))
-			busyFor := time.Since(s.recordBusy(chosen, backend.Backends))
-			if busyFor > s.terminalThreshold {
-				return terminalError{err}
-			}
-			return retryAfterError{error: err, at: time.Now().Add(graduatedBackoff(busyFor, s.jitterFactor))}
 		}
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model

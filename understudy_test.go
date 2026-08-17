@@ -3185,13 +3185,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should answer a lone busy target with a 503 and a backoff to wait out", test{
+	tests.Add("should answer a lone busy target like any sustained rate limit, with a backoff to wait out", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":{"message":"Service Unavailable","type":"server_error"}}`, wantRetryAfter: "5"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 503: server busy","type":"server_error"}}`, wantRetryAfter: "30"},
 		},
 	})
 
@@ -3439,19 +3439,19 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should tell a client to wait longer each time a target is still busy", test{
+	tests.Add("should tell a client the same wait every time a target answers busy", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
-			{advance: 5 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "10"},
-			{advance: 10 * time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "20"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "30"},
+			{advance: 5 * time.Second, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "30"},
+			{advance: 10 * time.Second, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "30"},
 		},
 	})
 
-	tests.Add("should start a fresh busy run once a target serves again", test{
+	tests.Add("should not let a quick success mid-bench clear a busy streak old enough to reject terminally", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				if call == 2 {
@@ -3462,9 +3462,21 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "30"},
+			// Still inside the 30s bench, so the streak survives the success
+			// (recordSuccess's bench-preserving branch, not its delete branch) —
+			// the target hasn't proven it's actually back, only answered once.
 			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`},
-			{advance: 2*time.Minute + time.Second, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			// Failing again long after: the streak's start never reset, so it is
+			// now well past the terminal threshold.
+			{
+				advance:    2*time.Minute + time.Second,
+				wantStatus: http.StatusBadRequest,
+				wantEnvelope: errorEnvelope{
+					Error:        errorDetail{Type: errTypeUpstreamRateLimited},
+					RetryAfterMS: int(rateLimitDemotionThreshold.Milliseconds()),
+				},
+			},
 		},
 	})
 
@@ -3474,13 +3486,13 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 		targets: []Target{{backend: "a", model: "ma"}},
 		steps: []step{
-			{advance: 0, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: "5"},
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantRetryAfter: "30"},
 			{
 				advance:    2*time.Minute + time.Second,
 				wantStatus: http.StatusBadRequest,
 				wantEnvelope: errorEnvelope{
-					Error:        errorDetail{Type: errTypeUpstreamUnavailable},
-					RetryAfterMS: int(maxPassthroughRetryAfter.Milliseconds()),
+					Error:        errorDetail{Type: errTypeUpstreamRateLimited},
+					RetryAfterMS: int(rateLimitDemotionThreshold.Milliseconds()),
 				},
 			},
 		},
@@ -4403,12 +4415,12 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		wantUp: 0,
 	})
 
-	tests.Add("should not announce a lone target down while it is only swapping models", test{
+	tests.Add("should announce a lone busy target down like any other sustained rate limit, even with nowhere to fail over", test{
 		aStatus:  func(int, context.CancelFunc) int { return http.StatusServiceUnavailable },
 		aBody:    `{"error":{"message":"server busy","code":"unavailable"}}`,
 		targets:  []Target{{backend: "a", model: "ma"}},
 		advances: []time.Duration{0, 16 * time.Second, 16 * time.Second},
-		wantDown: 0,
+		wantDown: 1,
 		wantUp:   0,
 	})
 
@@ -4436,10 +4448,20 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		upFields:   map[string]any{"model": "shared"},
 	})
 
-	// TODO: should name the paired "backend down"'s backend, not empty or the
-	// sibling that succeeded, when a success arrives mid-bench (readmitAt not
-	// reached) and a later success only then ends the streak — the case above
-	// only reaches recordSuccess's delete branch, not its bench-preserving one.
+	tests.Add("should name the paired backend down's backend when a mid-bench success is later followed by one that ends the streak", test{
+		targets: []Target{{backend: "a2", model: "shared"}},
+		seed: func(srv *server, backends map[string]Backend) {
+			srv.recordRateLimited(context.Background(), Target{backend: "a", model: "shared"}, 30*time.Second, backends, errors.New("bad gateway"))
+		},
+		// The first success lands mid-bench (readmitAt at t=30s) and must not
+		// end the streak; the second lands after it elapses and does.
+		advances:   []time.Duration{15 * time.Second, 30 * time.Second},
+		dialA2:     true,
+		wantDown:   1,
+		downFields: map[string]any{"model": "shared"},
+		wantUp:     1,
+		upFields:   map[string]any{"model": "shared"},
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -5719,12 +5741,14 @@ func TestChatCompletionsScattersBusyBackoff(t *testing.T) {
 		told[wait] = struct{}{}
 	}
 
-	// Scattering a 5s interval may shorten a client's wait but never lengthen it:
-	// below 1s sends it back at once, past 5s makes it sit out a swap that may
-	// already have finished.
+	// Scattering only shortens the synthesized interval, never lengthens it, and
+	// its floor is the demotion threshold itself — any lower and the scattered
+	// draw would stop counting as a sustained rate limit.
 	for wait := range told {
-		if hi := int(graduatedBackoffBase / time.Second); wait < 1 || wait > hi {
-			t.Errorf("client was told to return after %ds, outside the 1-%ds a scattered interval may span", wait, hi)
+		lo := int(rateLimitDemotionThreshold / time.Second)
+		hi := int(float64(lo) / (1 - defaultJitterFactor))
+		if wait < lo || wait > hi {
+			t.Errorf("client was told to return after %ds, outside the %d-%ds a scattered interval may span", wait, lo, hi)
 		}
 	}
 	if len(told) < 2 {
