@@ -307,7 +307,7 @@ func TestConfigResolve(t *testing.T) {
 		},
 	})
 
-	tests.Add("should reject a non-boolean thinking value at resolve", test{
+	tests.Add("should resolve a target whatever an override's value is, since only its key is validated", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{
 				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},
@@ -316,22 +316,44 @@ func TestConfigResolve(t *testing.T) {
 				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"thinking": {"maybe"}}}}},
 			},
 		},
-		wantErr: `^understudy\.models\.m: target "a/ma": invalid thinking value.+$`,
+		want: &BackendConfig{
+			Backends: map[string]Backend{
+				"a": {ProviderType: "openai", Config: providers.Config{
+					BaseURL: mustParseURL(t, "https://a.example.com"),
+					APIKey:  "sk-a",
+				}},
+			},
+			Models: map[string]LogicalModel{
+				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"thinking": {"maybe"}}}}},
+			},
+		},
 	})
 
-	tests.Add("should reject a reserved thinking=true value at resolve", test{
+	tests.Add("should reject a reserved override key at resolve", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{
 				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},
 			},
 			Models: map[string]LogicalModelSpec{
-				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"thinking": {"true"}}}}},
+				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"messages": {"[]"}}}}},
 			},
 		},
-		wantErr: `^understudy\.models\.m: target "a/ma": thinking=true is reserved.+$`,
+		wantErr: `^understudy\.models\.m: target "a/ma": override key "messages" is reserved$`,
 	})
 
-	tests.Add("should ignore an unknown query parameter at resolve", test{
+	tests.Add("should reject a repeated override key at resolve", test{
+		cfg: Config{
+			Backends: map[string]BackendSpec{
+				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},
+			},
+			Models: map[string]LogicalModelSpec{
+				"m": {Targets: []Target{{backend: "a", model: "ma", query: url.Values{"temperature": {"0.7", "1.5"}}}}},
+			},
+		},
+		wantErr: `^understudy\.models\.m: target "a/ma": override key "temperature" is repeated$`,
+	})
+
+	tests.Add("should keep an unrecognized query parameter at resolve as a live override", test{
 		cfg: Config{
 			Backends: map[string]BackendSpec{
 				"a": {ProviderType: "openai", BaseURL: "https://a.example.com", APIKey: "sk-a"},

@@ -37,7 +37,7 @@ func TestTargetUnmarshalText(t *testing.T) {
 		input:        "zai/glm-5?thinking=false",
 		wantIdentity: "zai/glm-5",
 	})
-	tests.Add("should decode an override the domain rules reject, leaving that verdict to the caller", test{
+	tests.Add("should decode an override value without interpreting it, leaving that verdict to the caller", test{
 		input:        "zai/glm-5?thinking=banana",
 		wantIdentity: "zai/glm-5",
 	})

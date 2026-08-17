@@ -446,47 +446,61 @@ the primary's body forwards untouched, so an unrecognized field is never sent to
 a backend that might reject it.
 
 Overrides ride **inline on the target reference** as URL-style query params —
-`<backend>/<model>?thinking=false`. Decoding the reference is **purely
-structural**: a `Target` carries its backend, model, and raw query, nothing more —
-no feature policy leaks into the transport parse. The target's `(backend, model)`
-is what gets **dialed**; **availability** keys on the canonical upstream account +
-model (`healthKey`) — both projections that drop the query overrides, so the
-thinking and non-thinking profiles of one model share health (same endpoint) while
-carrying different body policy.
+`<backend>/<model>?key=value`. Decoding the reference is **purely
+structural**: a `Target` carries its backend, model, and raw query, nothing
+more — no feature policy leaks into the transport parse. The target's
+`(backend, model)` is what gets **dialed**; **availability** keys on the
+canonical upstream account + model (`healthKey`) — both projections that drop
+the query overrides, so the override profiles of one model share health (same
+endpoint) while carrying different body policy.
 That projection is what lets the *same* model appear as distinct profiles across
 logical models — a home a global per-model flag (bakes one behavior in) or a
 logical-model-per-profile (nests logical models) can't provide. The **domain
-rules** — the `thinking` value's semantics — are validated wherever a reference
+rules** — which keys an override may carry — are validated wherever a reference
 is accepted, never in the decode: at `Config.Resolve` beside the existing
 backend-reference check, and again when a request names a `backend/model`
 reference directly, which is a target the caller wrote rather than the operator.
 One reference means one thing however it arrives, so an override the config would
 refuse is refused from a request too — as a `400`, since there it is the caller's
-input that is wrong. An **unrecognized query param is ignored, not rejected**
-(Postel's law): rejecting it would break forward/backward compatibility — an
-older binary would refuse a config carrying a param it hasn't learned yet, so a
-new override couldn't roll out across a fleet ahead of the binary. Only *known*
-params are validated (e.g. `thinking` must be a strict boolean).
+input that is wrong.
 
-The first override is **`thinking=false`** → understudy injects
-`thinking:{type:disabled}` into the forwarded body. Thinking fallback targets
-otherwise burn reasoning tokens and, for some, emit chain-of-thought into
-`content` where it collides with the fenced findings block reviewers parse;
-disabling restores the primary's non-thinking behavior on the failover hop.
+**Every non-reserved key is forwarded.** When the pinned target is called, each
+query key is spliced into the request body's root object under that key —
+replacing the value the request already carries, or inserting the key when
+absent — set to the value's **JSON interpretation**: the value parsed as JSON
+when it is one, its bytes verbatim (`?temperature=0.7` forwards the number
+`0.7`, `?thinking=false` the boolean `false`, `?thinking={"type":"disabled"}`
+that object), and otherwise the raw text as a JSON string
+(`?reasoning_effort=high` forwards `"high"` — a bare word is not valid JSON
+alone). A caller wanting a literal string that *looks* like a bool or number
+quotes it in the query (`?param="true"`) — a documented tradeoff of the JSON
+grammar, not a bug. Only the bytes up to the splice point are buffered; the rest
+of the body streams through byte-faithfully. Thinking fallback targets motivate
+the mechanism: they burn reasoning tokens and can leak chain-of-thought into
+`content`, colliding with the fenced findings block reviewers parse —
+`?thinking={"type":"disabled"}` restores the primary's behavior on the failover
+hop.
 
-The override value is a **strict boolean**: a value that doesn't parse is
-rejected when the config resolves, so a config typo fails loudly rather than
-silently no-opping. Only `false` is honored — `thinking=true` (forcing thinking
-*on*) is **reserved and rejected at resolve**, not a silent no-op: honoring it
-means injecting
-`thinking:{type:enabled}`, which is load-bearing only for a reasoning model that
-defaults thinking *off* (hybrid/opt-in reasoning models exist), a behavior not
-yet built. Rejecting `true` today keeps that evolution forward-compatible —
-error→valid never changes an existing config's behavior, where no-op→inject
-would. The override is therefore modeled **disable-only** until enable lands with
-its own behavior. This is the first member of a growing category — later
-normalizations (dropping a `temperature` a strict target rejects, downgrading
-`response_format`, renaming `max_tokens`) likewise land with their own behavior.
+The main domain rule is a **reserved-key list** — `model`, `messages`, `stream`,
+`tools`, `response_format`, `n`, `tool_choice`, `parallel_tool_calls` —
+rejected wherever a reference is validated and never forwarded. These define
+what the request *is* (identity and content) or the client's own contract for
+how the response arrives and is shaped, not a generation-behavior tweak, so an
+override would speak for the caller rather than adjust generation. Beyond that
+(and a repeated key, which can carry only one value), understudy validates
+reserved-or-not, **never vocabulary** — whether a model accepts `reasoning_effort` is the upstream's to
+answer, by rejecting the request and naming the parameter; an allowlist here
+would be stale at the next model release. Forwarding generically also beats the
+old ignore-unrecognized rule: a binary that has never heard of a param now
+forwards it instead of dropping it, so a new override works ahead of any binary
+rollout — nothing is silently discarded.
+
+**This is unsafe, in Go's sense of the word.** A caller reaching for this
+escape hatch takes on responsibility a type system would otherwise carry:
+`?thinking=true` sent to a backend expecting the Anthropic object shape
+forwards as the literal boolean `true`, silently no-opping on a lenient
+backend or erroring on a strict one. The reserved-key list is the only check
+performed; a known key's own shape is the caller's to get right.
 
 **understudy never picks a model, and reserves no model name.** Every logical
 model is one the operator declared, and a request resolves to a declared target or
@@ -942,7 +956,7 @@ no contribution at all is the stop. Not every row is weighed yet —
 
 **A target that cannot serve *this* conversation is routed around, not adapted.**
 DeepSeek requires `reasoning_content` on an assistant turn carrying `tool_calls`,
-which a history authored under `?thinking=false` lacks. That says nothing about the
+which a history authored under `?thinking={"type":"disabled"}` lacks. That says nothing about the
 target's health, so the walk replays onto the next untried candidate and leaves its
 health alone. It does not rewrite the body to suit: disabling a thinking mode the
 operator configured substitutes a capability nobody declared, and that judgment

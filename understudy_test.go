@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -613,7 +614,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should tell the caller an override it cannot read is not a value it may send", func(t *testing.T) test {
+	tests.AddFunc("should reject a reserved override key that would rewrite what the request is", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
 				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
@@ -621,14 +622,14 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}}
 		return test{
 			server:              New(validator, WithLogger(testLogger(t))).(*server),
-			requestBody:         `{"model":"openai/gpt-4?thinking=banana","messages":[{"role":"user","content":"hi"}]}`,
+			requestBody:         `{"model":"openai/gpt-4?messages=[]","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
-			wantBodyContains:    []string{`"type":"invalid_request_error"`, `openai/gpt-4?thinking=banana`},
+			wantBody:            `{"error":{"message":"model \"openai/gpt-4?messages=[]\": override key \"messages\" is reserved","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
 
-	tests.AddFunc("should tell the caller a reserved override is not supported rather than ignoring it", func(t *testing.T) test {
+	tests.AddFunc("should reject a reserved override key that would rewrite the caller's response contract", func(t *testing.T) test {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: map[string]Backend{
 				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
@@ -636,9 +637,24 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}}
 		return test{
 			server:              New(validator, WithLogger(testLogger(t))).(*server),
-			requestBody:         `{"model":"openai/gpt-4?thinking=true","messages":[{"role":"user","content":"hi"}]}`,
+			requestBody:         `{"model":"openai/gpt-4?stream=true","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
-			wantBody:            `{"error":{"message":"model \"openai/gpt-4?thinking=true\": thinking=true is reserved: enabling thinking is not yet supported","type":"invalid_request_error"}}`,
+			wantBody:            `{"error":{"message":"model \"openai/gpt-4?stream=true\": override key \"stream\" is reserved","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
+
+	tests.AddFunc("should reject a repeated override key rather than silently keeping only one value", func(t *testing.T) test {
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return &BackendConfig{Backends: map[string]Backend{
+				"openai": {ProviderType: "openai", Config: providers.Config{BaseURL: &url.URL{Scheme: "http", Host: "backend", Path: "/v1"}, APIKey: "sk-test"}},
+			}}, nil
+		}}
+		return test{
+			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			requestBody:         `{"model":"openai/gpt-4?temperature=0.7&temperature=1.5","messages":[{"role":"user","content":"hi"}]}`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"model \"openai/gpt-4?temperature=0.7&temperature=1.5\": override key \"temperature\" is repeated","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
@@ -714,6 +730,14 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
 		}
 	})
+
+	// TODO: should return 400 with invalid_request_error when a target with a
+	// query override is named and the body is malformed after the model field
+	// — e.g. model "openai/gpt-4?temperature=0.7" with body
+	// `{"model":"openai/gpt-4?temperature=0.7",`. rewriteModel never inspects
+	// the rest of the body, so this exercises setOverride's own decode failure
+	// (understudy.go's setOverride error branch), a distinct path from the case
+	// above, which fails inside rewriteModel before any override runs.
 
 	tests.AddFunc("should return StatusBadGateway when backend connection fails", func(t *testing.T) test {
 		return test{
@@ -1609,60 +1633,78 @@ func TestChatCompletionsForwardedModel(t *testing.T) {
 	})
 }
 
-func forwardedThinkingType(t *testing.T, body []byte) string {
-	t.Helper()
-	type thinkingField struct {
-		Type string `json:"type"`
-	}
-	var parsed struct {
-		Thinking thinkingField `json:"thinking"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		t.Fatalf("could not parse forwarded body: %v", err)
-	}
-	return parsed.Thinking.Type
-}
-
-func TestChatCompletionsThinkingInjection(t *testing.T) {
+func TestChatCompletionsQueryOverrides(t *testing.T) {
 	t.Parallel()
 
 	type test struct {
 		requestBody string
 		targetQuery url.Values
-		wantType    string
-		wantKeys    int
+		want        map[string]json.RawMessage
+		wantKeys    map[string]int
+		// wantOnlyKeys asserts the forwarded body has exactly these top-level
+		// keys — nothing added, nothing dropped. Always checked, every case.
+		wantOnlyKeys []string
 	}
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should inject disabled when the request omits thinking and the target disables it", test{
-		requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
-		targetQuery: url.Values{"thinking": {"false"}},
-		wantType:    "disabled",
-		wantKeys:    1,
+	tests.Add("should forward a thinking=false override as the literal boolean it parses to", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"thinking": {"false"}},
+		want:         map[string]json.RawMessage{"thinking": json.RawMessage("false")},
+		wantKeys:     map[string]int{"thinking": 1},
+		wantOnlyKeys: []string{"model", "messages", "thinking"},
+	})
+	tests.Add("should forward an object-valued override the request omits, written explicitly", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"thinking": {`{"type":"disabled"}`}},
+		want:         map[string]json.RawMessage{"thinking": json.RawMessage(`{"type":"disabled"}`)},
+		wantKeys:     map[string]int{"thinking": 1},
+		wantOnlyKeys: []string{"model", "messages", "thinking"},
+	})
+	tests.Add("should override a value the request already carries", test{
+		requestBody:  `{"thinking":true,"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"thinking": {"false"}},
+		want:         map[string]json.RawMessage{"thinking": json.RawMessage("false")},
+		wantKeys:     map[string]int{"thinking": 1},
+		wantOnlyKeys: []string{"model", "messages", "thinking"},
+	})
+	tests.Add("should replace an object value the request already carries", test{
+		requestBody:  `{"thinking":{"type":"enabled"},"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"thinking": {`{"type":"disabled"}`}},
+		want:         map[string]json.RawMessage{"thinking": json.RawMessage(`{"type":"disabled"}`)},
+		wantKeys:     map[string]int{"thinking": 1},
+		wantOnlyKeys: []string{"model", "messages", "thinking"},
+	})
+	tests.Add("should forward a numeric override value as a JSON number", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"temperature": {"0.7"}},
+		want:         map[string]json.RawMessage{"temperature": json.RawMessage("0.7")},
+		wantKeys:     map[string]int{"temperature": 1},
+		wantOnlyKeys: []string{"model", "messages", "temperature"},
+	})
+	tests.Add("should forward a bare-word override value as a JSON string", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"reasoning_effort": {"high"}},
+		want:         map[string]json.RawMessage{"reasoning_effort": json.RawMessage(`"high"`)},
+		wantKeys:     map[string]int{"reasoning_effort": 1},
+		wantOnlyKeys: []string{"model", "messages", "reasoning_effort"},
 	})
 	tests.Add("should apply an override carried by a backend/model reference the request names", test{
-		requestBody: `{"model":"zai/glm-5?thinking=false","messages":[{"role":"user","content":"hi"}]}`,
-		wantType:    "disabled",
-		wantKeys:    1,
+		requestBody:  `{"model":"zai/glm-5?reasoning_effort=high","messages":[{"role":"user","content":"hi"}]}`,
+		want:         map[string]json.RawMessage{"reasoning_effort": json.RawMessage(`"high"`)},
+		wantKeys:     map[string]int{"reasoning_effort": 1},
+		wantOnlyKeys: []string{"model", "messages", "reasoning_effort"},
 	})
-	tests.Add("should override a request's enabled thinking when the target disables it", test{
-		requestBody: `{"thinking":{"type":"enabled"},"model":"m","messages":[{"role":"user","content":"hi"}]}`,
-		targetQuery: url.Values{"thinking": {"false"}},
-		wantType:    "disabled",
-		wantKeys:    1,
-	})
-	tests.Add("should collapse an already-disabled request to a single thinking key", test{
-		requestBody: `{"thinking":{"type":"disabled"},"model":"m","messages":[{"role":"user","content":"hi"}]}`,
-		targetQuery: url.Values{"thinking": {"false"}},
-		wantType:    "disabled",
-		wantKeys:    1,
-	})
-	tests.Add("should leave thinking untouched when the target does not disable it", test{
-		requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
-		targetQuery: nil,
-		wantType:    "",
-		wantKeys:    0,
+	// TODO: should forward a quoted override value as the literal string it
+	// names, not coerced to the bool/number it looks like — e.g. a query-encoded
+	// ?param=%22true%22 should forward "param":"true", proving overrideJSON's
+	// documented quoting escape actually works, not just its bare-value path.
+
+	tests.Add("should add no override key when the target carries none", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  nil,
+		wantOnlyKeys: []string{"model", "messages"},
 	})
 
 	tests.Parallel()
@@ -1697,11 +1739,23 @@ func TestChatCompletionsThinkingInjection(t *testing.T) {
 
 		srv.ServeHTTP(httptest.NewRecorder(), req)
 
-		if got := forwardedThinkingType(t, forwarded); got != tt.wantType {
-			t.Errorf("forwarded thinking type: got %q, want %q", got, tt.wantType)
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(forwarded, &got); err != nil {
+			t.Fatalf("could not parse forwarded body %q: %v", forwarded, err)
 		}
-		if got := bytes.Count(forwarded, []byte(`"thinking"`)); got != tt.wantKeys {
-			t.Errorf("forwarded thinking key count: got %d, want %d", got, tt.wantKeys)
+		for key, want := range tt.want {
+			if !bytes.Equal(bytes.TrimSpace(got[key]), want) {
+				t.Errorf("forwarded %s: got %s, want %s", key, got[key], want)
+			}
+		}
+		for key, want := range tt.wantKeys {
+			if gotCount := bytes.Count(forwarded, []byte(`"`+key+`"`)); gotCount != want {
+				t.Errorf("forwarded %s key count: got %d, want %d", key, gotCount, want)
+			}
+		}
+		want := slices.Sorted(slices.Values(tt.wantOnlyKeys))
+		if d := gocmp.Diff(want, slices.Sorted(maps.Keys(got))); d != "" {
+			t.Errorf("forwarded keys (-want +got):\n%s", d)
 		}
 	})
 }

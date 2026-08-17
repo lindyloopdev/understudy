@@ -19,6 +19,11 @@
 - The failure-translation table ([[understudy-error-envelope-type]]) — status,
   envelope `type`, and `Retry-After` per upstream condition. A consumer dispatches
   on it, so it belongs in the library doc rather than only in the code.
+- Per-target request-body overrides (`<backend>/<model>?key=value`, DESIGN.md
+  §Understudy "Per-target request-body normalization"): the JSON-interpretation
+  rule (parse or quote), the reserved-key list, and the explicit "this is
+  unsafe — only the key is checked, never a value's shape" caveat. An operator
+  writing a config target needs this without reading the design doc.
 - `providers-tested.md` matrix: provider · OpenAI-compat endpoint · free-tier
   limit shape · last-verified date · quirks. Re-verify monthly (free tiers rot;
   Cerebras has paused theirs before).

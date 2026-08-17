@@ -1923,17 +1923,31 @@ func rewriteModel(r io.Reader, replace func(model string) (string, error)) (io.R
 	})
 }
 
-// disableThinking returns a reader over r's JSON object with exactly one
-// top-level "thinking" key whose value is {"type":"disabled"}: an existing
-// "thinking" value is replaced, otherwise the key is inserted. Like
-// rewriteModel, only the bytes up to the splice point are buffered; the
-// remainder of r streams through byte-faithfully. r must be a JSON object; a
-// body that is not one passes through unchanged.
-func disableThinking(r io.Reader) (io.Reader, error) {
-	const (
-		disabled   = `{"type":"disabled"}`
-		disabledKV = `"thinking":` + disabled
-	)
+// overrideJSON renders raw as the JSON value an override forwards: raw's own
+// bytes when they parse as a JSON value, otherwise the raw text encoded as a
+// JSON string. So ?temperature=0.7 forwards the number 0.7, ?thinking=false
+// the boolean false, ?thinking={"type":"disabled"} that object verbatim, and
+// ?reasoning_effort=high — a bare word, not valid JSON alone — the string
+// "high". A caller wanting a literal string that looks like a bool or number
+// quotes it in the query (?param="true").
+func overrideJSON(raw string) []byte {
+	if json.Valid([]byte(raw)) {
+		return []byte(raw)
+	}
+	encoded, _ := json.Marshal(raw)
+	return encoded
+}
+
+// setOverride returns a reader over r's JSON object with exactly one top-level
+// key whose value is value (JSON-encoded bytes): an existing value under key is
+// replaced, otherwise the key is inserted. Like rewriteModel, only the bytes up
+// to the splice point are buffered; the remainder of r streams through
+// byte-faithfully. r must be a JSON object; a body that is not one passes
+// through unchanged.
+func setOverride(r io.Reader, key string, value []byte) (io.Reader, error) {
+	keyJSON, _ := json.Marshal(key)
+	kv := append(keyJSON, ':')
+	kv = append(kv, value...)
 	var prefixBuf bytes.Buffer
 	tee := io.TeeReader(r, &prefixBuf)
 	dec := json.NewDecoder(tee)
@@ -1953,23 +1967,23 @@ func disableThinking(r io.Reader) (io.Reader, error) {
 			return nil, err
 		}
 		if keyTok == json.Delim('}') {
-			// The object ended without a "thinking" key: insert it right after
-			// the opening '{', with a trailing comma when other keys follow.
+			// The object ended without the key: insert it right after the
+			// opening '{', with a trailing comma when other keys follow.
 			prefix := prefixBuf.Bytes()
 			open := int64(bytes.IndexByte(prefix, '{')) + 1
-			insert := []byte(disabledKV)
+			insert := kv
 			if !empty {
-				insert = []byte(disabledKV + ",")
+				insert = append(slices.Clone(kv), ',')
 			}
 			spliced := slices.Concat(prefix[:open], insert, prefix[open:])
 			return io.MultiReader(bytes.NewReader(spliced), r), nil
 		}
 		empty = false
-		key, ok := keyTok.(string)
+		existing, ok := keyTok.(string)
 		if !ok {
 			return io.MultiReader(bytes.NewReader(prefixBuf.Bytes()), r), nil
 		}
-		if key != "thinking" {
+		if existing != key {
 			var discard json.RawMessage
 			if err := dec.Decode(&discard); err != nil {
 				return nil, err
@@ -1991,7 +2005,7 @@ func disableThinking(r io.Reader) (io.Reader, error) {
 		for valueStart < afterValue && isJSONSpace(prefix[valueStart]) {
 			valueStart++
 		}
-		spliced := slices.Concat(prefix[:valueStart], []byte(disabled), prefix[afterValue:])
+		spliced := slices.Concat(prefix[:valueStart], value, prefix[afterValue:])
 		return io.MultiReader(bytes.NewReader(spliced), r), nil
 	}
 }
@@ -2212,8 +2226,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 		ctx, cancel := context.WithCancelCause(r.Context())
 
-		if chosen.disablesThinking() {
-			body, err = disableThinking(body)
+		// Apply the pinned target's overrides: each non-reserved query key is
+		// spliced into the body's root object under that key, replacing any
+		// value the request already carries. Validation rejected reserved keys
+		// wherever the reference was accepted, so every key here is forwardable.
+		for key, values := range chosen.query {
+			if len(values) == 0 {
+				continue
+			}
+			body, err = setOverride(body, key, overrideJSON(values[0]))
 			if err != nil {
 				cancel(nil)
 				return badRequest(fmt.Errorf("malformed request body: %w", err))
