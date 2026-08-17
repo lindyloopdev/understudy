@@ -731,13 +731,17 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
-	// TODO: should return 400 with invalid_request_error when a target with a
-	// query override is named and the body is malformed after the model field
-	// — e.g. model "openai/gpt-4?temperature=0.7" with body
-	// `{"model":"openai/gpt-4?temperature=0.7",`. rewriteModel never inspects
-	// the rest of the body, so this exercises setOverride's own decode failure
-	// (understudy.go's setOverride error branch), a distinct path from the case
-	// above, which fails inside rewriteModel before any override runs.
+	tests.AddFunc("should return 400 with invalid_request_error when a body with an override runs malformed after the model field", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+			}, nil),
+			requestBody:         `{"model":"openai/gpt-4?temperature=0.7",`,
+			wantStatus:          http.StatusBadRequest,
+			wantBody:            `{"error":{"message":"malformed request body: EOF","type":"invalid_request_error"}}`,
+			wantResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+		}
+	})
 
 	tests.AddFunc("should return StatusBadGateway when backend connection fails", func(t *testing.T) test {
 		return test{
