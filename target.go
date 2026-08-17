@@ -1,21 +1,38 @@
 package understudy
 
 import (
-	"errors"
 	"fmt"
+	"maps"
 	"net/url"
-	"strconv"
+	"slices"
 	"strings"
 )
 
-// thinkingParam is the query-parameter key for the thinking override.
-const thinkingParam = "thinking"
+// reservedOverrideKeys are the query keys a target reference may not carry.
+// They define what the request is (model, messages, tools) or the client's own
+// contract for how the response arrives and is shaped (stream, response_format,
+// n, tool_choice, parallel_tool_calls) — not a generation-behavior tweak — so
+// an override would speak for the caller rather than adjust generation.
+var reservedOverrideKeys = []string{
+	"model",
+	"messages",
+	"stream",
+	"tools",
+	"response_format",
+	"n",
+	"tool_choice",
+	"parallel_tool_calls",
+}
 
 // Target is a concrete <backend>/<model> model target with optional per-target
-// request-body overrides carried in a "?key=value" query.
+// request-body overrides carried in a "?key=value" query: each non-reserved key
+// is forwarded in the request body under that key, set to its value's JSON
+// interpretation.
 //
-// TODO(TODO.d/understudy-thinking-disable.md): enabling thinking (thinking=true)
-// is reserved and unimplemented — a future tri-state override.
+// Overrides are unsafe in Go's sense: only the key is checked against
+// reservedOverrideKeys, never its value's shape. ?thinking=true forwards the
+// literal boolean true, not the object a backend may expect — the caller's to
+// get right. See DESIGN.md §Understudy "Per-target request-body normalization".
 type Target struct {
 	backend string
 	model   string
@@ -77,18 +94,20 @@ func (t Target) MarshalText() ([]byte, error) {
 	return []byte(s), nil
 }
 
-// validate reports whether the target's query overrides are acceptable. The
-// "thinking" override must be a strict boolean; thinking=true is reserved.
-// Unknown keys are ignored.
+// validate reports whether the target's query overrides are acceptable. Any
+// key is a valid override except the reserved ones, which would rewrite what
+// the request is or the caller's response contract rather than tweak
+// generation behavior. A repeated key is also rejected: it can only carry one
+// value into the body, so a second occurrence can never mean anything a single
+// query built from one source would — it is a duplication mistake, not two
+// values to reconcile.
 func (t Target) validate() error {
-	if t.query.Has(thinkingParam) {
-		raw := t.query.Get(thinkingParam)
-		thinking, err := strconv.ParseBool(raw)
-		if err != nil {
-			return fmt.Errorf("invalid thinking value %q: %w", raw, err)
+	for _, key := range slices.Sorted(maps.Keys(t.query)) {
+		if slices.Contains(reservedOverrideKeys, key) {
+			return fmt.Errorf("override key %q is reserved", key)
 		}
-		if thinking {
-			return errors.New("thinking=true is reserved: enabling thinking is not yet supported")
+		if len(t.query[key]) > 1 {
+			return fmt.Errorf("override key %q is repeated", key)
 		}
 	}
 	return nil
@@ -98,10 +117,3 @@ func (t Target) validate() error {
 // upstream, independent of any per-target overrides. It is the availability key,
 // so different override profiles of one model share health.
 func (t Target) identity() string { return t.backend + "/" + t.model }
-
-// disablesThinking reports whether the target's "thinking" override disables
-// thinking (present and parsing to false).
-func (t Target) disablesThinking() bool {
-	disabled, err := strconv.ParseBool(t.query.Get(thinkingParam))
-	return err == nil && !disabled
-}
