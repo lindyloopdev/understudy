@@ -1696,10 +1696,13 @@ func TestChatCompletionsQueryOverrides(t *testing.T) {
 		wantKeys:     map[string]int{"reasoning_effort": 1},
 		wantOnlyKeys: []string{"model", "messages", "reasoning_effort"},
 	})
-	// TODO: should forward a quoted override value as the literal string it
-	// names, not coerced to the bool/number it looks like — e.g. a query-encoded
-	// ?param=%22true%22 should forward "param":"true", proving overrideJSON's
-	// documented quoting escape actually works, not just its bare-value path.
+	tests.Add("should forward a quoted override value as the literal string it names, not the bool it looks like", test{
+		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		targetQuery:  url.Values{"param": {`"true"`}},
+		want:         map[string]json.RawMessage{"param": json.RawMessage(`"true"`)},
+		wantKeys:     map[string]int{"param": 1},
+		wantOnlyKeys: []string{"model", "messages", "param"},
+	})
 
 	tests.Add("should add no override key when the target carries none", test{
 		requestBody:  `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
