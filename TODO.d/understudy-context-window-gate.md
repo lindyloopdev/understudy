@@ -6,14 +6,19 @@
 resolves a logical model to targets; the error table's "the request is at
 fault" row (a 400 relays verbatim, `invalid_request_error`).
 
-Empirical grounding: kronk (through v1.30.3) answers an oversized prompt
+Empirical grounding: kronk through v1.30.3 answered an oversized prompt
 wrongly on both paths — non-streaming as `500`/`server_error` with decoder
 vocabulary in the message (ardanlabs/kronk#861), streaming as `200` with the
-error as an in-band SSE chunk no intermediary can classify
-(ardanlabs/kronk#862; the observed incident — an agent retried the identical
-request 3/3). Upstream fixes are filed and expected; this gate is the
-standing defense regardless: one that makes an unservable request cost one
-hop instead of walking every candidate to the same deterministic failure.
+error as an in-band SSE chunk no intermediary can classify (ardanlabs/kronk#862;
+the observed incident — an agent retried the identical request 3/3). Both are
+fixed as of v1.31.3 (verified directly against a local instance, both
+streaming and non-streaming): an oversized prompt now answers as a clean,
+structured `400 invalid_request_error` on either path. This gate is no longer
+a defense against a silent/unclassifiable upstream failure — the failure is
+already classifiable — but stays worth building as a proactive optimization:
+it saves the request/response round trip a target-then-fail loop would
+otherwise spend, and can name the offending target and its window directly
+rather than relaying whatever message the upstream chose.
 
 ## What to build
 
@@ -37,7 +42,7 @@ hop instead of walking every candidate to the same deterministic failure.
   borderline requests rather than passing oversized ones) is the right
   precision for a gate whose miss modes are both cheap: an overestimate
   refuses something that might have fit; an underestimate falls through to
-  the upstream's 400 — exact, once #861 lands — as backstop.
+  the upstream's exact `400` as backstop.
 
 ## Constraint: the buffer this reads is scheduled to shrink
 
