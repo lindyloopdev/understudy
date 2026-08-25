@@ -113,6 +113,23 @@ func (t Target) validate() error {
 	return nil
 }
 
+// Backend returns the backend half of the parsed "<backend>/<model>"
+// reference.
+func (t Target) Backend() string { return t.backend }
+
+// Model returns the model half of the parsed "<backend>/<model>" reference.
+func (t Target) Model() string { return t.model }
+
+// Query returns the reference's query, carrying any per-target request-body
+// overrides. It is empty, never nil, for a bare reference.
+func (t Target) Query() url.Values {
+	out := make(url.Values, len(t.query))
+	for k, v := range t.query {
+		out[k] = slices.Clone(v)
+	}
+	return out
+}
+
 // identity returns the "<backend>/<model>" string identifying the target's
 // upstream, independent of any per-target overrides. It is the availability key,
 // so different override profiles of one model share health.
