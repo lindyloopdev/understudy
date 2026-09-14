@@ -5,7 +5,13 @@
 **Design:** [DESIGN.md §Understudy](../DESIGN.md#understudy) — "Stalls: two axes,
 three dispositions" (the content boundary, pre-content stalls, and "a keep-alive
 is not progress"); [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
-(the probe a pre-content demotion relies on).
+(the probe a pre-content demotion relies on);
+[DESIGN.md §Session-Ordered Admission](../DESIGN.md#session-ordered-admission)
+— a comment-only request on a backend that bounds its own admission is
+queued-and-alive (wait), not stalled; the eager replay below applies to opaque
+remotes. The wait-side carve-out lands in
+[[wait-not-replay-on-bounded-backends]], sequenced immediately after this fix —
+the split only has meaning relative to it.
 
 The stall gate (`callWithHeaderGate`) returns as soon as the first response header
 arrives, so an upstream that sends `200` and then holds the stream open with SSE
@@ -34,6 +40,10 @@ Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
   them, or forward them once content has arrived.
 - Make `idleReader` count only content events, not comment lines or whitespace,
   as progress.
+- Leave backends marked as bounding their own admission alone: if
+  [[session-ordered-admission]] has landed, its marker and parked-probe gate
+  exemption must survive this change — comment-only and pre-header silence on
+  a marked backend keep waiting.
 - Tests, each against a fake upstream:
   - `200` plus keep-alives only → the target is demoted and the request replays
     to the next candidate (with no candidate left, it fails fast rather than

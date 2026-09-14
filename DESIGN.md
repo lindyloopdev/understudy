@@ -1124,6 +1124,108 @@ accumulate the goroutines and buffered bodies it exists to protect. It guards th
 above any cap the control law reaches and so bounds nothing about the account. Growth is
 bounded by the demand gate and the known-good boundary, never by the FD budget.
 
+## Session-Ordered Admission <a id="session-ordered-admission"></a>
+
+A capacity-constrained backend — a local model server whose decode streams number
+one or two — served as a plain relay turns concurrent conversations into
+round-robin at request granularity: every session's per-turn latency inflates by
+the number of sessions, all sessions finish near the end together, and a
+consumer's silence-based liveness watchdog reads the wait as death. The queue at
+such a backend exists either way; the question is who orders it. The backend's
+own queue is request-FCFS because it cannot see conversations. understudy can:
+it holds every request and infers session identity from the payload
+(§Understudy, *Affinity and admission*), so it is the layer positioned to order
+admission by session. In the shared daemon that ordering is global across runs
+(§Shared understudy daemon) — the same consolidation the concurrency cap gets.
+
+**Admission ordering is oldest-session-first.** Sessions run in arrival order,
+so the oldest finishes first and its result is observable before the queue's.
+Priority is session age; a priority function is a policy slot — explicit classes
+(interactive over batch) compose without touching the mechanism.
+
+**The queue is keyed on the server.** Canonical base URL — the server is the
+scarce resource whatever credential reaches it — and one queue is shared
+across *models* served by that server, since the GPU, not the model entry, is
+what contends. Distinct from the concurrency cap's per-account key and
+health's per-model key; all three are active at once.
+
+**Engagement is the bounded-admission property, not a detector.** The
+discipline engages exactly on backends marked as bounding their own
+admission — a local model server that queues requests itself and enforces its
+own timeout, the same property that flips the comment-only stall disposition
+to a wait (below). No slot count is configured or estimated: capacity is
+*discovered*, one confirmed admission at a time, and a queue forms under
+demand on a marked backend. Backends without the marking (opaque remotes,
+anything with real parallel headroom) never engage the ordering at all —
+engaging them would serialize request fan-out one first-content latency at a
+time — so there is no disengagement logic and no oscillation regime. This
+composes with §Concurrency & Rate Limiting rather than overlapping it: the
+learned cap bounds in-flight requests per upstream *account* to avoid
+provoking rejections; session-ordered admission bounds concurrent *sessions*
+per capacity-constrained backend to preserve ordering — different key,
+different goal, both active.
+
+**The probe discipline.** A session's rank is its age — when its conversation
+was first seen — and it keeps that rank between turns, while it holds nothing
+at the backend. At most one **unconfirmed** request — the current queue head —
+is outstanding at the backend; requests from **incumbent** sessions (a
+confirmed request in flight) run undisturbed. The head's parked request is the
+capacity probe: when the backend can serve it, it does, and the first content
+event confirms — the session becomes an incumbent and the next head parks. An
+older session's turn displaces a parked probe (cancel and submit) only while
+the probe has received no response header: a backend that admits before it
+answers has done no work on it, so the cancel is free. A header means admitted
+to the backend's queue, not to a slot — the probe may be prefilling, which the
+wire cannot tell from queueing — so a probe with a header is never canceled,
+and the older turn waits at the front of understudy's queue until the probe
+confirms. An admitted request is never canceled — a service in progress is
+atomic, so a younger session occasionally finishes one service ahead of an
+older one; that is bounded and accepted. Cancellation beyond displacement
+happens only when the queue head itself goes away (the consumer aborted it
+upstream).
+
+**Wire verdicts refine the stall dispositions.** Four states are readable
+from what understudy already knows: **held** (in its own queue — no bytes
+sent, so byte-silence must not read as dead; report the position), and for a
+submitted request, content events mean *progressing*; comment lines only
+(§Understudy, *Stalls* — a keep-alive is not content) mean *waiting* —
+queued or prefilling; no bytes mean *dead*, except before the response header
+on a backend that bounds its own admission, which may write nothing at all —
+not even its status — while a request waits for an admission permit. Which
+disposition a comment-only or not-yet-answered request takes is a backend
+property, not a wire fact: a backend that queues locally and bounds its own
+admission (a local model server with an admission timeout) emits comments, or
+withholds its header, meaning *queued and alive*, and the correct disposition
+is wait — the wait budget from §Understudy's stall case 2 sized generously,
+with the backend's own admission timeout surfacing as an error. An opaque
+remote's comments or silence mean a pre-content stall, and the existing eager
+replay applies. The discriminator — does the backend bound its own admission —
+is per-backend configuration, learned from observation where the backend
+reports it.
+
+**Waiting is surfaced, not hidden.** The verdict, and queue position where the
+backend exposes it, is available to consumers as a library-level snapshot
+keyed by the gateway-assigned request-record id — the same id the requestlog
+join already correlates, since a consumer cannot recompute the conversation
+key (wire messages are template-wrapped) and a per-token view cannot attribute
+which of a token's sessions is waiting. A consumer's liveness judgment
+consumes that verdict instead of inferring death from event-stream silence. A
+queued request is alive and its wait has a cause and a bound; hiding that
+behind silence converts a schedulable wait into a consumer-side abort. A held
+request failovers on error only — healthy-busy waits, bounded by the
+consumer's deadline rather than understudy's, so the queue never preempts the
+routing decision its consumer owns.
+
+**Reservation window (staged).** After a request completes, its session holds
+admission priority for a window sized to the consumer's inter-turn gap: a turn
+arriving within it keeps the place uncontested, so incumbent sessions run to
+completion rather than trading slots with the queue head at turn granularity.
+Without the window the discipline still orders contention — sessions complete
+in arrival order, interleaved among the incumbents plus one — so the window is
+staged separately: it buys run-to-completion and the deterministic per-session
+completion times that prediction and routing policies lean on, at the cost of
+at most one window of idle per turn when a queue is waiting.
+
 ## Shared understudy daemon <a id="shared-daemon"></a>
 
 A single understudy process hosts many concurrent runs' configs, so a provider
