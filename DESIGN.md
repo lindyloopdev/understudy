@@ -359,21 +359,29 @@ before handing understudy a configuration. Routability as *understudy* defines i
 set would make it so, and is deliberately not built until a consumer needs it.
 
 **Stalls: two axes, three dispositions.** Whether a stalled request can be
-salvaged turns on two independent facts. **Replayability** is set by the header
-boundary: *pre-header* (no first byte yet) means nothing is written to the client,
-so the request is replayable to another target; *mid-stream* (headers, maybe
-partial payload, already sent) means it is not — `WriteHeader(200)` cannot be
-un-sent. **Switching cost**, when replay *is* possible, is set by conversation
+salvaged turns on two independent facts. **Replayability** is set by the
+**content boundary**: *pre-content* (no part of the response payload yet) means
+nothing is written to the client, so the request is replayable to another target;
+*mid-stream* (payload already sent) means it is not — `WriteHeader(200)` cannot be
+un-sent. The boundary is the first content, not the first header, because an
+upstream can answer `200` and then hold a queued request open with nothing but
+SSE comment lines (`: keep-alive`), or a non-streamed body with leading
+whitespace, and neither a header nor a comment carries any of the response. So
+understudy withholds an upstream's status, headers, and any comment lines or
+leading whitespace until the first **content**: a stream's first `data:` event,
+or a body's first non-whitespace byte. Until then the attempt is pre-content and
+nothing has been committed to the client. **Switching cost**, when replay *is* possible, is set by conversation
 position: a *first request* has no prompt-cache or coherence to forfeit (~0), a
 *subsequent request* forfeits the pinned target's warm cache and mid-conversation
 coherence (high). Mid-stream collapses the cost axis — replay being impossible,
 position is moot — leaving three cases:
 
-1. **First-request pre-header stall** — replayable, cost ~0 → **synthesized
+1. **First-request pre-content stall** — replayable, cost ~0 → **synthesized
    backpressure with an eager replay**: synthesize a bounded `Retry-After`,
    demote the target to `readmitAt`, replay the triggering request to the next
-   candidate, recover via the half-open probe. *(The busy-local-model case.)*
-2. **Subsequent-request pre-header stall** — replayable, but switching forfeits
+   candidate, recover via the half-open probe. *(The busy-local-model case, and a provider
+   holding a queued request open with keep-alives.)*
+2. **Subsequent-request pre-content stall** — replayable, but switching forfeits
    coherence → the same disposition **gated by a coherence-sized wait budget**:
    hold in place longer, replaying only once the budget is spent. This is
    §Affinity's "wait budget driven by coherence" (a live session's budget is
@@ -384,6 +392,12 @@ position is moot — leaving three cases:
    signal is too weak a basis for a binary verdict, so persistent mid-stream
    slowness surfaces as *cost* in the selection layer (a slow target sinks in the
    cost order and re-floats as it recovers), never as a demotion here.
+
+**A keep-alive is not progress.** Neither bound counts a comment line or
+insignificant whitespace: the stall gate runs until the first content, and the
+idle deadline measures the gap between content events. An upstream that sends
+only keep-alives has produced nothing, so it reaches whichever bound applies —
+the stall gate before content, the idle deadline after it.
 
 Each
 entry is a full `(backend, model)` target, so a
@@ -583,7 +597,7 @@ a target due for a check is **served immediately by the first healthy target**,
 and the probe is launched **asynchronously**; its outcome lands in the health map
 for the next request to read. Demand is the trigger, so an idle install — a
 single user away for a long weekend — issues nothing at all; but no client ever
-pays the probe's latency, which for a stalled target is the full header-stall gate
+pays the probe's latency, which for a stalled target is the full stall gate
 and for a slow 5xx is worse.
 
 Both alternatives are rejected. A **standing background timer** polls on a

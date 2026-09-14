@@ -21,7 +21,7 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   429 measured this cost directly: 25 dead reviewers in one `review-examine`
   run on a target understudy kept in service — settled by routing both around
   the target instead of relaying either, §Understudy's Retry-After ladder).
-- **Pre-header stall gate — tune constants and add the coherence budget.** The
+- **Stall gate — tune constants and add the coherence budget.** The
   gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
   and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
   request. Settle both empirically; then add the **coherence-sized wait budget**
