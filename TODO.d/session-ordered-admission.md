@@ -22,13 +22,6 @@ path ahead of the stall gate and the concurrency limiter.
 
 ## Work
 
-- **A request with no response header waits.** Remove the chat path's transport
-  `ResponseHeaderTimeout` (`providers/providers.go`) so a request waits for its
-  header until the backend errors or the client goes away. Kronk's permit wait
-  and Ollama's queue, prefill, and model load are all silent before the header.
-  - Tests: a target silent for 20s or more is served by that target, not demoted
-    or replayed; a target that errors while silent takes the ordinary failure
-    path.
 - **Session age.** Record `first_seen` per tenant and conversation key from a
   conversation's first turn (affinity keys only after a prior assistant turn;
   ordering needs the first). A session keeps its age through any quiet stretch.

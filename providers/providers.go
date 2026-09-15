@@ -67,18 +67,20 @@ func (cfg Config) Client() *http.Client {
 }
 
 // defaultClient is shared across all providers' calls that don't supply their
-// own. It is tuned for LLM API roundtrips: short connect/TLS/TTFB timeouts to
-// fail fast on misbehaving upstreams, but no overall Client.Timeout so
-// streaming response bodies aren't cut off.
+// own. It is tuned for LLM API roundtrips: short connect and TLS handshake
+// timeouts so an unreachable upstream fails fast, but no overall Client.Timeout
+// so streaming response bodies aren't cut off, and no ResponseHeaderTimeout: a
+// backend may stay silent before its header while it queues or loads a model, so
+// that wait is bounded by the backend's own error and the consumer's deadline
+// rather than by the transport.
 var defaultClient = &http.Client{
 	Transport: &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
 	},
 }
 

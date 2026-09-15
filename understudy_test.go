@@ -1,6 +1,7 @@
 package understudy
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2146,6 +2148,79 @@ func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 		}
 		if got := rr.Body.String(); got != "data" {
 			t.Errorf("body: got %q, want %q", got, "data")
+		}
+	})
+}
+
+// TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader pins DESIGN's
+// "silence before a response header waits, on every backend": a backend that
+// stays silent for an hour before its header still serves. An hour outruns any
+// header timeout a caller might reasonably configure.
+func TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clientConn, backendConn := net.Pipe()
+
+		const completion = `{"id":"chatcmpl-slow-header","object":"chat.completion","choices":[]}`
+
+		// The backend actor is released and joined however the request ends,
+		// so no goroutine outlives the test.
+		release := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer backendConn.Close()
+			req, err := http.ReadRequest(bufio.NewReader(backendConn))
+			if err != nil {
+				return
+			}
+			_, _ = io.ReadAll(req.Body)
+			select {
+			case <-time.After(time.Hour):
+			case <-release:
+				return
+			}
+			_, _ = fmt.Fprintf(backendConn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(completion), completion)
+		}()
+		defer func() {
+			close(release)
+			<-done
+		}()
+
+		// The doubled client carries the shared production client's settings,
+		// with only the dial swapped for the pipe, so the header-wait policy
+		// under test is the production one.
+		shared := providers.Config{}.Client()
+		doubled := *shared
+		sharedTransport, ok := shared.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("shared client transport: got %T, want *http.Transport", shared.Transport)
+		}
+		transport := sharedTransport.Clone()
+		transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			return clientConn, nil
+		}
+		doubled.Transport = transport
+
+		srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", &doubled), nil
+		}}, WithLogger(testLogger(t)))
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/json")
+
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("status: got %d, want 200", rr.Code)
+		}
+		if d := testy.DiffJSON([]byte(completion), rr.Body.Bytes()); d != nil {
+			t.Errorf("body: %s", d)
 		}
 	})
 }
