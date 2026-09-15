@@ -942,7 +942,7 @@ status, so a row reads as the rule it follows.
 | any other `5xx` with a delay beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
 | any other `5xx` with no delay, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
 | overloaded (`529` and kin) | `502` | *open* | as `5xx` |
-| every candidate stalled before its header | `504` | `server_error` | — |
+| every candidate stalled before its first content | `504` | `server_error` | — |
 | failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
 
 **A walk that runs out of candidates answers for the request, not for its last
@@ -962,7 +962,7 @@ break by judgement:
 | --- | --- |
 | sent a `Retry-After` | what remains of it |
 | answered a retryable failure with no delay — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
-| stalled before its header | the synthesized stall backoff |
+| stalled before its first content | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
 | refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
 | rejected the request's history | nothing; no delay will make it serve this conversation |

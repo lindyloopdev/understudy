@@ -21,14 +21,14 @@ availability layer in [[understudy-scope]] (§failover + circuit-breaker).
   429 measured this cost directly: 25 dead reviewers in one `review-examine`
   run on a target understudy kept in service — settled by routing both around
   the target instead of relaying either, §Understudy's Retry-After ladder).
-- **Stall gate — tune constants and add the coherence budget.** The
-  gate demotes-and-replays on a stall using provisional `headerStallGate` (20s)
-  and `synthesizedStallBackoff` (30s), with a **uniform** budget for every
-  request. Settle both empirically; then add the **coherence-sized wait budget**
-  that separates a first request (cheap replay, ~0 budget) from a coherent
-  subsequent one (switching forfeits cache — a larger budget), likely inferred
-  from request-body size. Later, refine the synthesized backoff from ollama
-  queue length.
+- **Settle the stall gate's constants and add the coherence budget.** Settle
+  empirically how long the gate waits between the response header and the first
+  content, and the synthesized backoff it benches a stalled target for; the gate
+  itself is [[stall-before-first-content-event]]'s. Then add the
+  **coherence-sized wait budget** that separates a first request (cheap replay,
+  ~0 budget) from a coherent subsequent one (switching forfeits cache — a larger
+  budget), likely inferred from request-body size. Later, refine the synthesized
+  backoff from ollama queue length.
 - **Cross-session coordination** (the aggregate-health value-add). The health map
   + limiters are process-local; pushing every session's interval up together as a
   host degrades and pulling down on recovery needs the shared daemon

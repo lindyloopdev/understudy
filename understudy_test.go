@@ -2150,36 +2150,6 @@ func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 	})
 }
 
-func TestChatCompletionsClosesResponseThatRacesTheStallGate(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		body := &trackingBody{Reader: strings.NewReader(`{"id":"late"}`)}
-		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			// Finish just after the gate fires, so the stall branch has already been
-			// taken and the response arrives to a caller that stopped waiting for it.
-			time.Sleep(defaultHeaderStallGate + time.Second)
-			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
-		})
-		srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-		}}, WithLogger(testLogger(t)))
-
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
-			strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer tok")
-		req.Header.Set("Content-Type", "application/json")
-
-		srv.ServeHTTP(httptest.NewRecorder(), req)
-		synctest.Wait()
-
-		if !body.closed {
-			t.Error("stalled request leaked the response that raced the gate: Body was not closed")
-		}
-	})
-}
-
 func TestChatCompletionsRecordsErrorOnStalledStream(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
@@ -2645,34 +2615,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	tests.AddFunc("should record a stalled attempt as having answered nothing", func(t *testing.T) test {
-		stalling := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
-			<-r.Context().Done()
-			return nil, r.Context().Err()
-		})
-		serving := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"from-b"}`)), Header: http.Header{}}, nil
-		})
-		return test{
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{
-					Backends: map[string]Backend{
-						"a": {ProviderType: "openai", Config: providers.Config{BaseURL: mustParseURL(t, "http://a/v1"), APIKey: "sk-a", HTTPClient: stalling}},
-						"b": {ProviderType: "openai", Config: providers.Config{BaseURL: mustParseURL(t, "http://b/v1"), APIKey: "sk-b", HTTPClient: serving}},
-					},
-					Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}}}},
-				}, nil
-			}},
-			opts:        []Option{func(s *server) { s.headerStallGate = 10 * time.Millisecond }},
-			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
-			want: map[string]any{
-				"excluded": []Attempt{
-					{Backend: "a", ModelUpstream: "ma", UpstreamStatus: 0, Err: errHeaderStall, Called: true},
-				},
-			},
-		}
-	})
-
 	tests.AddFunc("should log the upstream's own words for a refusal the client is not told", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2785,23 +2727,11 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			}, nil
 		}
 	}
-	// stall never returns a response header, blocking until its request context is
-	// cancelled — a pre-header stall. The long fallback keeps a broken gate surfacing
-	// as an assertion failure rather than a hang.
 	// notDueUntil is the record a walk leaves for a target it stepped over: the moment
 	// it is due back, d after synctest's epoch, rendered as pickTarget renders it.
 	notDueUntil := func(d time.Duration, answered string) error {
 		return fmt.Errorf("routed around: not due until %s, last answered: %s",
 			time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(d).Local().Format(time.RFC3339), answered)
-	}
-
-	stall := func(r *http.Request, _ int) (*http.Response, error) {
-		select {
-		case <-r.Context().Done():
-			return nil, r.Context().Err()
-		case <-time.After(5 * time.Minute):
-			return resp(http.StatusOK, `{"id":"unstalled"}`), nil
-		}
 	}
 
 	// loggedAnswer is the part of a LogRecord that names the candidate a request
@@ -3172,17 +3102,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		}
 	})
 
-	tests.Add("should answer a stall itself when the only candidate left is unusable", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
-			"b": {apiKey: "sk-b"},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{advance: 0, wantStatus: http.StatusGatewayTimeout, wantBackend: "a", wantRetryAfter: "20"},
-		},
-	})
-
 	tests.Add("should answer a refusal itself when the only candidate left is unusable", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)},
@@ -3234,18 +3153,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should fail over within the request when a target stalls before its response header", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
-			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-			{advance: time.Second, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-		},
-	})
-
 	tests.Add("should answer a lone busy target like any sustained rate limit, with a backoff to wait out", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusServiceUnavailable, `{"error":{"message":"server busy","code":"unavailable"}}`)},
@@ -3264,35 +3171,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
 		steps: []step{
 			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-		},
-	})
-
-	tests.Add("should route around a stalled target for the bench it synthesized, and call it again once that bench elapses", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(r *http.Request, call int) (*http.Response, error) {
-				if call == 1 {
-					return stall(r, call)
-				}
-				return resp(http.StatusOK, `{"id":"from-a"}`), nil
-			}},
-			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-			{advance: synthesizedStallBackoff / 2, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
-			{advance: synthesizedStallBackoff, wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a"},
-		},
-	})
-
-	tests.Add("should name the stalled target an operator would otherwise not see", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
-			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", Err: errHeaderStall, Called: true}}},
 		},
 	})
 
@@ -3361,22 +3239,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusOK, wantBackend: "b", wantExcluded: []Attempt{
 				{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 			}},
-		},
-	})
-
-	tests.Add("should surface a 504 when every target stalls and the replay walk is exhausted", test{
-		backends: map[string]backendStub{
-			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: stall},
-			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: stall},
-		},
-		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
-		steps: []step{
-			{
-				advance: 0, wantStatus: http.StatusGatewayTimeout, wantBody: `{"error":{"message":"Gateway Timeout","type":"server_error"}}`, wantBackend: "b", wantRetryAfter: "20",
-				// The walk answers for the last candidate it stalled on, so the record
-				// names it and the stall, not an upstream status it never received.
-				wantLogged: loggedAnswer{Backend: "b", ModelUpstream: "mb", UpstreamStatus: new(0), Err: errors.New("upstream produced no response header before the stall gate")},
-			},
 		},
 	})
 
@@ -3973,9 +3835,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("40", "back in forty")},
 			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(r *http.Request, call int) (*http.Response, error) {
-				// Under the 20s header-stall gate, so the walk goes on to c rather than
-				// treating this as a stall — but long enough that a's 40s has 25s left
-				// when b's 30s is weighed against it.
+				// Long enough that a's 40s has 25s left when b's 30s is weighed against it.
 				time.Sleep(15 * time.Second)
 				return throttling("30", "back in thirty")(r, call)
 			}},
@@ -4348,22 +4208,6 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 		},
 		wantUp: 0,
 	})
-	tests.Add("should say understudy benched a target that answered nothing", test{
-		aBody:   badGateway,
-		targets: bothTargets,
-		aStatus: func(int, context.CancelFunc) int {
-			time.Sleep(defaultHeaderStallGate + time.Second)
-			return http.StatusOK
-		},
-		advances: []time.Duration{0},
-		wantDown: 1,
-		downFields: map[string]any{
-			"reason": "no response header",
-			// The gate fires at 20s and the stalled handler is reaped a second later.
-			"failing_since": logTime(21 * time.Second),
-		},
-		wantUp: 0,
-	})
 	tests.Add("should log a transition the departed client discovered", test{
 		aBody:   badGateway,
 		targets: bothTargets,
@@ -4711,9 +4555,6 @@ func TestChatCompletionsProcessBudgetShed(t *testing.T) {
 			// These cases assert the interval exactly; scattering it is
 			// TestChatCompletionsScattersBusyBackoff's subject.
 			srv.jitterFactor = 0
-			// The holder must keep its slot for as long as a case runs, so the stall
-			// gate must not reclaim it partway through and end the saturation.
-			srv.headerStallGate = time.Hour
 
 			req := func() *http.Request {
 				r, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))

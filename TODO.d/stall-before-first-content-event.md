@@ -10,11 +10,11 @@ is not progress"); [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
 — silence before the response header waits on every backend, so the stall gate
 runs from the header to the first content, never before the header.
 
-The stall gate (`callWithHeaderGate`) returns as soon as the first response header
-arrives, so an upstream that sends `200` and then holds the stream open with SSE
-comment lines is treated as mid-stream: no demotion, no replay. The stream idle
-watchdog (`idleReader`, `streamIdleTimeout`) resets on any byte, so the same
-keep-alives defeat it too, and the request runs until the client gives up.
+An upstream that sends `200` and then holds the stream open with SSE comment
+lines is treated as mid-stream: no demotion, no replay — nothing gates the
+attempt between the header and the first content. The stream idle watchdog
+(`idleReader`, `streamIdleTimeout`) resets on any byte, so the same keep-alives
+defeat it too, and the request runs until the client gives up.
 
 Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
 
@@ -25,18 +25,17 @@ Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
   containers all ended at lindy's 10-minute idle watchdog, and others ran 15–19
   minutes, with no demotion and no failover.
 
-The damaging shape is the one after the header. Silence before the header is
-not a stall: [[session-ordered-admission]] removes the header gate, and this fix
-must not reintroduce one.
+The damaging shape is the one after the header. Run no gate before the header:
+that wait belongs to [[session-ordered-admission]], and this fix must not
+reintroduce one.
 
 ## Work
 
 - Gate from the response header to the first content: read ahead past SSE
   comment lines (streamed) or leading JSON whitespace (non-streamed —
   `isJSONSpace`) before committing status and headers to the client. A gate
-  timeout before content takes the pre-content stall path (`recordStalled`,
-  replay to the next candidate). Rename the error and gate to match the content
-  boundary. The read-ahead is shared with [[session-ordered-admission]]'s
+  timeout before content demotes the target and replays the request to the next
+  candidate. The read-ahead is shared with [[session-ordered-admission]]'s
   confirmation; whichever lands first builds it.
 - **(open) Keep-alives from a busy local server are not a stall.** Kronk sends
   its 15s keep-alive while a request with a header waits in its own queue —
