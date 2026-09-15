@@ -738,7 +738,7 @@ func conversationKey(prefix []json.RawMessage) string {
 	// self-delimiting, so concatenating them hashes a unique split.
 	h := fnv.New64a()
 	for _, raw := range prefix {
-		h.Write(raw)
+		_, _ = h.Write(raw)
 	}
 	return strconv.FormatUint(h.Sum64(), 16)
 }
