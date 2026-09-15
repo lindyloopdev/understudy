@@ -7,11 +7,8 @@ three dispositions" (the content boundary, pre-content stalls, and "a keep-alive
 is not progress"); [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
 (the probe a pre-content demotion relies on);
 [DESIGN.md §Session-Ordered Admission](../DESIGN.md#session-ordered-admission)
-— a comment-only request on a backend that bounds its own admission is
-queued-and-alive (wait), not stalled; the eager replay below applies to opaque
-remotes. The wait-side carve-out lands in
-[[wait-not-replay-on-bounded-backends]], sequenced immediately after this fix —
-the split only has meaning relative to it.
+— silence before the response header waits on every backend, so the stall gate
+runs from the header to the first content, never before the header.
 
 The stall gate (`callWithHeaderGate`) returns as soon as the first response header
 arrives, so an upstream that sends `200` and then holds the stream open with SSE
@@ -23,31 +20,41 @@ Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
 
 - A direct streamed request got `200` headers after 12.5s, then only
   `: keep-alive` comment lines — no `data:` event — for 30s; a non-streamed one
-  got no headers within 30s (which the existing gate already catches).
+  got no headers within 30s.
 - Through lindy's shared daemon, ~20 concurrent chat completions from separate
   containers all ended at lindy's 10-minute idle watchdog, and others ran 15–19
   minutes, with no demotion and no failover.
 
+The damaging shape is the one after the header. Silence before the header is
+not a stall: [[session-ordered-admission]] removes the header gate, and this fix
+must not reintroduce one.
+
 ## Work
 
-- Extend the stall gate from the first header to the first content: read ahead
-  past SSE comment lines (streamed) or leading JSON whitespace (non-streamed —
+- Gate from the response header to the first content: read ahead past SSE
+  comment lines (streamed) or leading JSON whitespace (non-streamed —
   `isJSONSpace`) before committing status and headers to the client. A gate
-  timeout before content takes the existing pre-header path (`errHeaderStall`,
-  `recordStalled`, replay to the next candidate). Rename the error and gate to
-  match the content boundary.
+  timeout before content takes the pre-content stall path (`recordStalled`,
+  replay to the next candidate). Rename the error and gate to match the content
+  boundary. The read-ahead is shared with [[session-ordered-admission]]'s
+  confirmation; whichever lands first builds it.
+- **(open) Keep-alives from a busy local server are not a stall.** Kronk sends
+  its 15s keep-alive while a request with a header waits in its own queue —
+  where session-ordered admission deliberately parks the probe at the default
+  `QueueDepth` — and while it prefills. A plain content gate would demote and
+  replay that probe behind a 6–10 minute generation. Settle a disposition with
+  no per-backend flag; the candidate is progress on the request's key (a
+  comment-only request waits while another request on its key, or linked set,
+  is producing content, and stalls otherwise), weighed against a remote whose
+  hung requests coexist with a progressing one.
 - Decide what happens to comment lines and whitespace read before content: drop
   them, or forward them once content has arrived.
 - Make `idleReader` count only content events, not comment lines or whitespace,
   as progress.
-- Leave backends marked as bounding their own admission alone: if
-  [[session-ordered-admission]] has landed, its marker and parked-probe gate
-  exemption must survive this change — comment-only and pre-header silence on
-  a marked backend keep waiting.
 - Tests, each against a fake upstream:
-  - `200` plus keep-alives only → the target is demoted and the request replays
-    to the next candidate (with no candidate left, it fails fast rather than
-    hanging);
+  - `200` plus keep-alives only, nothing else on the key progressing → the
+    target is demoted and the request replays to the next candidate (with no
+    candidate left, it fails fast rather than hanging);
   - keep-alives, then `data:` events → the response passes through intact and
     the target is not demoted;
   - non-streamed leading whitespace, then JSON → passes through intact;
