@@ -30,8 +30,11 @@ const (
 
 	// sessionHeader carries the caller's per-conversation session identifier
 	// upstream, verbatim, for backends that key their own routing or prompt
-	// caching on it (opencode.ai's Zen/Go).
+	// caching on it. Sent only to [sessionHeaderHost].
 	sessionHeader = "X-Opencode-Session"
+
+	// sessionHeaderHost is the only host [sessionHeader] is relayed to.
+	sessionHeaderHost = "opencode.ai"
 )
 
 // defaultCallTimeout bounds a non-streaming upstream call (Models). Chat
@@ -309,9 +312,9 @@ func withRetryAfter(err error, v string) error {
 }
 
 // Chat POSTs body to <BaseURL>/chat/completions with Bearer auth. A non-empty
-// sessionID is relayed to the upstream as the [sessionHeader] header; an
-// empty one sends no such header at all. Caller is responsible for closing the
-// returned response body.
+// sessionID is relayed to the upstream as the [sessionHeader] header only when
+// the BaseURL's host is [sessionHeaderHost]. Caller is responsible for closing
+// the returned response body.
 func Chat(ctx context.Context, cfg providers.Config, sessionID string, body io.Reader) (*http.Response, error) {
 	ctx, trace := newUpstreamTrace(ctx)
 	req, err := newRequest(ctx, cfg, http.MethodPost, chatCompletionsPath, body)
@@ -319,7 +322,7 @@ func Chat(ctx context.Context, cfg providers.Config, sessionID string, body io.R
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if sessionID != "" {
+	if sessionID != "" && cfg.BaseURL.Hostname() == sessionHeaderHost {
 		req.Header.Set(sessionHeader, sessionID)
 	}
 	resp, err := cfg.Client().Do(req)
