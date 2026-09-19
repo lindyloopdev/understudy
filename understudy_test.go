@@ -6280,7 +6280,7 @@ type fakeChatProvider struct {
 	models   []providers.Model
 }
 
-func (p fakeChatProvider) Chat(context.Context, providers.Config, io.Reader) (*http.Response, error) {
+func (p fakeChatProvider) Chat(context.Context, providers.Config, string, io.Reader) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(p.response)),

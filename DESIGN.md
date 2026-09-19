@@ -725,9 +725,12 @@ once). This is the concrete realization of session binding above; two dependenci
 gate it, both staged:
 
 - **Session identity.** understudy must recognize which requests belong to one
-  conversation. opencode holds a session id internally but passes **none** on the
-  OpenAI-compat call — understudy sees only the bearer token and the body. So the
-  key is **inferred from the payload and scoped to the token**: a hash of the
+  conversation. opencode sends a per-session identifier (`x-session-affinity`)
+  on every OpenAI-compat call, but understudy does not key affinity on it: a
+  caller-supplied id survives compaction and would need an explicit release (see
+  *Affinity is a short-lived hint, not a lease*, below), while a payload hash
+  releases itself when compaction rewrites the leading messages. So the key is
+  **inferred from the payload and scoped to the token**: a hash of the
   invariant leading messages (system + first user turn), which is also exactly
   what prompt-cache coherence keys on, mixed with the bearer token so one
   tenant's affinity cannot steer another's routing in the shared daemon. The

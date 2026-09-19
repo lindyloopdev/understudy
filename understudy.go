@@ -37,8 +37,8 @@ const ProviderOpenAI = "openai"
 // openaiProvider implements [providers.Handler] over the openai package.
 type openaiProvider struct{}
 
-func (openaiProvider) Chat(ctx context.Context, cfg providers.Config, body io.Reader) (*http.Response, error) {
-	return openai.Chat(ctx, cfg, body)
+func (openaiProvider) Chat(ctx context.Context, cfg providers.Config, sessionID string, body io.Reader) (*http.Response, error) {
+	return openai.Chat(ctx, cfg, sessionID, body)
 }
 
 func (openaiProvider) Models(ctx context.Context, cfg providers.Config) ([]providers.Model, error) {
@@ -2186,7 +2186,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		heldSlot = lim
 
-		resp, err := sel.handler.Chat(ctx, sel.cfg, body)
+		// TODO(TODO.d/forward-the-session-header-upstream.md)
+		resp, err := sel.handler.Chat(ctx, sel.cfg, "", body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in

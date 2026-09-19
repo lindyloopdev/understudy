@@ -35,15 +35,11 @@ Neither layer below understudy can supply the header:
 
 ## Work
 
-- **Set `x-opencode-session` on every upstream chat-completions request**,
-  sourced in order: the inbound `x-opencode-session`, else the inbound
-  `x-session-affinity` (what opencode sends for a custom provider), else a value
-  synthesized from the conversation key `chatCompletions` already computes — a
-  headerless client still gets stable per-conversation routing.
-- **Plumb the value to the provider seam.** `chatCompletions` holds the inbound
-  `*http.Request`; `providers.Chat(ctx, cfg, body)` does not. Ride it on
-  `providers.Config` or the context; the test capture
-  (`newCapturingServer`) extends to assert the header.
+- **Source the value in `chatCompletions`** (understudy.go), which currently
+  passes an empty sessionID, in order: the inbound `x-opencode-session`, else
+  the inbound `x-session-affinity` (what opencode sends for a custom provider),
+  else a value synthesized from the conversation key `chatCompletions` already
+  computes — a headerless client still gets stable per-conversation routing.
 - **Send it unconditionally, not per-backend.** An upstream that does not know
   the header ignores it; gating on a per-backend flag would be vocabulary
   validation, which the body-override design already refuses ("never

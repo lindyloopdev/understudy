@@ -12,7 +12,8 @@ import (
 
 // Handler serves proxied requests for one provider type. Chat proxies a
 // chat-completions request body to the upstream identified by cfg and returns
-// its response. Models lists the models the upstream identified by cfg
+// its response, relaying a non-empty sessionID to the upstream as its
+// per-session header. Models lists the models the upstream identified by cfg
 // offers.
 //
 // An error a Handler returns carries the status the upstream itself returned,
@@ -22,7 +23,7 @@ import (
 // provider reports what the upstream said; what the client is shown is derived
 // at the handler boundary, never set by a provider.
 type Handler interface {
-	Chat(ctx context.Context, cfg Config, body io.Reader) (*http.Response, error)
+	Chat(ctx context.Context, cfg Config, sessionID string, body io.Reader) (*http.Response, error)
 	Models(ctx context.Context, cfg Config) ([]Model, error)
 }
 
