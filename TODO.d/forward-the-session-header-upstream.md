@@ -59,16 +59,13 @@ value only when neither is present.
 
 ## Work
 
-- **Replace the constant `"understudy"` placeholder in `chatCompletions`**
-  (the `sel.handler.Chat` call's sessionID argument, currently a fixed value
-  that only satisfies Zen's non-empty check) with a computed value: mix the
-  bearer token into the
-  conversation key the same way the internal affinity key already does
-  (DESIGN.md, "mixed with the bearer token so one tenant's affinity cannot
-  steer another's routing in the shared daemon"), so two tenants'
-  conversations can never collide on the value sent to Zen. This also fixes
-  the compaction issue above for free: the value changes exactly when
-  `conversationKey` does.
+- **Mix the bearer token into the session header sent from `chatCompletions`:**
+  the `sel.handler.Chat` call already passes the conversation key as the
+  sessionID argument, so the value varies by conversation and resets at
+  compaction, but two tenants' conversations can still collide on the value
+  sent to Zen. Apply the same token-mixing construction the internal affinity
+  key uses (DESIGN.md, "mixed with the bearer token so one tenant's affinity
+  cannot steer another's routing in the shared daemon").
 
 ## Notes
 

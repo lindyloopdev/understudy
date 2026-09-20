@@ -2186,10 +2186,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		heldSlot = lim
 
-		// TODO(TODO.d/forward-the-session-header-upstream.md): any non-empty
-		// value satisfies Zen's routing today; the real per-conversation
-		// derivation is still pending.
-		resp, err := sel.handler.Chat(ctx, sel.cfg, "understudy", body)
+		// TODO(TODO.d/forward-the-session-header-upstream.md): the value varies
+		// by conversation but not yet by tenant — the bearer token still needs
+		// mixing in, so two tenants' conversations can collide on Zen's side.
+		resp, err := sel.handler.Chat(ctx, sel.cfg, convKey, body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in

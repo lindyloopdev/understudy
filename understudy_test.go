@@ -1667,6 +1667,56 @@ func TestChatCompletionsForwardedRequest(t *testing.T) {
 	})
 }
 
+func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		conversationA string
+		conversationB string
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should send a different x-opencode-session header for a different conversation", test{
+		conversationA: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`,
+		conversationB: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"what is the capital of France"}]}`,
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		var sessions []string
+		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
+			sessions = append(sessions, req.Header.Get("X-Opencode-Session"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "https://opencode.ai/zen/go/v1", "sk-test", client), nil
+		}}
+		srv := New(validator, WithLogger(testLogger(t)))
+
+		for _, conversation := range []string{tt.conversationA, tt.conversationB} {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(conversation))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+			srv.ServeHTTP(httptest.NewRecorder(), req)
+		}
+
+		if len(sessions) != 2 {
+			t.Fatalf("upstream received %d requests, want 2", len(sessions))
+		}
+		if sessions[0] == sessions[1] {
+			t.Errorf("both conversations sent the same x-opencode-session header %q", sessions[0])
+		}
+	})
+}
+
 func TestChatCompletionsQueryOverrides(t *testing.T) {
 	t.Parallel()
 
