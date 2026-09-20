@@ -32,6 +32,10 @@ provider's table would deepen the split rather than close it.
   with type `overloaded_error`, distinct from a faulted upstream's `500`. Note
   that `http.StatusText(529)` is empty, so anything rendering status text needs
   its own word for it.
+- Add the still-queued row: a request ended by the consumer's time limit
+  (§Session-Ordered Admission) answers `400` with a type of its own, carrying
+  the reason it waited, its queue position, and a retry-after hint
+  ([[session-ordered-admission]]).
 - Publish it. There is no user-facing doc yet — see [[documentation]], whose
   README and library-doc restructure are where a consumer reads this.
 

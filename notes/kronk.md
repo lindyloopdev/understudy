@@ -72,3 +72,22 @@ server-specific. It can be configured when the operator knows what they pointed
 at, but the operator who writes the URL is not always the one who chose the
 server. A version header lets clients adapt without a config change, and must be
 on error responses to help — that is the response being classified.
+
+## 4. Signal liveness before the status line (nice-to-have)
+
+A request waiting for an admission permit gets nothing — not even its `200` —
+until admitted (`sdk/kronk/concurrency.go` acquires before `ChatStreamingHTTP`
+writes the header). To a proxy that is indistinguishable from a hung upstream,
+so understudy cannot bound the wait with a gate and waits on every backend
+instead. A periodic `102 Processing` while a request waits for its permit
+would let a client that observes informational responses tell queued from dead,
+without committing a final status early. Go's server writes `1xx` since 1.19.
+
+## 5. The admission timeout needs its own code
+
+The same conflation as #2, from the other side: understudy re-queues a request
+Kronk turned away at its admission timeout, but cannot tell that `429
+resource_exhausted` from the model-does-not-fit one by code, so it has to infer
+it from other traffic on the same model. A distinct code — or a `Retry-After`
+on the admission timeout — makes the re-queue a read of Kronk's answer rather
+than a guess about it.

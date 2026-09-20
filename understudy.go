@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +40,8 @@ const ProviderOpenAI = "openai"
 // openaiProvider implements [providers.Handler] over the openai package.
 type openaiProvider struct{}
 
-func (openaiProvider) Chat(ctx context.Context, cfg providers.Config, body io.Reader) (*http.Response, error) {
-	return openai.Chat(ctx, cfg, body)
+func (openaiProvider) Chat(ctx context.Context, cfg providers.Config, sessionID string, body io.Reader) (*http.Response, error) {
+	return openai.Chat(ctx, cfg, sessionID, body)
 }
 
 func (openaiProvider) Models(ctx context.Context, cfg providers.Config) ([]providers.Model, error) {
@@ -111,22 +114,6 @@ const defaultFailoverThreshold = 15 * time.Second
 // re-probes of a demoted target, so a recovered target rejoins the failover
 // walk instead of being stranded on the fallback forever.
 const defaultRecoveryInterval = 30 * time.Second
-
-// defaultHeaderStallGate bounds how long understudy waits for an upstream's first
-// response header before treating the attempt as a pre-header stall — backpressure
-// from a busy target — rather than a slow success. Shorter than the transport's
-// 60s ResponseHeaderTimeout so a stalled request is routed around well before the
-// transport would give up. Provisional; see
-// TODO.d/understudy-adaptive-coordinated-backoff.md.
-const defaultHeaderStallGate = 20 * time.Second
-
-// synthesizedStallBackoff is how long a stalled target is benched before a probe
-// may try it again — understudy's own routing, never a wait handed to a client.
-// Provisional; see TODO.d/understudy-adaptive-coordinated-backoff.md.
-const synthesizedStallBackoff = 30 * time.Second
-
-// errHeaderStall marks an upstream attempt cancelled by the header-stall gate.
-var errHeaderStall = errors.New("upstream produced no response header before the stall gate")
 
 // deferredLog queues a log call to be emitted once the caller's lock is released.
 type deferredLog func(msg string, args ...any)
@@ -234,7 +221,6 @@ type server struct {
 	// hard-fails to the non-retryable reject.
 	terminalThreshold time.Duration
 	recoveryInterval  time.Duration
-	headerStallGate   time.Duration
 	// jitterFactor scatters a synthesized backoff; zero sends the interval
 	// exactly, which only a test asserting fixed values wants.
 	jitterFactor float64
@@ -522,7 +508,6 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		terminalThreshold:        maxPassthroughRetryAfter,
 		jitterFactor:             defaultJitterFactor,
 		recoveryInterval:         defaultRecoveryInterval,
-		headerStallGate:          defaultHeaderStallGate,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
 		fdLimitReader:            readFDSoftLimit,
 		health:                   make(map[string]targetHealth),
@@ -738,7 +723,7 @@ func conversationKey(prefix []json.RawMessage) string {
 	// self-delimiting, so concatenating them hashes a unique split.
 	h := fnv.New64a()
 	for _, raw := range prefix {
-		h.Write(raw)
+		_, _ = h.Write(raw)
 	}
 	return strconv.FormatUint(h.Sum64(), 16)
 }
@@ -821,7 +806,6 @@ const msgBackendDown = "backend down"
 // understudy is pacing its own retries.
 const (
 	reasonUpstreamRetryAfter = "upstream retry-after"
-	reasonNoResponseHeader   = "no response header"
 	reasonProbeNotYetDue     = "probe not yet due"
 )
 
@@ -1022,23 +1006,12 @@ func (s *server) recordImmediateFailure(ctx context.Context, t Target, backends 
 	}
 }
 
-// recordStalled demotes t for a pre-header stall and benches it for a backoff
-// understudy synthesized, the upstream having named none.
-// It logs the transition itself: a stall is a demotion understudy decides, so the
-// cause is known here and nowhere later.
-func (s *server) recordStalled(ctx context.Context, t Target, backends map[string]Backend, answered error) {
-	if h, owed := s.demoteFor(t, synthesizedStallBackoff, backends, answered); owed {
-		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonNoResponseHeader, h.readmitAt))...)
-	}
-}
-
 // recordRateLimited demotes t at once like recordImmediateFailure, and records the
 // moment the upstream named. An upstream that answers `Retry-After` has said more
 // about when it will serve again than understudy's own pacing can infer, so that
 // moment supersedes the recovery interval — which would otherwise call the target
-// back while it is still saying no. A bench understudy synthesized for an upstream
-// that said nothing is recordStalled's, not this one's. It logs the transition when
-// the streak has not already reported one.
+// back while it is still saying no. It logs the transition when the streak has not
+// already reported one.
 func (s *server) recordRateLimited(ctx context.Context, t Target, retryAfter time.Duration, backends map[string]Backend, answered error) {
 	if h, owed := s.demoteFor(t, retryAfter, backends, answered); owed {
 		s.logTransition(ctx, msgBackendDown, backendDownRecord(t, h, benchedUntil(reasonUpstreamRetryAfter, h.readmitAt))...)
@@ -1085,13 +1058,8 @@ type failedAttempt struct {
 	upstreamModel string
 }
 
-// status is what the attempt answered with. An attempt cut off before its header
-// answered nothing, so it reports none: Attempt.UpstreamStatus is 0 for exactly that,
-// and yerrors would otherwise invent a 500 for a status-less error.
+// status is what the attempt answered with.
 func (f failedAttempt) status() int {
-	if errors.Is(f.raw, errHeaderStall) {
-		return 0
-	}
 	return yerrors.HTTPStatus(f.raw)
 }
 
@@ -2015,37 +1983,6 @@ func isJSONSpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
-// callWithHeaderGate runs sel.handler bounded by a header-phase gate. It returns
-// the handler's response as soon as the first response header arrives; if none
-// arrives within gate it cancels the attempt with errHeaderStall, waits for the
-// handler to unwind, and returns errHeaderStall. Streaming of the response body
-// past the header is deliberately left unbounded here — that is the mid-stream
-// idle watchdog's concern, not the gate's.
-func callWithHeaderGate(ctx context.Context, cancel context.CancelCauseFunc, gate time.Duration, sel selection, body io.Reader) (*http.Response, error) {
-	type handlerResult struct {
-		resp *http.Response
-		err  error
-	}
-	done := make(chan handlerResult, 1)
-	go func() {
-		r, e := sel.handler.Chat(ctx, sel.cfg, body)
-		done <- handlerResult{r, e}
-	}()
-	select {
-	case res := <-done:
-		return res.resp, res.err
-	case <-time.After(gate):
-		cancel(errHeaderStall)
-		// Reap the cancelled handler so its upstream connection tears down before the
-		// caller frees the concurrency slot; close any response it still returned, so
-		// a handler that won the race does not leak its body.
-		if res := <-done; res.resp != nil && res.resp.Body != nil {
-			_ = res.resp.Body.Close()
-		}
-		return nil, errHeaderStall
-	}
-}
-
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	backend := backendFromContext(r.Context())
 
@@ -2252,28 +2189,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		heldSlot = lim
 
-		resp, err := callWithHeaderGate(ctx, cancel, s.headerStallGate, sel, body)
-		if errors.Is(err, errHeaderStall) {
-			// A pre-header stall: backpressure from a busy target. Demote it under a
-			// synthesized backoff, then replay the request onto the next untried
-			// target rather than surfacing the stall; only when none remains does the
-			// client see the 504.
-			s.recordStalled(r.Context(), chosen, backend.Backends, err)
-			releaseHeld()
-			stalled := yerrors.WithHTTPStatus(http.StatusGatewayTimeout, errHeaderStall)
-			if logicalTargets != nil {
-				tried = append(tried, healthKey(chosen, backend.Backends))
-				lastFailure = &failedAttempt{
-					answer:        stalled,
-					raw:           err,
-					target:        chosen,
-					backend:       parsedBackendName,
-					upstreamModel: upstreamModel,
-				}
-				continue
-			}
-			return stalled
-		}
+		// The session header reaches Zen, so the bearer token never appears
+		// in it directly: it HMACs the conversation key instead.
+		mac := hmac.New(sha256.New, []byte(convTenant))
+		_, _ = mac.Write([]byte(convKey))
+		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in

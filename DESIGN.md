@@ -359,21 +359,30 @@ before handing understudy a configuration. Routability as *understudy* defines i
 set would make it so, and is deliberately not built until a consumer needs it.
 
 **Stalls: two axes, three dispositions.** Whether a stalled request can be
-salvaged turns on two independent facts. **Replayability** is set by the header
-boundary: *pre-header* (no first byte yet) means nothing is written to the client,
-so the request is replayable to another target; *mid-stream* (headers, maybe
-partial payload, already sent) means it is not — `WriteHeader(200)` cannot be
-un-sent. **Switching cost**, when replay *is* possible, is set by conversation
+salvaged turns on two independent facts. **Replayability** is set by the
+**content boundary**: *pre-content* (no part of the response payload yet) means
+nothing is written to the client, so the request is replayable to another target;
+*mid-stream* (payload already sent) means it is not — `WriteHeader(200)` cannot be
+un-sent. The boundary is the first content, not the first header, because an
+upstream can answer `200` and then hold a queued request open with nothing but
+SSE comment lines (`: keep-alive`), or a non-streamed body with leading
+whitespace, and neither a header nor a comment carries any of the response. So
+understudy withholds an upstream's status, headers, and any comment lines or
+leading whitespace until the first **content**: a stream's first `data:` event,
+or a body's first non-whitespace byte. Until then the attempt is pre-content and
+nothing has been committed to the client. **Switching cost**, when replay *is* possible, is set by conversation
 position: a *first request* has no prompt-cache or coherence to forfeit (~0), a
 *subsequent request* forfeits the pinned target's warm cache and mid-conversation
 coherence (high). Mid-stream collapses the cost axis — replay being impossible,
 position is moot — leaving three cases:
 
-1. **First-request pre-header stall** — replayable, cost ~0 → **synthesized
+1. **First-request pre-content stall** — replayable, cost ~0 → **synthesized
    backpressure with an eager replay**: synthesize a bounded `Retry-After`,
    demote the target to `readmitAt`, replay the triggering request to the next
-   candidate, recover via the half-open probe. *(The busy-local-model case.)*
-2. **Subsequent-request pre-header stall** — replayable, but switching forfeits
+   candidate, recover via the half-open probe. *(A provider holding a queued
+   request open with keep-alives. Silence before the response header is not a
+   stall on any backend: it waits — §Session-Ordered Admission.)*
+2. **Subsequent-request pre-content stall** — replayable, but switching forfeits
    coherence → the same disposition **gated by a coherence-sized wait budget**:
    hold in place longer, replaying only once the budget is spent. This is
    §Affinity's "wait budget driven by coherence" (a live session's budget is
@@ -384,6 +393,14 @@ position is moot — leaving three cases:
    signal is too weak a basis for a binary verdict, so persistent mid-stream
    slowness surfaces as *cost* in the selection layer (a slow target sinks in the
    cost order and re-floats as it recovers), never as a demotion here.
+
+**A keep-alive is not progress.** Neither bound counts a comment line or
+insignificant whitespace: the stall gate runs from the response header until the
+first content, and the idle deadline measures the gap between content events. An
+upstream that sends only keep-alives has produced nothing, so it reaches
+whichever bound applies — the stall gate between header and content, the idle
+deadline after it. Before the header no gate runs; that wait belongs to
+§Session-Ordered Admission.
 
 Each
 entry is a full `(backend, model)` target, so a
@@ -583,7 +600,7 @@ a target due for a check is **served immediately by the first healthy target**,
 and the probe is launched **asynchronously**; its outcome lands in the health map
 for the next request to read. Demand is the trigger, so an idle install — a
 single user away for a long weekend — issues nothing at all; but no client ever
-pays the probe's latency, which for a stalled target is the full header-stall gate
+pays the probe's latency, which for a stalled target is the full stall gate
 and for a slow 5xx is worse.
 
 Both alternatives are rejected. A **standing background timer** polls on a
@@ -691,6 +708,11 @@ The ladder subsumes the reject and backoff paths as its bottom rung; failover an
 wait-in-place are the rungs that keep the client on *a* model — the cheapest
 healthy one, or (with affinity) its own.
 
+A request that waits for its own target — a later turn, or a first turn with no
+healthy alternate — does not fail over on a 429 it can be queued through:
+§Session-Ordered Admission re-queues it at its rank. That is the wait-in-place
+rung, carried out by the queue rather than by a sleep.
+
 **Affinity and admission (staged).** Holding a throttled request open
 (wait-in-place) turns understudy from a stateless relay into an **admission
 scheduler** for a scarce backend: it owns the pending requests, so it can order
@@ -703,14 +725,19 @@ once). This is the concrete realization of session binding above; two dependenci
 gate it, both staged:
 
 - **Session identity.** understudy must recognize which requests belong to one
-  conversation. opencode holds a session id internally but passes **none** on the
-  OpenAI-compat call — understudy sees only the bearer token and the body. So the
-  key is **inferred from the payload and scoped to the token**: a hash of the
+  conversation. opencode sends a per-session identifier (`x-session-affinity`)
+  on every OpenAI-compat call, but understudy does not key affinity on it: a
+  caller-supplied id survives compaction and would need an explicit release (see
+  *Affinity is a short-lived hint, not a lease*, below), while a payload hash
+  releases itself when compaction rewrites the leading messages. So the key is
+  **inferred from the payload and scoped to the token**: a hash of the
   invariant leading messages (system + first user turn), which is also exactly
   what prompt-cache coherence keys on, mixed with the bearer token so one
   tenant's affinity cannot steer another's routing in the shared daemon. The
-  token is hashed, never stored raw, so understudy's own state cannot be read
-  back into a credential.
+  token groups the affinity map raw, unhashed: it already sits in memory via
+  the request's Authorization header for the life of the request, so
+  hashing this one map key would add per-request cost without reducing what a
+  memory inspection could recover.
 
   **Affinity engages only on a request carrying a prior assistant turn.** A first
   turn has nothing to stay coherent with, so it takes the walk as ordered — which
@@ -920,7 +947,7 @@ status, so a row reads as the rule it follows.
 | any other `5xx` with a delay beyond the ceiling | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
 | any other `5xx` with no delay, or a transport failure that never answered | `502` | `server_error` | synthesized — nothing is sent today, [[understudy-adaptive-coordinated-backoff]] |
 | overloaded (`529` and kin) | `502` | *open* | as `5xx` |
-| every candidate stalled before its header | `504` | `server_error` | — |
+| every candidate stalled before its first content | `504` | `server_error` | — |
 | failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
 
 **A walk that runs out of candidates answers for the request, not for its last
@@ -940,7 +967,7 @@ break by judgement:
 | --- | --- |
 | sent a `Retry-After` | what remains of it |
 | answered a retryable failure with no delay — a `429`, or a `500`/`502`/`503`/`504`/`529` | that endpoint's current synthesized interval — [[understudy-adaptive-coordinated-backoff]] |
-| stalled before its header | the synthesized stall backoff |
+| stalled before its first content | the synthesized stall backoff |
 | was benched and never called | its `readmitAt`, less now |
 | refused — `401`, `402`, `403` | nothing; no delay it named, and no bench it earned |
 | rejected the request's history | nothing; no delay will make it serve this conversation |
@@ -1097,7 +1124,14 @@ nothing.
 A 429 that carries a usable signal is not a concurrency measurement at all: it is quota
 or rate exhaustion, and it routes to quota-class-aware demotion (§Understudy) rather than
 to the cap. Only the bare case (a per-host fallback — [[understudy-ratelimit-signal-classifier]])
-feeds the estimator.
+feeds the estimator. A bare 429 that §Session-Ordered Admission re-queues —
+another request in its scope still producing content — does not feed it either:
+it says the request was not yet served, not where the account's limit lies.
+
+**Waiting for a slot is ordered, and only released requests wait.** A request
+held in the admission queue (§Session-Ordered Admission) takes no slot; only a
+request the queue releases competes for one, and when a slot frees, the waiter
+from the oldest session takes it.
 
 **Per-upstream state outlives the tenant that taught it.** The learned cap is a property
 of the account, accumulated across runs; tearing down a tenant frees its in-flight slots
@@ -1109,6 +1143,167 @@ accumulate the goroutines and buffered bodies it exists to protect. It guards th
 *process* against resource exhaustion; on a host with a generous soft limit it sits far
 above any cap the control law reaches and so bounds nothing about the account. Growth is
 bounded by the demand gate and the known-good boundary, never by the FD budget.
+
+## Session-Ordered Admission <a id="session-ordered-admission"></a>
+
+A contended backend served as a plain relay turns concurrent conversations into
+round-robin at request granularity: every session's per-turn latency inflates by
+the number of sessions, all sessions finish near the end together, and a
+consumer's silence-based liveness watchdog reads the wait as death — so every
+session times out, and the work each did is lost. The queue at a contended
+backend exists either way; the question is who orders it. The backend's own
+queue is request-FCFS because it cannot see conversations. Understudy can: it
+holds every request and infers session identity from the payload (§Understudy,
+*Affinity and admission*), so it is the layer positioned to order admission by
+session. The motivating case is a local model server whose decode streams number
+one or two, but nothing in the mechanism is specific to one.
+
+**Admission ordering is oldest-session-first.** A session's rank is its age —
+when its conversation key was first seen — and it keeps that rank for its whole
+life, between turns and through long quiet stretches such as a tool run.
+Sessions therefore finish in arrival order, and a newer session waits behind
+older ones for as long as they keep taking turns. That is the design, not a
+cost: under contention some sessions cannot finish in time, and it is better to
+hold back the ones that have not started than to let every session interleave
+and time out together. Understudy forgets a session when the consumer signals
+that it ended, or after a long backstop (on the order of a day) with no request,
+for consumers that send no such signal; a session returning after the backstop
+ranks as new. A request with no conversation key ranks by its own arrival. Two
+conversations that share a key share a place in line — a collision costs
+ordering, never correctness. In the shared daemon the ordering is global across
+runs (§Shared understudy daemon). Session age is a policy slot: explicit
+classes (interactive over batch) compose without touching the mechanism.
+
+**It applies to every backend, and forms only under contention.** There is no
+per-backend marking and no capacity model. Requests go straight to the backend
+until a queue forms, one at a time while it exists, and straight through again
+once it drains — so where nothing contends, the discipline is indistinguishable
+from a plain relay. A remote that is slow to answer under load but has parallel
+headroom is sent one new request at a time while its queue exists; that
+under-use lasts only as long as the contention that formed the queue.
+
+**The queue is keyed on the target.** Canonical `url + key + model` — health's
+key (§Understudy) — because that is the scope a provider limits and the scope a
+local server hands out slots on: Kronk's admission permits and Ollama's
+parallel slots are both per loaded model. One server's models contend with each
+other only across a model swap, and that contention is **linked by evidence**:
+a busy refusal (a swap refused because the loaded model is mid-stream) links the
+server's models into one ranking. While linked, the loaded model's queue stops
+releasing whenever the top-ranked waiter is for another model; its running
+requests finish undisturbed, and the waiter is released the moment Understudy's
+own count of the loaded model's running requests reaches zero, so the swap
+lands on an idle entry rather than being refused again. The link ends when
+either queue drains. On a server with several slots the swap waits for the
+longest remaining request, which leaves the GPU running near full speed while
+the last slots drain — a small loss next to starving one model, and only paid
+when the top rank changes model. A server that loads models one at a time on
+its own (Ollama holds other requests while a load is pending) needs no link.
+
+**What forms a queue.** A request that has received no response header after a
+short grace period (on the order of a second or two — long enough that an
+uncontended backend's normal header latency never trips it) is evidence of
+contention. Two events form or grow a queue:
+
+- **An arrival outranks a waiting request.** Every outstanding headerless
+  request past its grace period that ranks below the arrival is canceled and
+  queued with it, by rank. Requests that rank above the arrival stay outstanding.
+- **A request waits past its grace period.** Every outstanding headerless
+  request is canceled and queued except the highest-ranked unconfirmed one —
+  and that one too if another request is already unconfirmed.
+
+A request with no response header has been given no work by a backend that
+admits before it answers (Kronk writes nothing, its status included, until a
+request holds an admission permit), so canceling it is free. A backend that
+writes nothing until its first token (Ollama is silent through queueing,
+prefill, and model load alike) cannot show the difference, and canceling there
+may discard a prefill in progress; that loss is accepted, and the reservation
+window below makes it rare.
+
+**The probe discipline.** A request is **confirmed** by its first content event
+(§Understudy, *Stalls* — a keep-alive is not content). The queue releases its
+head only when nothing unconfirmed is outstanding in its scope — its target, or
+the linked set — so once a queue exists at most one unconfirmed request, the
+**probe**, is at the backend. A request that has received a response header is
+never canceled by preemption: a header means admitted to the backend's queue,
+not to a slot, and the wire cannot tell queueing from prefill. A higher-ranked
+arrival therefore waits at the front of Understudy's queue until the probe
+confirms. The backend's own ordering matters only among requests left
+outstanding when a queue forms; after that there is nothing at the backend for
+it to reorder. The only other cancellations are the consumer abandoning a
+request and the consumer's time limit (below).
+
+**Silence before a response header waits, on every backend.** Kronk waiting for
+a permit, Ollama queueing or prefilling or loading, and a remote holding a
+queued request all look identical before the header, and the ones with evidence
+behind them are alive. So no gate bounds the wait for a header — neither
+Understudy's own nor the transport's header timeout on the chat path. What
+bounds it is the backend's own error, the consumer's time limit, and the
+consumer's deadline. A stall after the header — keep-alives with no content — is
+§Understudy's pre-content stall, not this.
+
+**Who waits, and who fails over.** The wait budget is the one §Understudy's
+*Affinity and admission* derives from coherence. A later turn is bound to its
+target — switching forfeits its prompt cache and coherence — so it waits. A
+first turn has nothing to forfeit: with a healthy untried alternate it takes the
+walk as ordered and fails over rather than queue; with none, it waits like a
+later turn. A consumer that knows more than one request can — how long a whole
+session is likely to run, and whether a slow local target can finish it in time
+— chooses the target per session itself, by naming it; that routing is
+consumer policy, not Understudy's.
+
+**A 429 on a request that waits re-queues it.** The request returns to the
+queue at its rank. Its scope is its target, or the linked set while models are
+linked.
+
+- **With `Retry-After`:** the target is benched until then (§Understudy,
+  health), and the queue releases around it — the highest-ranked request whose
+  target is not benched goes next.
+- **Without `Retry-After`, while another request in scope is producing
+  content:** the backend's own admission bound fired on a request that was
+  simply not yet served. It is released again when a request in scope finishes,
+  so nothing is retried against a slot that is still held. It is not a capacity
+  measurement, so the concurrency cap does not shrink.
+- **Without `Retry-After`, with nothing in scope producing content:** the
+  ordinary handling applies (§Understudy, the `Retry-After` ladder;
+  §Concurrency & Rate Limiting).
+
+A request that fails over takes the ladder unchanged.
+
+**A consumer's time limit ends a wait with a reason.** A consumer may set how
+long a request can go without content — held in Understudy's queue, or submitted
+to a backend that has produced nothing. Past it, Understudy cancels the request
+and answers with a typed `400` carrying the reason (behind older sessions, or
+waiting on a model swap), its position, and a retry-after hint. A `400` because
+a consumer like opencode gives up on it at once instead of looping, and its
+envelope reaches the consumer's error event intact (the rate-limit firewall
+relies on the same path); the consumer then decides — resend later, route the
+session elsewhere, abort. A resent conversation keeps its key, so it returns at
+its rank. To answer with a status at all, Understudy withholds the backend's
+status and headers from the client until the first content, and the limit
+overrides the header rule above. With no limit set, Understudy waits. A queued
+request is alive, and saying so with a reason is what keeps a schedulable wait
+from being read as death.
+
+**Backend configuration.** On Kronk the admission-permit pool is
+`NSeqMax × QueueDepth`. At the default depth of 2 the probe takes a spare permit
+and waits in Kronk's own queue with a header, so Kronk's admission timeout never
+fires however long a turn runs; the cost is that a probe with a header cannot be
+displaced, so each preemption lets one request finish out of order, and when a
+queue first forms up to `NSeqMax × (QueueDepth − 1)` younger requests already
+admitted run ahead. A depth of 1 keeps order strict but leaves the probe waiting
+for a permit, so it needs Kronk's admission timeout raised past the longest
+turn. (A depth of 0 means Kronk's default, not zero.)
+
+**Reservation window (staged).** After a request completes, its session holds
+admission priority for a window sized to the consumer's inter-turn gap: a turn
+arriving within it keeps the place uncontested, so running sessions finish
+rather than trading slots with the queue head at turn granularity. Without the
+window the discipline still orders contention — sessions complete in arrival
+order, interleaved among the running sessions plus one — so the window is
+staged separately: it buys run-to-completion, fewer model swaps, fewer canceled
+prefills, and the deterministic per-session completion times that prediction and
+routing policies lean on, at the cost of at most one window of idle per turn
+when a queue is waiting.
 
 ## Shared understudy daemon <a id="shared-daemon"></a>
 

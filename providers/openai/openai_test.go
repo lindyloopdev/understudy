@@ -28,6 +28,22 @@ type capturedRequest struct {
 	Body        string
 }
 
+// captureRequest renders r as a [capturedRequest].
+func captureRequest(t *testing.T, r *http.Request) capturedRequest {
+	t.Helper()
+	reqBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("reading request body: %v", err)
+	}
+	return capturedRequest{
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		Auth:        r.Header.Get("Authorization"),
+		ContentType: r.Header.Get("Content-Type"),
+		Body:        string(reqBody),
+	}
+}
+
 // newCapturingServer stands up an httptest server that records the inbound
 // request into the returned *capturedRequest and responds with the given
 // status, headers, and body.
@@ -35,17 +51,7 @@ func newCapturingServer(t *testing.T, status int, headers http.Header, body stri
 	t.Helper()
 	var got capturedRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqBody, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("reading request body: %v", err)
-		}
-		got = capturedRequest{
-			Method:      r.Method,
-			Path:        r.URL.Path,
-			Auth:        r.Header.Get("Authorization"),
-			ContentType: r.Header.Get("Content-Type"),
-			Body:        string(reqBody),
-		}
+		got = captureRequest(t, r)
 		for k, vs := range headers {
 			for _, v := range vs {
 				w.Header().Add(k, v)
@@ -75,7 +81,7 @@ func TestChatRequest(t *testing.T) {
 
 	srvURL, got := newCapturingServer(t, http.StatusOK, nil, "")
 
-	resp, err := Chat(t.Context(), providers.Config{BaseURL: mustParseURL(t, srvURL+"/v4"), APIKey: "sk-test"}, strings.NewReader(standardBody))
+	resp, err := Chat(t.Context(), providers.Config{BaseURL: mustParseURL(t, srvURL+"/v4"), APIKey: "sk-test"}, "", strings.NewReader(standardBody))
 	if err != nil {
 		t.Fatalf("Chat returned unexpected error: %v", err)
 	}
@@ -91,6 +97,57 @@ func TestChatRequest(t *testing.T) {
 	if d := gocmp.Diff(want, *got); d != "" {
 		t.Errorf("unexpected request to backend (-want +got):\n%s", d)
 	}
+}
+
+// TestChatSessionHeader verifies [Chat] relays sessionID upstream as the
+// x-opencode-session header only for non-empty sessionIDs sent to opencode.ai.
+func TestChatSessionHeader(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "f4b2b0db-4c6e-4f2a-9d1a-3b1f6a7c9e21"
+	opencodeURL := mustParseURL(t, "https://opencode.ai/zen/go/v1")
+	otherURL := mustParseURL(t, "https://example.com/v1")
+
+	type test struct {
+		baseURL   *url.URL
+		sessionID string
+		want      string
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should send no x-opencode-session header when the session identifier is empty", test{
+		baseURL: opencodeURL,
+	})
+	tests.Add("should send no x-opencode-session header when the base URL's host is not opencode.ai", test{
+		baseURL:   otherURL,
+		sessionID: sessionID,
+	})
+	tests.Add("should relay a non-empty session identifier as x-opencode-session when the base URL's host is opencode.ai", test{
+		baseURL:   opencodeURL,
+		sessionID: sessionID,
+		want:      sessionID,
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		var got string
+		client := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+			got = r.Header.Get(sessionHeader)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}}, nil
+		})
+		cfg := providers.Config{BaseURL: tt.baseURL, APIKey: "sk-test", HTTPClient: client}
+
+		resp, err := Chat(t.Context(), cfg, tt.sessionID, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("Chat returned unexpected error: %v", err)
+		}
+		_ = resp.Body.Close()
+
+		if got != tt.want {
+			t.Errorf("%s header: got %q, want %q", sessionHeader, got, tt.want)
+		}
+	})
 }
 
 // TestModelsRequest verifies what Models sends upstream: given a base_url
@@ -505,7 +562,7 @@ func TestChatResponse(t *testing.T) {
 		if ctx == nil {
 			ctx = t.Context()
 		}
-		resp, err := Chat(ctx, tt.cfg, strings.NewReader(`{}`))
+		resp, err := Chat(ctx, tt.cfg, "", strings.NewReader(`{}`))
 		if !testy.ErrorMatchesRE(tt.wantErr, err) {
 			t.Errorf("unexpected error: got %v, want /%s/", err, tt.wantErr)
 		}
@@ -561,7 +618,7 @@ func TestChatSurfacesCancellationCause(t *testing.T) {
 		cancel(tt.cause)
 		srvURL, _ := newCapturingServer(t, http.StatusOK, nil, "")
 
-		_, err := Chat(ctx, providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"}, strings.NewReader(`{}`))
+		_, err := Chat(ctx, providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"}, "", strings.NewReader(`{}`))
 		if !errors.Is(err, tt.cause) {
 			t.Errorf("returned error does not wrap the cancellation cause: got %v, want errors.Is(_, %v)", err, tt.cause)
 		}
@@ -583,7 +640,7 @@ func TestChatSurfacesGeminiQuotaRetryDelay(t *testing.T) {
 
 	want := time.Now().Add(22509 * time.Millisecond)
 
-	_, err := Chat(t.Context(), providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"}, strings.NewReader("{}"))
+	_, err := Chat(t.Context(), providers.Config{BaseURL: mustParseURL(t, srvURL), APIKey: "sk-test"}, "", strings.NewReader("{}"))
 
 	var gotRetryAfter time.Time
 	if ra, ok := yerrors.AsType[interface{ RetryAfter() time.Time }](err); ok {
