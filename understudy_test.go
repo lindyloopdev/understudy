@@ -1539,7 +1539,7 @@ func forwardedModel(t *testing.T, body []byte) string {
 	return model
 }
 
-func TestChatCompletionsForwardedModel(t *testing.T) {
+func TestChatCompletionsForwardedRequest(t *testing.T) {
 	t.Parallel()
 
 	type test struct {
@@ -1617,6 +1617,34 @@ func TestChatCompletionsForwardedModel(t *testing.T) {
 			check: func() {
 				if got := forwardedModel(t, forwarded); got != "gpt-4" {
 					t.Errorf("forwarded model: got %q, want %q", got, "gpt-4")
+				}
+			},
+		}
+	})
+
+	tests.AddFunc("should send an x-opencode-session header to an opencode.ai backend", func(t *testing.T) test {
+		var forwarded bool
+		var session string
+		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
+			forwarded = true
+			session = req.Header.Get("X-Opencode-Session")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return test{
+			requestModel: "openai/gpt-4",
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "https://opencode.ai/zen/go/v1", "sk-test", client), nil
+			}},
+			check: func() {
+				if !forwarded {
+					t.Fatal("no request reached the upstream")
+				}
+				if session == "" {
+					t.Error("upstream request carried no x-opencode-session header")
 				}
 			},
 		}

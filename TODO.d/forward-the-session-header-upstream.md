@@ -18,7 +18,7 @@ opencode Zen Go now rejects a chat request carrying no `x-opencode-session`:
     cannot be routed efficiently.
     https://opencode.ai/docs/go/#where-can-i-use-it
 
-Every request to an opencode-go backend target fails this way — lindy observed
+Every request to an opencode-go backend target failed this way — lindy observed
 it as every beat on such a target dying `Unavailable` (`test-corpus-coupling@project`
 was the first named). The policy is new (the docs page carries 2026-09-18 as its
 update date); backends that do not enforce it (z-ai et al.) are unaffected, so
@@ -59,16 +59,16 @@ value only when neither is present.
 
 ## Work
 
-- ~~Plumb a `sessionID` parameter to `Handler.Chat`/`openai.Chat` and gate
-  the header on the base URL's host being opencode.ai~~ — done.
-- **Always compute the value in `chatCompletions`** (understudy.go:2189,
-  currently passes `""`), unconditionally — no inbound-header inspection. Mix
-  the bearer token into the conversation key the same way the internal
-  affinity key already does (DESIGN.md, "mixed with the bearer token so one
-  tenant's affinity cannot steer another's routing in the shared daemon"), so
-  two tenants' conversations can never collide on the value sent to Zen. This
-  also fixes the compaction issue above for free: the value changes exactly
-  when `conversationKey` does.
+- **Replace the constant `"understudy"` placeholder in `chatCompletions`**
+  (the `sel.handler.Chat` call's sessionID argument, currently a fixed value
+  that only satisfies Zen's non-empty check) with a computed value: mix the
+  bearer token into the
+  conversation key the same way the internal affinity key already does
+  (DESIGN.md, "mixed with the bearer token so one tenant's affinity cannot
+  steer another's routing in the shared daemon"), so two tenants'
+  conversations can never collide on the value sent to Zen. This also fixes
+  the compaction issue above for free: the value changes exactly when
+  `conversationKey` does.
 
 ## Notes
 
