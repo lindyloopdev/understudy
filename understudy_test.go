@@ -1667,13 +1667,7 @@ func TestChatCompletionsForwardedRequest(t *testing.T) {
 	})
 }
 
-// TODO(coverage): nothing asserts the equality half of this contract — that
-// the same call (same token, same conversation) sent twice gets the same
-// x-opencode-session header both times. This table only proves inequality
-// across different inputs, so a per-request-random value would pass every
-// case here while breaking the stability Zen actually asked for. Belongs in
-// its own test (an equality claim, not this table's inequality claim).
-func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
+func TestChatCompletionsSessionHeaderScoping(t *testing.T) {
 	t.Parallel()
 
 	// call is one chat-completions request.
@@ -1683,9 +1677,16 @@ func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
 	}
 	type test struct {
 		callA, callB call
+		wantEqual    bool
 	}
 
 	tests := testy.NewTable[test]()
+
+	tests.Add("should send the same x-opencode-session header for a repeated call", test{
+		callA:     call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
+		callB:     call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
+		wantEqual: true,
+	})
 
 	tests.Add("should send a different x-opencode-session header for a different conversation", test{
 		callA: call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
@@ -1726,8 +1727,12 @@ func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
 		if len(sessions) != 2 {
 			t.Fatalf("upstream received %d requests, want 2", len(sessions))
 		}
-		if sessions[0] == sessions[1] {
-			t.Errorf("both requests sent the same x-opencode-session header %q", sessions[0])
+		if sessions[0] == "" {
+			t.Fatal("x-opencode-session header must not be empty")
+		}
+		equal := sessions[0] == sessions[1]
+		if equal != tt.wantEqual {
+			t.Errorf("got %q and %q (equal=%v); want equal=%v", sessions[0], sessions[1], equal, tt.wantEqual)
 		}
 	})
 }
