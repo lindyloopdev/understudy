@@ -1667,19 +1667,34 @@ func TestChatCompletionsForwardedRequest(t *testing.T) {
 	})
 }
 
+// TODO(coverage): nothing asserts the equality half of this contract — that
+// the same call (same token, same conversation) sent twice gets the same
+// x-opencode-session header both times. This table only proves inequality
+// across different inputs, so a per-request-random value would pass every
+// case here while breaking the stability Zen actually asked for. Belongs in
+// its own test (an equality claim, not this table's inequality claim).
 func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
 	t.Parallel()
 
+	// call is one chat-completions request.
+	type call struct {
+		token        string
+		conversation string
+	}
 	type test struct {
-		conversationA string
-		conversationB string
+		callA, callB call
 	}
 
 	tests := testy.NewTable[test]()
 
 	tests.Add("should send a different x-opencode-session header for a different conversation", test{
-		conversationA: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`,
-		conversationB: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"what is the capital of France"}]}`,
+		callA: call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
+		callB: call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"what is the capital of France"}]}`},
+	})
+
+	tests.Add("should send a different x-opencode-session header for a different caller", test{
+		callA: call{token: "user-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
+		callB: call{token: "other-token", conversation: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"tell me about pelicans"}]}`},
 	})
 
 	tests.Parallel()
@@ -1698,12 +1713,12 @@ func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
 		}}
 		srv := New(validator, WithLogger(testLogger(t)))
 
-		for _, conversation := range []string{tt.conversationA, tt.conversationB} {
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(conversation))
+		for _, c := range []call{tt.callA, tt.callB} {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(c.conversation))
 			if err != nil {
 				t.Fatal(err)
 			}
-			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Authorization", "Bearer "+c.token)
 			req.Header.Set("Content-Type", "application/json")
 			srv.ServeHTTP(httptest.NewRecorder(), req)
 		}
@@ -1712,7 +1727,7 @@ func TestChatCompletionsSessionHeaderVariesByConversation(t *testing.T) {
 			t.Fatalf("upstream received %d requests, want 2", len(sessions))
 		}
 		if sessions[0] == sessions[1] {
-			t.Errorf("both conversations sent the same x-opencode-session header %q", sessions[0])
+			t.Errorf("both requests sent the same x-opencode-session header %q", sessions[0])
 		}
 	})
 }

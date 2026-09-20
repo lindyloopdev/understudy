@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2186,10 +2189,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		heldSlot = lim
 
-		// TODO(TODO.d/forward-the-session-header-upstream.md): the value varies
-		// by conversation but not yet by tenant — the bearer token still needs
-		// mixing in, so two tenants' conversations can collide on Zen's side.
-		resp, err := sel.handler.Chat(ctx, sel.cfg, convKey, body)
+		// The session header reaches Zen, so the bearer token never appears
+		// in it directly: it HMACs the conversation key instead.
+		mac := hmac.New(sha256.New, []byte(convTenant))
+		_, _ = mac.Write([]byte(convKey))
+		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in
