@@ -72,6 +72,10 @@ type LogicalModel struct {
 
 // TokenValidator validates a bearer token extracted from an incoming request.
 type TokenValidator interface {
+	// Validate is called exactly once per request, at arrival, with the
+	// request's own context, which [net/http] cancels when the handler returns
+	// — after the response body has been fully relayed — so an implementation
+	// may treat ctx.Done() as its end-of-request signal.
 	Validate(ctx context.Context, token string) (*BackendConfig, error)
 }
 

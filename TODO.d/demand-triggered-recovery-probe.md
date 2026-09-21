@@ -9,8 +9,9 @@ rejected alternatives),
 failover walk the probe re-admits into),
 [DESIGN.md §Upstream-identity canonicalization](../DESIGN.md#upstream-identity-canonicalization)
 (health keys on `(url + key + model)` — why a rotated credential needs no probe at
-all), [DESIGN.md §Control plane](../DESIGN.md#daemon-control-plane) (where an
-operator's "recheck now" would live).
+all), [lindy DESIGN.md §Control
+plane](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#daemon-control-plane)
+(where an operator's "recheck now" would live).
 
 Today `pickTarget` re-admits a demoted target by handing it to a live client
 request once `recoveryInterval` (30s) has elapsed, so that client pays the
