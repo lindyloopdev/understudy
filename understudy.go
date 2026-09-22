@@ -458,11 +458,7 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithHTTPClient sends upstream chat requests through client, overriding each
-// backend's configured client. It exists for end-to-end tests that run inside
-// a testing/synctest bubble: goroutines parked on real sockets never let the
-// bubble's clock advance, so the injected client must serve the upstream hop
-// over [httptest.NewTestServer]'s network instead.
+// WithHTTPClient overrides each backend's configured client.
 func WithHTTPClient(client *http.Client) Option {
 	return func(s *server) {
 		s.httpClient = client
