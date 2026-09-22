@@ -2,7 +2,11 @@
 
 Port the simple-server subset of lindy's `internal/cli/proxy.go` +
 `internal/cli/registry.go` into `cmd/understudyd/` — a thin main wrapping the
-library.
+library. The daemon design those files implement is specified in the consumer's
+design doc ([lindy DESIGN.md §The Tenant
+Registry](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#tenant-registry)
+and [§Gateway
+Lifecycle](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#gateway-lifecycle)).
 
 - Single process, one TOML config, cleartext on localhost by default, TLS
   optional. Hold back the rendezvous file / spawn-lock / version-handshake

@@ -185,6 +185,27 @@ func TestChatCompletionsValidation(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should serve a proxied request through the HTTP client injected with WithHTTPClient", func(t *testing.T) test {
+		// The backend's address is unservable, so the stock client can only
+		// fail the request: any response is one the injected client carried.
+		injected := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"served-by-injected-client"}`)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return test{
+			authHeader: "Bearer user-token",
+			validate: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://127.0.0.1:1/v1", "sk-test", nil), nil
+			},
+			opts:       []Option{WithHTTPClient(injected)},
+			wantStatus: http.StatusOK,
+			wantBody:   `{"id":"served-by-injected-client"}`,
+		}
+	})
+
 	tests.AddFunc("should reserve no model name, rejecting default like any other undeclared model", func(t *testing.T) test {
 		decoy := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("no upstream call expected: no name is reserved, so no catalog is consulted to resolve one")

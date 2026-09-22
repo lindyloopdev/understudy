@@ -1312,63 +1312,31 @@ account's concurrency cap and learned rate-limit state are enforced **globally**
 rather than per-run. A per-process understudy sees only its own traffic, so N
 concurrent `lindy run`s share an account's limit as N uncoordinated AIMD flows that
 converge only approximately (TCP-style); one shared understudy sees the true
-aggregate and enforces a real ceiling. The daemon **is the `lindy proxy` composition
-root** (free tier) or understudy **multiplexed onto `lindyd`'s control-plane
-listener** (paid) — an existing binary (§Binaries in DESIGN.md), not a new package.
-The concurrency limiter is reused wholesale: the daemon is understudy run once, so
-its in-process cap+queue+AIMD (keyed by upstream identity) becomes global by
-consolidating all traffic into one process — no shared state store.
+aggregate and enforces a real ceiling. The concurrency limiter is reused wholesale:
+the daemon is understudy run once, so its in-process cap+queue+AIMD (keyed by
+upstream identity) becomes global by consolidating all traffic into one process —
+no shared state store. The daemon itself is the embedding consumer's composition —
+the session registry, its control plane, and the daemon lifecycle are specified in
+the consumer's design doc ([lindy DESIGN.md §The Tenant
+Registry](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#tenant-registry)
+and [§Gateway
+Lifecycle](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#gateway-lifecycle)).
 
-**Control plane.** <a id="daemon-control-plane"></a> The data plane is `/v1/*`; the
-daemon adds a control plane. A run POSTs its resolved understudy config (backends +
-credentials + models — what `Config.Resolve` consumes) to `POST /session`;
-creating the session is the validation gate — the daemon resolves and validates it,
-mints a token (`crypto/rand.Text()`), and returns `{token}`. The client already trusts
-the daemon's CA — from the rendezvous file (the daemon publishes its details there
-before signaling readiness), which it needs to make the HTTPS call at all — and points opencode at
-`https://localhost:<port>/v1` with the token as bearer. **The token is the routing
-key**: one shared `/v1/*` serves every tenant
-and the bearer selects the config (unknown token → 401) — no path namespace. A run
-**deletes its session** on completion with `DELETE /session` bearing its token; the
-token is its own authorization (holding it already grants full data-plane access, so
-dropping it needs no separate credential), and the delete is idempotent.
+**The validator runs on the request lifecycle.** <a
+id="validator-request-lifecycle"></a> `Validate` is called exactly once per inbound
+request, at arrival, with the request's `context.Context` — the one `net/http`
+cancels when the handler returns, after the response body has been fully relayed.
+A validator can therefore treat `ctx.Done()` as its end-of-request signal, covering
+every ending a request has: a relayed response, a failed candidate walk, a client
+that left mid-stream.
 
-Every response the daemon serves — both planes — is logged by the mount (§Handler
-boundary), so a rejected registration is as visible to an operator as a data-plane error.
-On the data plane understudy populates its own log record (served backend/model,
-upstream status, and on failure the real error) which the mount reads back as a `LogRecord`
-snapshot to emit the `/v1` entry; on the control plane the daemon records only a `/session`
-rejection's reason into its own record — the two never mix.
-
-**Control-credential auth.** <a id="daemon-control-plane-auth"></a> The control plane
-holds every session's upstream credentials in memory, so the threat is unauthorized
-use of understudy **as a proxy** — an open relay once it is TCP-hosted. `POST
-/session` therefore authenticates the registrant at the **application layer** with a
-control credential it presents (the `X-Understudy-Control` header), never by transport
-reachability (a loopback port isn't UID-gated; a same-user socket's protection
-vanishes once TCP-hosted). The credential is delivered locally via the
-`$HOME`-permissioned rendezvous file and operator-configured when TCP-hosted. Control
-and data planes share **one loopback listener**: the credential guards `POST /session`;
-per-run bearer tokens guard both `DELETE /session` and `/v1/*` (holding the token
-already grants full data-plane access), so no separate socket is needed.
-
-**Two lifecycles.** A **tenant** (a registered token → config) is ephemeral — one per
-run, dropped on teardown or idle. **Per-upstream state outlives it:** the learned
+**Two lifecycles.** A **tenant** (a registered token → config) is ephemeral —
+registered and dropped by the embedding daemon ([lindy DESIGN.md §The Tenant
+Registry](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#tenant-registry)).
+**Per-upstream state outlives it:** the learned
 concurrency cap + health for an account (keyed by upstream identity) is a property of
 the *account*, accumulated across runs, so tearing down a tenant frees its in-flight
 slots but MUST NOT reset the learned cap.
-
-**Idle eviction.** <a id="daemon-idle-eviction"></a> Explicit deregister is the
-primary reclamation path; an idle timeout is the crash-safety fallback for a run that
-dies without deregistering. A tenant unused past a window — **minutes**, exceeding the
-longest legitimate inter-beat gap (near opencode's ~10-min idle watchdog) so it never
-rejects a live run mid-flight — is dropped. Each tenant carries its own idle timer
-(`time.AfterFunc`), armed at registration and reset on every `Validate` under the
-registry mutex, so eviction is intrinsic to the registry — no external sweeper for a
-caller to wire or forget. A `Reset` racing an already-fired timer can drop a just-used
-tenant, but the only effect is a correct 401 on its next request, and the window
-(exceeding opencode's watchdog) keeps a live run from ever reaching that edge
-([notes](notes/2026-07-20-idle-eviction-timer-over-sweep.md)).
 
 **Upstream-identity canonicalization.** <a id="upstream-identity-canonicalization"></a>
 Logically-same upstreams written differently across tenant configs coalesce onto one
