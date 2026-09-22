@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/go-playground/locales v0.14.1
-	github.com/go-playground/universal-translator v0.18.1
+	github.com/go-playground/universal-translator v0.18.2
 	github.com/go-playground/validator/v10 v10.30.5
 	github.com/google/go-cmp v0.7.0
 	gitlab.com/flimzy/testy/v2 v2.0.0-20250904163106-29163c594af6
