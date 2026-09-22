@@ -73,7 +73,7 @@ type LogicalModel struct {
 // TokenValidator validates a bearer token extracted from an incoming request.
 type TokenValidator interface {
 	// Validate is called exactly once per request, at arrival, with the
-	// request's own context, which [net/http] cancels when the handler returns
+	// request's context, which [net/http] cancels when the handler returns
 	// — after the response body has been fully relayed — so an implementation
 	// may treat ctx.Done() as its end-of-request signal.
 	Validate(ctx context.Context, token string) (*BackendConfig, error)
@@ -240,6 +240,11 @@ type server struct {
 	processLimiter *upstreamLimiter
 
 	interceptor ResponseInterceptor
+
+	// httpClient overrides each backend's configured client for upstream chat
+	// requests; nil leaves each backend's own client in force. See
+	// [WithHTTPClient] for why it exists.
+	httpClient *http.Client
 
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
@@ -450,6 +455,17 @@ func WithResponseInterceptor(fn ResponseInterceptor) Option {
 func WithLogger(logger *slog.Logger) Option {
 	return func(s *server) {
 		s.logger = logger
+	}
+}
+
+// WithHTTPClient sends upstream chat requests through client, overriding each
+// backend's configured client. It exists for end-to-end tests that run inside
+// a testing/synctest bubble: goroutines parked on real sockets never let the
+// bubble's clock advance, so the injected client must serve the upstream hop
+// over [httptest.NewTestServer]'s network instead.
+func WithHTTPClient(client *http.Client) Option {
+	return func(s *server) {
+		s.httpClient = client
 	}
 }
 
@@ -2197,6 +2213,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// in it directly: it HMACs the conversation key instead.
 		mac := hmac.New(sha256.New, []byte(convTenant))
 		_, _ = mac.Write([]byte(convKey))
+		if s.httpClient != nil {
+			sel.cfg.HTTPClient = s.httpClient
+		}
 		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to

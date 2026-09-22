@@ -1322,9 +1322,9 @@ Registry](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#tenant-registry)
 and [§Gateway
 Lifecycle](https://gitlab.com/flimzy/lindy/-/blob/main/DESIGN.md#gateway-lifecycle)).
 
-**The validator runs on the request's own lifecycle.** <a
+**The validator runs on the request lifecycle.** <a
 id="validator-request-lifecycle"></a> `Validate` is called exactly once per inbound
-request, at arrival, with the request's own `context.Context` — the one `net/http`
+request, at arrival, with the request's `context.Context` — the one `net/http`
 cancels when the handler returns, after the response body has been fully relayed.
 A validator can therefore treat `ctx.Done()` as its end-of-request signal, covering
 every ending a request has: a relayed response, a failed candidate walk, a client
