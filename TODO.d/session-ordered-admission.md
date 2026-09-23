@@ -17,40 +17,30 @@ together, and the consumer's silence-based watchdog aborts them all. Measured
 locally: queue waits p50 2.4s / p90 60s against a 10-minute consumer idle
 watchdog, with Kronk turns (ornith 1.5) of 6–10 minutes.
 
-Each item below is one deployable step, in order. The queue sits in the request
-path ahead of the stall gate and the concurrency limiter.
+The queue sits in the request path ahead of the stall gate and the concurrency
+limiter. The steps below remain, in order.
 
 ## Work
 
-- **Session age.** Record `first_seen` per tenant and conversation key from a
-  conversation's first turn (affinity keys only after a prior assistant turn;
-  ordering needs the first). A session keeps its age through any quiet stretch.
-  Forget it on the consumer's session-end signal (new library surface, shared
-  with [[admission-reservation-window]]) or after a backstop of about a day with
-  no request. A request with no conversation key ranks by its own arrival.
+- **Forget a session's age.** Drop a session's `first_seen` on the consumer's
+  session-end signal (new library surface, shared with
+  [[admission-reservation-window]]) or after a backstop of about a day with
+  no request.
   - Tests: a session returning after a long tool run keeps its rank; a session
     ended by the consumer, or idle past the backstop, returns ranked as new.
-- **The queue.** Keyed on `url + key + model` (`healthKey`). Requests go straight
-  through until a queue forms; a queue forms when an arrival outranks an
-  outstanding headerless request past the grace period (cancel and queue every
-  such request ranked below it), or when a request waits past the grace period
-  with no header (cancel and queue every headerless request except the
-  highest-ranked unconfirmed one, and that one too if another request is already
-  unconfirmed). The grace period is a named constant of a second or two. The
-  head is released only when nothing unconfirmed is outstanding on its key; a
-  request is confirmed by its first content event; a request with a response
-  header is never canceled by preemption; the queue drains back to
-  straight-through. Confirmation needs the read-ahead past SSE comments and
-  leading JSON whitespace that [[stall-before-first-content-event]] also needs —
-  whichever lands first builds it, and the client's status and headers are
-  withheld until the first content.
-  - Tests against a fake contended backend: interleaved sessions complete in
-    arrival order; an older session's turn displaces a headerless probe past its
-    grace period; a request whose header arrived is never displaced; a request
-    within its grace period is not canceled; headerless requests ranked above
-    the arrival stay outstanding; an uncontended backend never forms a queue;
-    a consumer aborting a held request removes it; the queue drains back to
-    straight-through.
+- **The queue's second trigger.** A request that waits past the grace period
+  with no header and no higher-ranked arrival also forms the queue: cancel and
+  queue every headerless request except the highest-ranked unconfirmed one,
+  and that one too if another request is already unconfirmed.
+- **Withhold status and headers until the first content.** The relay commits
+  the upstream's status and headers as they arrive; hold them until the
+  confirmation read-ahead (past SSE comments and leading JSON whitespace)
+  finds content.
+  - Tests against a fake contended backend: a request whose header arrived is
+    never displaced; a request within its grace period is not canceled;
+    headerless requests ranked above the arrival stay outstanding; an
+    uncontended backend never forms a queue; a consumer aborting a held
+    request removes it; the queue drains back to straight-through.
 - **Who waits, and who fails over.** A later turn, and a first turn with no
   healthy untried alternate, wait in the queue. A first turn with a healthy
   alternate takes the walk and fails over rather than queue.
@@ -80,9 +70,10 @@ path ahead of the stall gate and the concurrency limiter.
     younger session's request for the loaded one; the loaded model's running
     requests are never canceled for the swap; the swap request is sent only
     once no request for the loaded model is running.
-- **The concurrency limiter follows the queue.** A held request takes no slot
-  (`upstreamLimiter.acquire` runs after release), and a freed slot goes to the
-  waiter from the oldest session rather than whichever wakes first.
+- **The concurrency limiter follows the queue.** Keep a held request taking no
+  slot, and route a freed slot to the waiter from the oldest session rather
+  than whichever wakes first — `upstreamLimiter.acquire` wakes its waiters in
+  release order.
   - Tests: with the cap full, a freed slot goes to the oldest session's
     waiting request.
 - **The consumer's time limit.** An optional library setting (Lindy supplies

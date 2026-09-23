@@ -246,6 +246,12 @@ type server struct {
 	// [WithHTTPClient] for why it exists.
 	httpClient *http.Client
 
+	// TODO(TODO.d/collapse-the-server-state-maps.md): the five maps below sit in
+	// three key spaces — health and admission share a target key, affinity and
+	// sessionAges share a tenant-and-conversation key — so two records would say
+	// what four maps now do. The merge waits on per-field expiry: affinity
+	// releases at its idle TTL while a session's rank outlives it, and a swept
+	// health entry must not strand a queue's waiters.
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
@@ -255,6 +261,13 @@ type server struct {
 	// reorders candidates pickTarget would accept, and expires once idle. The
 	// token groups the records so a tenant's can be dropped with it.
 	affinity map[string]map[string]lastServed
+	// sessionAges records when each tenant's conversations were first seen —
+	// a session's admission rank — taken at the first turn, so ordering
+	// engages before any history exists to stay coherent with.
+	sessionAges map[string]map[string]time.Time
+	// admission holds each target's session-ordered admission queue, keyed by
+	// the same availability key (canonical url + key + model) the walk uses.
+	admission map[string]*targetQueue
 	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
 	// identity, bounding concurrent in-flight requests to each account.
 	upstreamLimiters map[string]*upstreamLimiter
@@ -302,6 +315,9 @@ func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
 		}
 		ready := l.ready
 		l.mu.Unlock()
+		// TODO(TODO.d/session-ordered-admission.md): waiters here are woken in
+		// release order, not session order, so a freed slot can still go to a
+		// younger session's request.
 		select {
 		case <-ready:
 			waited = true
@@ -528,6 +544,8 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		fdLimitReader:            readFDSoftLimit,
 		health:                   make(map[string]targetHealth),
 		affinity:                 make(map[string]map[string]lastServed),
+		sessionAges:              make(map[string]map[string]time.Time),
+		admission:                make(map[string]*targetQueue),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}
 	for _, opt := range opts {
@@ -2028,6 +2046,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	// One pointer suffices because the retry loop holds at most one slot at a time;
 	// re-panicking leaves rendering to recoverPanic.
 	var heldSlot *upstreamLimiter
+	var heldPlace *pending
 	releaseHeld := func() {
 		if heldSlot != nil {
 			heldSlot.release()
@@ -2037,6 +2056,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	defer func() {
 		if v := recover(); v != nil {
 			releaseHeld()
+			if heldPlace != nil {
+				heldPlace.queue.finish(heldPlace)
+			}
 			panic(v)
 		}
 	}()
@@ -2219,24 +2241,93 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
-		waited, err := lim.acquire(ctx)
+
+		// Session-ordered admission sits ahead of the slot: a request held by
+		// the queue takes no slot, and only a released one competes for one.
+		// Uncontended, nothing queues and a request passes straight through.
+		queue := s.admissionQueue(healthKey(chosen, backend.Backends))
+		pend, err := queue.enter(ctx, cancel, s.sessionAge(convTenant, convKey))
 		if err != nil {
+			cancel(nil)
+			return fmt.Errorf("held in the admission queue: %w", err)
+		}
+		heldPlace = pend
+
+		// The resend replays the same bytes to the same target when the queue
+		// displaces an attempt: the pick is settled, so the reader is rebuilt
+		// without re-walking the candidates.
+		resend := func() (io.Reader, error) {
+			b, rerr := rewriteModel(io.NopCloser(bytes.NewReader(bodyBytes)), func(string) (string, error) {
+				return upstreamModel, nil
+			})
+			if rerr != nil {
+				return nil, rerr
+			}
+			for key, values := range chosen.query {
+				if len(values) == 0 {
+					continue
+				}
+				if b, rerr = setOverride(b, key, overrideJSON(values[0])); rerr != nil {
+					return nil, rerr
+				}
+			}
+			return b, nil
+		}
+
+		// The send, retried wherever the queue displaces it. A displaced
+		// attempt is not a failure — the target is healthy and the client
+		// still waiting — so it records and shrinks nothing; it waits for the
+		// queue's release and sends the same bytes again.
+		var resp *http.Response
+		var waited, acquired bool
+		// Per attempt: a re-sent attempt restamps sent, and only the attempt
+		// that reaches the relay below reads it, so neither a displaced nor a
+		// failed failover attempt sets the record's timing.
+		var sent time.Time
+		for {
+			var sendErr error
+			waited, sendErr = lim.acquire(ctx)
+			acquired = sendErr == nil
+			if acquired {
+				heldSlot = lim
+				// The session header reaches Zen, so the bearer token never appears
+				// in it directly: it HMACs the conversation key instead.
+				mac := hmac.New(sha256.New, []byte(convTenant))
+				_, _ = mac.Write([]byte(convKey))
+				if s.httpClient != nil {
+					sel.cfg.HTTPClient = s.httpClient
+				}
+				sent = time.Now()
+				resp, sendErr = sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
+			}
+			if !queue.attemptEnded(pend, sendErr) {
+				err = sendErr
+				break
+			}
+			// TODO(TODO.d/session-ordered-admission.md): removing a held
+			// request whose client left goes no further than dropping it from
+			// the line here; the queue does not yet release around a departed
+			// head.
+			if resp != nil {
+				_ = resp.Body.Close()
+				resp = nil
+			}
+			releaseHeld()
+			cancel(nil)
+			if holdErr := queue.await(r.Context(), pend); holdErr != nil {
+				return fmt.Errorf("held in the admission queue: %w", holdErr)
+			}
+			ctx, cancel = context.WithCancelCause(r.Context())
+			queue.rearm(pend, cancel)
+			if body, err = resend(); err != nil {
+				cancel(nil)
+				return badRequest(fmt.Errorf("malformed request body: %w", err))
+			}
+		}
+		if err != nil && !acquired {
 			cancel(nil)
 			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
 		}
-		heldSlot = lim
-
-		// The session header reaches Zen, so the bearer token never appears
-		// in it directly: it HMACs the conversation key instead.
-		mac := hmac.New(sha256.New, []byte(convTenant))
-		_, _ = mac.Write([]byte(convKey))
-		if s.httpClient != nil {
-			sel.cfg.HTTPClient = s.httpClient
-		}
-		// Per attempt: only the attempt that reaches the relay below reads
-		// sent, so a failed failover attempt never sets the record's timing.
-		sent := time.Now()
-		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in
@@ -2246,6 +2337,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// understudy invents — but the base is scaled so jitter's floor still
 		// clears rateLimitDemotionThreshold, or a scattered draw could flip its
 		// own classification to transientRate and silently stop demoting.
+		// TODO(TODO.d/session-ordered-admission.md): a busy refusal should also
+		// link the server's models into one admission ranking, so a model swap
+		// waits for the loaded model's requests rather than being refused; only
+		// the demotion normalization is built.
 		if errors.Is(err, providers.ErrServerBusy) {
 			base := time.Duration(float64(rateLimitDemotionThreshold) / (1 - s.jitterFactor))
 			err = retryAfterError{
@@ -2253,6 +2348,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				at:    time.Now().Add(jitteredInterval(base, s.jitterFactor)),
 			}
 		}
+		// TODO(TODO.d/session-ordered-admission.md): a 429 on a request the
+		// admission queue holds re-queues it at its rank rather than taking
+		// this ladder; not built.
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen
@@ -2334,6 +2432,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if s.interceptor != nil {
 			if err := s.interceptor(r.Context(), RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}, resp); err != nil {
 				_ = resp.Body.Close()
+				queue.finish(pend)
 				releaseHeld()
 				cancel(nil)
 				return err
@@ -2341,16 +2440,21 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			resp.Header.Del("Content-Length")
 		}
 
+		// TODO(TODO.d/session-ordered-admission.md): the consumer's time limit
+		// withholds the upstream's status and headers until the first content;
+		// this cycle commits them as the upstream sends them.
 		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
 		_, err = io.Copy(w, &confirmingReader{
 			r: relay,
 			content: func() {
+				queue.confirm(pend)
 				setLogTimeToFirstContent(r.Context(), time.Since(sent))
 			},
 		})
 		_ = resp.Body.Close()
+		queue.finish(pend)
 		releaseHeld()
 		cancel(nil)
 		return err

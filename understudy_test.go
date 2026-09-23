@@ -5452,6 +5452,208 @@ func TestChatCompletionsConcurrencyLimit(t *testing.T) {
 	})
 }
 
+func TestShouldServeAnOlderSessionsTurnBeforeAYoungerSessionWaitingOnTheSameTarget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// The doubled backend is a one-decode-slot model server: it serves one
+		// request at a time, admits waiting requests in the order they reached
+		// it, and answers nothing — status, header, or body — until it starts
+		// serving a request. A canceled generation still occupies its slot to
+		// the end; the server offers no finer-grained interruption than that.
+		const longGeneration = 3 * time.Minute
+		var mu sync.Mutex
+		serving := false
+		var waiters []chan struct{}
+
+		acquireSlot := func(ctx context.Context) error {
+			mu.Lock()
+			if !serving {
+				serving = true
+				mu.Unlock()
+				return nil
+			}
+			ch := make(chan struct{})
+			waiters = append(waiters, ch)
+			mu.Unlock()
+			select {
+			case <-ch:
+				return nil
+			case <-ctx.Done():
+				mu.Lock()
+				waiters = slices.DeleteFunc(waiters, func(c chan struct{}) bool { return c == ch })
+				mu.Unlock()
+				return ctx.Err()
+			}
+		}
+		releaseSlot := func() {
+			mu.Lock()
+			if len(waiters) > 0 {
+				close(waiters[0])
+				waiters = waiters[1:]
+			} else {
+				serving = false
+			}
+			mu.Unlock()
+		}
+
+		type chatTurn struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		client := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				return nil, err
+			}
+			var chat struct {
+				Messages []chatTurn `json:"messages"`
+			}
+			if err := json.Unmarshal(body, &chat); err != nil {
+				t.Errorf("unparsable chat body %q: %v", body, err)
+				return nil, err
+			}
+			if len(chat.Messages) == 0 {
+				t.Errorf("chat body %q carries no messages", body)
+				return nil, errors.New("chat body carries no messages")
+			}
+			// The last message names the request, so a session's second turn
+			// stays distinguishable from its first.
+			who := chat.Messages[len(chat.Messages)-1].Content
+			if err := acquireSlot(r.Context()); err != nil {
+				return nil, err
+			}
+			if strings.Contains(who, "session D") {
+				timer := time.NewTimer(longGeneration)
+				select {
+				case <-r.Context().Done():
+					<-timer.C
+					releaseSlot()
+					return nil, r.Context().Err()
+				case <-timer.C:
+				}
+			}
+			releaseSlot()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":%q}`, who))),
+			}, nil
+		})
+
+		srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+		}})
+		srv.logger = testLogger(t)
+
+		const (
+			sysA  = "answer in one word"
+			askA  = "session A asks"
+			askD  = "session D asks"
+			askB  = "session B asks"
+			askA2 = "session A asks again"
+		)
+		msg := func(role, content string) string {
+			return fmt.Sprintf(`{"role":%q,"content":%q}`, role, content)
+		}
+		turn := func(messages ...string) string {
+			return fmt.Sprintf(`{"model":"openai/gpt-4","messages":[%s]}`, strings.Join(messages, ","))
+		}
+
+		type answer struct {
+			label string
+			code  int
+			body  string
+		}
+		answers := make(chan answer, 4)
+		var orderMu sync.Mutex
+		var answered []string
+		post := func(label, body string) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			orderMu.Lock()
+			answered = append(answered, label)
+			orderMu.Unlock()
+			answers <- answer{label: label, code: rec.Code, body: rec.Body.String()}
+		}
+
+		// A's first turn completes, making A's conversation the oldest of the
+		// three; D then takes the target's only slot for a long generation;
+		// B arrives next and waits at the target. Fake time separates the
+		// arrivals so each conversation has a distinct age.
+		go post("A-first", turn(msg("system", sysA), msg("user", askA)))
+		synctest.Wait()
+		time.Sleep(time.Second)
+
+		go post("D-first", turn(msg("user", askD)))
+		synctest.Wait()
+		time.Sleep(time.Second)
+
+		go post("B-first", turn(msg("user", askB)))
+		synctest.Wait()
+		// B waits at the target past the admission grace period before A's
+		// next turn arrives, so displacing it is allowed.
+		time.Sleep(3 * time.Second)
+
+		// A's second turn arrives last of all and still outranks B: it carries
+		// A's original leading messages plus history.
+		go post("A-second", turn(msg("system", sysA), msg("user", askA), msg("assistant", "word"), msg("user", askA2)))
+		synctest.Wait()
+
+		// D's generation ends and the target serves again. The first sleep
+		// spans D's original generation; the second spans the re-send the
+		// queue owes whichever request it displaced.
+		time.Sleep(longGeneration + time.Second)
+		time.Sleep(longGeneration + time.Second)
+		synctest.Wait()
+
+		got := make(map[string]answer, 4)
+		for range 4 {
+			a := <-answers
+			got[a.label] = a
+		}
+		for label, a := range got {
+			if a.code != http.StatusOK {
+				t.Errorf("%s: status %d, want %d", label, a.code, http.StatusOK)
+			}
+		}
+		if b := got["B-first"]; !strings.Contains(b.body, askB) {
+			t.Errorf("B's client received %q; want the backend's successful response naming %q", b.body, askB)
+		}
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		if i, j := slices.Index(answered, "A-second"), slices.Index(answered, "B-first"); i < 0 || j < 0 || i >= j {
+			t.Errorf("turns were answered in order %v; A's second turn should be answered before B's first", answered)
+		}
+	})
+}
+
+// TODO(TODO.d/session-ordered-admission.md): a streamed target confirms on its
+// first data: event, not on the keep-alive comments before it — the queue's
+// next waiter stays held while a backend answers only comments. The case above
+// confirms through a non-streamed body, so the SSE half of that rule is unpinned.
+
+// TODO(TODO.d/session-ordered-admission.md): a target that mislabels a streamed
+// body (an SSE stream under a non-SSE Content-Type) must not confirm on its
+// leading `: keep-alive` line, which the non-streamed scan reads as content.
+// The same content boundary serves [[stall-before-first-content-event]], so one
+// detector should answer both.
+
+// TODO(TODO.d/session-ordered-admission.md): a response that arrives after its
+// attempt was displaced is discarded, and the client receives the re-sent
+// attempt's response instead — one successful answer, not the raced one. Driving
+// it needs a target that answers despite the preemption cancel.
+
+// TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on the
+// consumer's session-end signal, and a session idle past the backstop ranks as
+// new — until both land, sessionAges grows one entry per conversation forever.
+
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex

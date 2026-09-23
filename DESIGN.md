@@ -734,10 +734,11 @@ gate it, both staged:
   invariant leading messages (system + first user turn), which is also exactly
   what prompt-cache coherence keys on, mixed with the bearer token so one
   tenant's affinity cannot steer another's routing in the shared daemon. The
-  token groups the affinity map raw, unhashed: it already sits in memory via
-  the request's Authorization header for the life of the request, so
-  hashing this one map key would add per-request cost without reducing what a
-  memory inspection could recover.
+  token groups a tenant's state raw, unhashed: it arrives in memory with every
+  request's Authorization header, and a process holding live upstream
+  credentials is already the thing a memory inspection reads, so hashing it
+  here would add per-request cost without reducing what such an inspection
+  recovers.
 
   **Affinity engages only on a request carrying a prior assistant turn.** A first
   turn has nothing to stay coherent with, so it takes the walk as ordered — which
