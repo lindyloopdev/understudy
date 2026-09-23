@@ -122,9 +122,6 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// given — and takes its place in line by rank. A headered request is never
 	// displaced: a header means the backend has admitted it, and the wire
 	// cannot tell queueing from prefill.
-	// TODO(TODO.d/session-ordered-admission.md): the other event that forms a
-	// queue — a request waiting past its grace period with no higher-ranked
-	// arrival — is not built; an outranking arrival is the only trigger.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) || !o.rank.After(rank) {
 			continue
@@ -152,8 +149,63 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 		}
 	}
 	q.outstanding = append(q.outstanding, p)
+	// The wait itself can form the queue: p headerless past its grace period
+	// with no higher-ranked arrival. p is that request only when it arrived
+	// beside one, so only then is its timer armed.
+	for _, o := range q.outstanding {
+		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
+			continue
+		}
+		time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
+		break
+	}
 	q.mu.Unlock()
 	return p, nil
+}
+
+// formByWaiting forms the queue: p has waited past its grace period headerless
+// with no higher-ranked arrival, so the wait itself is the evidence of
+// contention. Every outstanding headerless request past its grace period is
+// canceled and queued by rank — canceling costs nothing, since no header
+// means no work was given — except the highest-ranked unconfirmed one, which
+// stays outstanding as the probe: the queue releases its next head only when
+// nothing unconfirmed is at the backend. If that unconfirmed request is
+// headered, the probe is queued too: preemption never takes a headered
+// request, so it already holds the slot the probe would wait for.
+func (q *targetQueue) formByWaiting(p *pending) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if p.headered || p.preempted || !slices.Contains(q.outstanding, p) {
+		return
+	}
+	now := time.Now()
+	var probe *pending
+	probeHeld := false
+	for _, o := range q.outstanding {
+		if o.confirmed || o.preempted {
+			continue
+		}
+		if probe == nil || o.rank.Before(probe.rank) {
+			probe = o
+		}
+		if o.headered {
+			probeHeld = true
+		}
+	}
+	for _, o := range q.outstanding {
+		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
+			continue
+		}
+		// TODO(TODO.d/session-ordered-admission.md): no case yet stages a
+		// headered unconfirmed request ranked below a headerless one when the
+		// wait forms the queue, so the probe-held arm is unexercised.
+		if o == probe && !probeHeld {
+			continue
+		}
+		o.preempted = true
+		q.insert(o)
+		o.cancel(errPreempted)
+	}
 }
 
 // attemptEnded records the attempt's upstream call ending: err is nil when the

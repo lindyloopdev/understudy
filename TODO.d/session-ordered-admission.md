@@ -27,10 +27,10 @@ limiter. The steps below remain, in order.
   `sessionAges` holds one entry per conversation ever seen — a stale entry is
   reset rather than dropped.
   - Tests: a session ended by the consumer returns ranked as new.
-- **The queue's second trigger.** A request that waits past the grace period
-  with no header and no higher-ranked arrival also forms the queue: cancel and
-  queue every headerless request except the highest-ranked unconfirmed one,
-  and that one too if another request is already unconfirmed.
+- **Test the probe-held arm of the waiting trigger.** No case stages a
+  headered unconfirmed request ranked below a headerless one when the wait
+  forms the queue, so the arm that queues the probe because preemption never
+  takes a headered request is unexercised.
 - **Withhold status and headers until the first content.** The relay commits
   the upstream's status and headers as they arrive; hold them until the
   confirmation read-ahead (past SSE comments and leading JSON whitespace)

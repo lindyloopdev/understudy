@@ -5579,6 +5579,15 @@ const (
 	admissionLongGeneration = 3 * time.Minute
 )
 
+// The waiting-trigger case's two later sessions: the older one outranks the
+// younger, and the younger reaches the target first, so the backend's own
+// order and the session order disagree.
+const (
+	admissionAskOlder      = "the older session asks"
+	admissionAskOlderAgain = "the older session asks again"
+	admissionAskYounger    = "the younger session asks"
+)
+
 // admissionTarget doubles a model server with a single decode slot: it serves
 // one request at a time, admits waiters in the order they reached it, and
 // answers nothing — status, header, or body — until it starts serving one.
@@ -5965,6 +5974,95 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 		}
 	})
 }
+
+func TestShouldServeTheOlderSessionsTurnFirstWhenWaitingFormsTheQueue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		target := &admissionTarget{}
+		// The two later turns are generations too: whichever one holds the
+		// target's slot holds it to the end of its own generation, so the
+		// order the target hands the slot over in is the order the turns
+		// finish in.
+		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
+			if ask != admissionAskYounger && ask != admissionAskOlderAgain {
+				if err := target.serve(r.Context(), ask); err != nil {
+					return nil, err
+				}
+				return admissionJSON(ask), nil
+			}
+			if err := target.acquire(r.Context()); err != nil {
+				return nil, err
+			}
+			defer target.release()
+			timer := time.NewTimer(admissionLongGeneration)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				<-timer.C
+				return nil, r.Context().Err()
+			case <-timer.C:
+			}
+			return admissionJSON(ask), nil
+		})
+		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+
+		// The oldest session of all holds the target's only decode slot for a
+		// long generation throughout, so it stays the one unconfirmed request
+		// at the backend.
+		go poster.post(t.Context(), "D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+		synctest.Wait()
+		time.Sleep(time.Second)
+
+		// The older of the two later sessions fixes its rank with a first turn
+		// whose client then goes away, so it leaves nothing at the target.
+		oCtx, olderClientGoesAway := context.WithCancel(t.Context())
+		go poster.post(oCtx, "older-first", admissionTurn(admissionMsg("user", admissionAskOlder)))
+		synctest.Wait()
+		olderClientGoesAway()
+		synctest.Wait()
+		time.Sleep(time.Second)
+
+		// The younger session's turn reaches the target first, and the older
+		// session's second turn follows within the younger's grace period, so
+		// the arrival outranks nothing past its grace period and forms no
+		// queue. Nothing arrives after them: only the waiting itself can form
+		// one.
+		go poster.post(t.Context(), "younger-first", admissionTurn(admissionMsg("user", admissionAskYounger)))
+		synctest.Wait()
+		time.Sleep(time.Second)
+		go poster.post(t.Context(), "older-second", admissionTurn(
+			admissionMsg("user", admissionAskOlder),
+			admissionMsg("assistant", "word"),
+			admissionMsg("user", admissionAskOlderAgain),
+		))
+		synctest.Wait()
+
+		// D's generation ends and the target serves the later turns one
+		// generation at a time. Each sleep spans one: D's original, then the
+		// two the target spends on the later turns, in whatever order it
+		// settled on.
+		time.Sleep(admissionLongGeneration + time.Second)
+		time.Sleep(admissionLongGeneration + time.Second)
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+
+		poster.answeredOK("D-first", "older-second", "younger-first")
+		if order, ok := poster.answeredBefore("older-second", "younger-first"); !ok {
+			t.Errorf("turns were answered in order %v; the older session's turn should be answered before the younger one, although the younger reached the target first", order)
+		}
+	})
+}
+
+// TODO(TODO.d/session-ordered-admission.md): the turn already being served
+// should be answered from the attempt that was already running, once, when the
+// wait forms the queue around it. Nothing pins that here: dropping the headered
+// check from the formation sweep leaves the whole suite green, so the one path
+// that could kill a live generation is unfenced.
+
+// TODO(TODO.d/session-ordered-admission.md): a turn that arrived within the
+// grace period should be answered from its first attempt when the wait forms
+// the queue, rather than canceled and re-sent for a generation it has not yet
+// had time to lose. Dropping the grace check from the formation sweep leaves
+// the whole suite green.
 
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
