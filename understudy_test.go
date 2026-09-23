@@ -5634,25 +5634,365 @@ func TestShouldServeAnOlderSessionsTurnBeforeAYoungerSessionWaitingOnTheSameTarg
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): a streamed target confirms on its
-// first data: event, not on the keep-alive comments before it — the queue's
-// next waiter stays held while a backend answers only comments. The case above
-// confirms through a non-streamed body, so the SSE half of that rule is unpinned.
-
 // TODO(TODO.d/session-ordered-admission.md): a target that mislabels a streamed
 // body (an SSE stream under a non-SSE Content-Type) must not confirm on its
 // leading `: keep-alive` line, which the non-streamed scan reads as content.
 // The same content boundary serves [[stall-before-first-content-event]], so one
 // detector should answer both.
 
-// TODO(TODO.d/session-ordered-admission.md): a response that arrives after its
-// attempt was displaced is discarded, and the client receives the re-sent
-// attempt's response instead — one successful answer, not the raced one. Driving
-// it needs a target that answers despite the preemption cancel.
-
 // TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on the
 // consumer's session-end signal, and a session idle past the backstop ranks as
 // new — until both land, sessionAges grows one entry per conversation forever.
+
+// Session ranks the admission cases depend on: D is the oldest and holds the
+// target's only slot for a generation, A outranks B, and B asks before A's
+// second turn.
+const (
+	admissionAskD           = "session D asks"
+	admissionAskB           = "session B asks"
+	admissionAskA2          = "session A asks again"
+	admissionLongGeneration = 3 * time.Minute
+)
+
+// admissionTarget doubles a model server with a single decode slot: it serves
+// one request at a time, admits waiters in the order they reached it, and
+// answers nothing — status, header, or body — until it starts serving one.
+type admissionTarget struct {
+	mu      sync.Mutex
+	serving bool
+	waiters []chan struct{}
+}
+
+func (a *admissionTarget) acquire(ctx context.Context) error {
+	a.mu.Lock()
+	if !a.serving {
+		a.serving = true
+		a.mu.Unlock()
+		return nil
+	}
+	ch := make(chan struct{})
+	a.waiters = append(a.waiters, ch)
+	a.mu.Unlock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		a.mu.Lock()
+		a.waiters = slices.DeleteFunc(a.waiters, func(c chan struct{}) bool { return c == ch })
+		a.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (a *admissionTarget) release() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.waiters) > 0 {
+		close(a.waiters[0])
+		a.waiters = a.waiters[1:]
+		return
+	}
+	a.serving = false
+}
+
+// serve runs one request through the target's slot, holding it for
+// [admissionLongGeneration] when ask is D's. A canceled generation still
+// occupies the slot to the end: the target offers no finer-grained
+// interruption than that.
+func (a *admissionTarget) serve(ctx context.Context, ask string) error {
+	if err := a.acquire(ctx); err != nil {
+		return err
+	}
+	defer a.release()
+	if ask != admissionAskD {
+		return nil
+	}
+	timer := time.NewTimer(admissionLongGeneration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		<-timer.C
+		return ctx.Err()
+	case <-timer.C:
+	}
+	return nil
+}
+
+// admissionMessage is one chat message in a request body.
+type admissionMessage struct {
+	Content string `json:"content"`
+}
+
+func admissionMsg(role, content string) string {
+	return fmt.Sprintf(`{"role":%q,"content":%q}`, role, content)
+}
+
+func admissionTurn(messages ...string) string {
+	return fmt.Sprintf(`{"model":"openai/gpt-4","messages":[%s]}`, strings.Join(messages, ","))
+}
+
+// admissionAsk reports a request's last message, which names the request for a
+// doubled target: a session's second turn stays distinguishable from its
+// first.
+func admissionAsk(t *testing.T, r *http.Request) string {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Error(err)
+		return ""
+	}
+	var chat struct {
+		Messages []admissionMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &chat); err != nil {
+		t.Errorf("unparsable chat body %q: %v", body, err)
+		return ""
+	}
+	if len(chat.Messages) == 0 {
+		t.Errorf("chat body %q carries no messages", body)
+		return ""
+	}
+	return chat.Messages[len(chat.Messages)-1].Content
+}
+
+func admissionJSON(id string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":%q}`, id))),
+	}
+}
+
+// admissionClient hands each request to handle along with the ask that names
+// it. A nil handle serves every request through the slot and answers with the
+// ask's own name.
+func admissionClient(t *testing.T, target *admissionTarget, handle func(r *http.Request, ask string) (*http.Response, error)) *http.Client {
+	if handle == nil {
+		handle = func(r *http.Request, ask string) (*http.Response, error) {
+			if err := target.serve(r.Context(), ask); err != nil {
+				return nil, err
+			}
+			return admissionJSON(ask), nil
+		}
+	}
+	return testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
+		return handle(r, admissionAsk(t, r))
+	})
+}
+
+// newAdmissionServer builds the server an admission case drives: one backend,
+// reached through client.
+func newAdmissionServer(t *testing.T, client *http.Client) *server {
+	t.Helper()
+	srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+	}})
+	srv.logger = testLogger(t)
+	return srv
+}
+
+// admissionPoster posts chat turns at a server and keeps each answer under its
+// label, so a case can ask whether a request has been answered yet.
+type admissionPoster struct {
+	t       *testing.T
+	srv     http.Handler
+	mu      sync.Mutex
+	answers map[string]*httptest.ResponseRecorder
+}
+
+func newAdmissionPoster(t *testing.T, srv http.Handler) *admissionPoster {
+	return &admissionPoster{t: t, srv: srv, answers: map[string]*httptest.ResponseRecorder{}}
+}
+
+func (p *admissionPoster) post(ctx context.Context, label, body string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		p.t.Error(err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer user-token")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	p.srv.ServeHTTP(rec, req)
+	p.mu.Lock()
+	p.answers[label] = rec
+	p.mu.Unlock()
+}
+
+func (p *admissionPoster) answered(label string) (*httptest.ResponseRecorder, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rec, ok := p.answers[label]
+	return rec, ok
+}
+
+// admissionQueueFormed posts the turns that leave B queued behind A's second
+// turn: D takes the target's only slot, A's first turn fixes A's age, B waits
+// at the target past the grace period with no header, and A's second turn
+// outranks it and displaces it. D asks first so it outranks A: an arrival
+// displaces every headerless request ranked below it, and a displaced D
+// generation would re-run ahead of B. B posts under bCtx so a case can take
+// its client away while it waits.
+func admissionQueueFormed(ctx, bCtx context.Context, p *admissionPoster) {
+	// A's second turn repeats its first turn's messages, which fix A's rank,
+	// so only this function needs them by name.
+	const (
+		sysA = "answer in one word"
+		askA = "session A asks"
+	)
+
+	go p.post(ctx, "D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+	synctest.Wait()
+	time.Sleep(time.Second)
+
+	go p.post(ctx, "A-first", admissionTurn(admissionMsg("system", sysA), admissionMsg("user", askA)))
+	synctest.Wait()
+	time.Sleep(time.Second)
+
+	go p.post(bCtx, "B-first", admissionTurn(admissionMsg("user", admissionAskB)))
+	synctest.Wait()
+	time.Sleep(3 * time.Second)
+
+	go p.post(ctx, "A-second", admissionTurn(
+		admissionMsg("system", sysA),
+		admissionMsg("user", askA),
+		admissionMsg("assistant", "word"),
+		admissionMsg("user", admissionAskA2),
+	))
+	synctest.Wait()
+}
+
+func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		target := &admissionTarget{}
+		// dataGate keeps A's second turn answering comments until the case
+		// lets its first data: event through.
+		dataGate := make(chan struct{})
+
+		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
+			if err := target.serve(r.Context(), ask); err != nil {
+				return nil, err
+			}
+			if ask != admissionAskA2 {
+				return admissionJSON(ask), nil
+			}
+			stage := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					switch stage {
+					case 0:
+						stage++
+						return copy(p, ": keep-alive\n\n"), nil
+					case 1:
+						<-dataGate
+						stage++
+						return copy(p, "data: {\"id\":\"a-second\"}\n\n"), nil
+					}
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+
+		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+		admissionQueueFormed(t.Context(), t.Context(), poster)
+
+		// D's generation ends, so A's second turn starts streaming comments.
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+		if _, ok := poster.answered("B-first"); ok {
+			t.Error("B was answered while A's stream carried only keep-alive comments; a comment is not content, so the queue holds its next waiter")
+		}
+
+		close(dataGate)
+		synctest.Wait()
+		if _, ok := poster.answered("B-first"); !ok {
+			t.Error("B was still held after A's stream reached its first data: event, which confirms the attempt and frees the queue")
+		}
+	})
+}
+
+func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			raced  = "B raced answer"
+			resent = "B resent answer"
+		)
+		target := &admissionTarget{}
+		var mu sync.Mutex
+		attempts := 0
+
+		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
+			if ask != admissionAskB {
+				if err := target.serve(r.Context(), ask); err != nil {
+					return nil, err
+				}
+				return admissionJSON(ask), nil
+			}
+			mu.Lock()
+			attempts++
+			attempt := attempts
+			mu.Unlock()
+			if attempt == 1 {
+				// The displaced attempt answers anyway: its cancel lands as the
+				// target is already returning a response.
+				<-r.Context().Done()
+				return admissionJSON(raced), nil
+			}
+			if err := target.serve(r.Context(), ask); err != nil {
+				return nil, err
+			}
+			return admissionJSON(resent), nil
+		})
+
+		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+		admissionQueueFormed(t.Context(), t.Context(), poster)
+
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+
+		rec, ok := poster.answered("B-first")
+		if !ok {
+			t.Fatal("B never received an answer")
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("B's client got status %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Body.String(); !strings.Contains(got, resent) || strings.Contains(got, raced) {
+			t.Errorf("B's client received %q; want the re-sent attempt's answer, not the response that raced its displacement", got)
+		}
+	})
+}
+
+func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		target := &admissionTarget{}
+
+		poster := newAdmissionPoster(t, newAdmissionServer(t, admissionClient(t, target, nil)))
+		bCtx, clientGoesAway := context.WithCancel(t.Context())
+		admissionQueueFormed(t.Context(), bCtx, poster)
+
+		clientGoesAway()
+		synctest.Wait()
+
+		rec, ok := poster.answered("B-first")
+		if !ok {
+			t.Fatal("B's request was still held after its client went away; a held request does not outlive the client waiting for it")
+		}
+		if rec.Code == http.StatusOK {
+			t.Errorf("B's client got status %d after going away; want an error", rec.Code)
+		}
+
+		// A departed client leaves the queue intact for the requests it held
+		// up.
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+		if _, ok := poster.answered("A-second"); !ok {
+			t.Error("A's second turn never completed after the held request's client left")
+		}
+	})
+}
 
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
