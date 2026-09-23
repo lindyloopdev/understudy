@@ -5634,12 +5634,6 @@ func TestShouldServeAnOlderSessionsTurnBeforeAYoungerSessionWaitingOnTheSameTarg
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): a target that mislabels a streamed
-// body (an SSE stream under a non-SSE Content-Type) must not confirm on its
-// leading `: keep-alive` line, which the non-streamed scan reads as content.
-// The same content boundary serves [[stall-before-first-content-event]], so one
-// detector should answer both.
-
 // TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on the
 // consumer's session-end signal, and a session idle past the backstop ranks as
 // new — until both land, sessionAges grows one entry per conversation forever.
@@ -5862,6 +5856,11 @@ func admissionQueueFormed(ctx, bCtx context.Context, p *admissionPoster) {
 	synctest.Wait()
 }
 
+// TODO(TODO.d/session-ordered-admission.md): a stream opening with a framing
+// line that is not a comment — `event: ping`, `id: 1` — confirms on that
+// line's first byte, because only a leading `:` marks the body a stream. The
+// case belongs beside the one below, as a second opening the target can send.
+
 func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		target := &admissionTarget{}
@@ -5879,7 +5878,9 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 			stage := 0
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				// Mislabeled on purpose: the body's own bytes, not the
+				// Content-Type, decide what counts as content.
+				Header: http.Header{"Content-Type": {"application/json"}},
 				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
 					switch stage {
 					case 0:
@@ -5902,7 +5903,7 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 		time.Sleep(admissionLongGeneration + time.Second)
 		synctest.Wait()
 		if _, ok := poster.answered("B-first"); ok {
-			t.Error("B was answered while A's stream carried only keep-alive comments; a comment is not content, so the queue holds its next waiter")
+			t.Error("B was answered while A's stream carried only keep-alive comments; a comment is not content whatever the Content-Type claims, so the queue holds its next waiter")
 		}
 
 		close(dataGate)
