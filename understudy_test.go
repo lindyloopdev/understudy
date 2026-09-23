@@ -5856,61 +5856,72 @@ func admissionQueueFormed(ctx, bCtx context.Context, p *admissionPoster) {
 	synctest.Wait()
 }
 
-// TODO(TODO.d/session-ordered-admission.md): a stream opening with a framing
-// line that is not a comment — `event: ping`, `id: 1` — confirms on that
-// line's first byte, because only a leading `:` marks the body a stream. The
-// case belongs beside the one below, as a second opening the target can send.
-
 func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		target := &admissionTarget{}
-		// dataGate keeps A's second turn answering comments until the case
-		// lets its first data: event through.
-		dataGate := make(chan struct{})
+	type test struct {
+		// opening is the stream's first framing line.
+		opening string
+	}
 
-		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
-			if err := target.serve(r.Context(), ask); err != nil {
-				return nil, err
+	tests := testy.NewTable[test]()
+
+	tests.Add("should hold the next waiter while the stream opens with a keep-alive comment", test{
+		opening: ": keep-alive\n\n",
+	})
+	tests.Add("should hold the next waiter while the stream opens with an event framing line", test{
+		opening: "event: ping\n\n",
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			target := &admissionTarget{}
+			// dataGate holds the first data: event back until the test lets
+			// it through.
+			dataGate := make(chan struct{})
+
+			client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
+				if err := target.serve(r.Context(), ask); err != nil {
+					return nil, err
+				}
+				if ask != admissionAskA2 {
+					return admissionJSON(ask), nil
+				}
+				stage := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					// Mislabeled on purpose: the body's own bytes, not the
+					// Content-Type, decide what counts as content.
+					Header: http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						switch stage {
+						case 0:
+							stage++
+							return copy(p, tt.opening), nil
+						case 1:
+							<-dataGate
+							stage++
+							return copy(p, "data: {\"id\":\"a-second\"}\n\n"), nil
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			})
+
+			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+			admissionQueueFormed(t.Context(), t.Context(), poster)
+
+			// D's generation ends, so A's second turn begins streaming.
+			time.Sleep(admissionLongGeneration + time.Second)
+			synctest.Wait()
+			if _, ok := poster.answered("B-first"); ok {
+				t.Errorf("B was answered while A's stream had sent only %q; a framing line is not content whatever the Content-Type claims, so the queue holds its next waiter", strings.TrimSpace(tt.opening))
 			}
-			if ask != admissionAskA2 {
-				return admissionJSON(ask), nil
+
+			close(dataGate)
+			synctest.Wait()
+			if _, ok := poster.answered("B-first"); !ok {
+				t.Error("B was still held after A's stream reached its first data: event, which confirms the attempt and frees the queue")
 			}
-			stage := 0
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				// Mislabeled on purpose: the body's own bytes, not the
-				// Content-Type, decide what counts as content.
-				Header: http.Header{"Content-Type": {"application/json"}},
-				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-					switch stage {
-					case 0:
-						stage++
-						return copy(p, ": keep-alive\n\n"), nil
-					case 1:
-						<-dataGate
-						stage++
-						return copy(p, "data: {\"id\":\"a-second\"}\n\n"), nil
-					}
-					return 0, io.EOF
-				})),
-			}, nil
 		})
-
-		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-		admissionQueueFormed(t.Context(), t.Context(), poster)
-
-		// D's generation ends, so A's second turn starts streaming comments.
-		time.Sleep(admissionLongGeneration + time.Second)
-		synctest.Wait()
-		if _, ok := poster.answered("B-first"); ok {
-			t.Error("B was answered while A's stream carried only keep-alive comments; a comment is not content whatever the Content-Type claims, so the queue holds its next waiter")
-		}
-
-		close(dataGate)
-		synctest.Wait()
-		if _, ok := poster.answered("B-first"); !ok {
-			t.Error("B was still held after A's stream reached its first data: event, which confirms the attempt and frees the queue")
-		}
 	})
 }
 
