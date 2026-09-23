@@ -20,15 +20,31 @@ const admissionGracePeriod = 2 * time.Second
 // it is recorded.
 var errPreempted = errors.New("displaced for an older session")
 
+// sessionForgetAfter is how long a conversation may go with no request before
+// its age is forgotten and it ranks as new again, so a session that keeps
+// taking turns — however old — is never outranked by one that has been away
+// longer. A backstop for consumers that send no session-end signal.
+const sessionForgetAfter = 24 * time.Hour
+
+// sessionRecord is a conversation's standing in admission: firstSeen is its
+// rank, and lastSeen is when it last took a turn, which [sessionForgetAfter]
+// is measured from.
+type sessionRecord struct {
+	firstSeen time.Time
+	lastSeen  time.Time
+}
+
 // sessionAge returns when tenant's conversation was first seen, recording the
-// first sighting. The age is the session's admission rank, so an old session's
-// later turn outranks a younger session's earlier one. A request with no
-// conversation key ranks by its own arrival.
+// first sighting and refreshing the last. The age is the session's admission
+// rank, so an old session's later turn outranks a younger session's earlier
+// one, and the rank holds through quiet stretches shorter than
+// [sessionForgetAfter]. A request with no conversation key ranks by its own
+// arrival.
 //
-// TODO(TODO.d/session-ordered-admission.md): a session's age is never
-// forgotten — the consumer's session-end signal and the day-long backstop are
-// unbuilt — and this record is keyed on caller-supplied content, so it grows
-// unbounded until one of them lands.
+// TODO(TODO.d/session-ordered-admission.md): the consumer's session-end signal
+// is unbuilt, and a stale entry is reset rather than dropped — so this record,
+// keyed on caller-supplied content, still holds one entry per conversation
+// ever seen.
 func (s *server) sessionAge(tenant, key string) time.Time {
 	now := time.Now()
 	if key == "" {
@@ -38,13 +54,14 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 	defer s.mu.Unlock()
 	ages, ok := s.sessionAges[tenant]
 	if !ok {
-		ages = make(map[string]time.Time)
+		ages = make(map[string]sessionRecord)
 		s.sessionAges[tenant] = ages
 	}
-	if first, ok := ages[key]; ok {
-		return first
+	if rec, ok := ages[key]; ok && now.Sub(rec.lastSeen) < sessionForgetAfter {
+		ages[key] = sessionRecord{firstSeen: rec.firstSeen, lastSeen: now}
+		return rec.firstSeen
 	}
-	ages[key] = now
+	ages[key] = sessionRecord{firstSeen: now, lastSeen: now}
 	return now
 }
 

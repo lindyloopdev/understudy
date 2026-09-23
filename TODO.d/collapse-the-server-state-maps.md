@@ -16,11 +16,12 @@ hold two maps each:
 | `health` | `healthKey` (canonical url + key + model) | `targetHealth` |
 | `admission` | `healthKey` — the same key | `*targetQueue` |
 | `affinity` | tenant → conversation key | `lastServed` |
-| `sessionAges` | tenant → conversation key — the same key | first-seen time |
+| `sessionAges` | tenant → conversation key — the same key | first-seen rank and last-seen time |
 | `upstreamLimiters` | `canonicalUpstreamKey` (url + key) | `*upstreamLimiter` |
 
 Two records would say the same thing: one per target holding its health and its
-queue, one per conversation holding its bound target and its first sighting.
+queue, one per conversation holding its bound target and its admission standing
+— the rank it was first seen at, and when it last took a turn.
 
 ## Why it is not a mechanical merge
 
@@ -29,10 +30,14 @@ break one of them:
 
 - **Affinity releases at `affinityIdleTTL` (5m, sized to the provider's prefix
   cache) via `evictIdleAffinity`; a session's rank must outlive it** — kept for
-  the session's life, dropped only on the consumer's end signal or the
-  day-long backstop ([[session-ordered-admission]]). Merging needs per-field
-  expiry: drop the bound target at the idle TTL, keep the first-seen time to the
-  backstop.
+  the session's life, dropped only on the consumer's end signal or once the
+  conversation has gone `sessionForgetAfter` (a day) without a turn
+  ([[session-ordered-admission]]). The two are measured from different
+  instants: affinity expires from when the conversation was last served, the
+  rank from when it last took a turn, and the rank itself is the *first*
+  sighting, which never moves while the session lives. Merging therefore needs
+  per-field expiry: drop the bound target at the idle TTL, and keep the rank
+  until the last-seen time falls that far behind.
 - **`evictStaleHealth` sweeps health, but a `targetQueue` can hold goroutines
   parked on a release.** Evicting a queue with waiters strands them, so the
   sweep must skip a queue that is not empty (or the queue must hold the record

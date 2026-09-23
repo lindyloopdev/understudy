@@ -22,12 +22,11 @@ limiter. The steps below remain, in order.
 
 ## Work
 
-- **Forget a session's age.** Drop a session's `first_seen` on the consumer's
-  session-end signal (new library surface, shared with
-  [[admission-reservation-window]]) or after a backstop of about a day with
-  no request.
-  - Tests: a session returning after a long tool run keeps its rank; a session
-    ended by the consumer, or idle past the backstop, returns ranked as new.
+- **Forget a session's age on the consumer's session-end signal** (new library
+  surface, shared with [[admission-reservation-window]]). Until it lands,
+  `sessionAges` holds one entry per conversation ever seen — a stale entry is
+  reset rather than dropped.
+  - Tests: a session ended by the consumer returns ranked as new.
 - **The queue's second trigger.** A request that waits past the grace period
   with no header and no higher-ranked arrival also forms the queue: cancel and
   queue every headerless request except the highest-ranked unconfirmed one,

@@ -261,10 +261,11 @@ type server struct {
 	// reorders candidates pickTarget would accept, and expires once idle. The
 	// token groups the records so a tenant's can be dropped with it.
 	affinity map[string]map[string]lastServed
-	// sessionAges records when each tenant's conversations were first seen —
-	// a session's admission rank — taken at the first turn, so ordering
+	// sessionAges records, per tenant conversation, when it was first seen —
+	// its admission rank — and when it was last seen, which [sessionForgetAfter]
+	// is measured from. The rank is taken at the first turn, so ordering
 	// engages before any history exists to stay coherent with.
-	sessionAges map[string]map[string]time.Time
+	sessionAges map[string]map[string]sessionRecord
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	admission map[string]*targetQueue
@@ -544,7 +545,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		fdLimitReader:            readFDSoftLimit,
 		health:                   make(map[string]targetHealth),
 		affinity:                 make(map[string]map[string]lastServed),
-		sessionAges:              make(map[string]map[string]time.Time),
+		sessionAges:              make(map[string]map[string]sessionRecord),
 		admission:                make(map[string]*targetQueue),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}

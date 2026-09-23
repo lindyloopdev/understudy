@@ -5452,191 +5452,122 @@ func TestChatCompletionsConcurrencyLimit(t *testing.T) {
 	})
 }
 
-func TestShouldServeAnOlderSessionsTurnBeforeAYoungerSessionWaitingOnTheSameTarget(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		// The doubled backend is a one-decode-slot model server: it serves one
-		// request at a time, admits waiting requests in the order they reached
-		// it, and answers nothing — status, header, or body — until it starts
-		// serving a request. A canceled generation still occupies its slot to
-		// the end; the server offers no finer-grained interruption than that.
-		const longGeneration = 3 * time.Minute
-		var mu sync.Mutex
-		serving := false
-		var waiters []chan struct{}
+// Three sessions share one target: A is the older of the two that contend, B
+// the younger one that keeps taking turns throughout, and D the oldest of all,
+// which holds the target's only decode slot for a generation while the other
+// two queue behind it.
+func TestShouldServeTheHigherRankedSessionsTurnFirstOnAContendedTarget(t *testing.T) {
+	type test struct {
+		// awayFor is how long the older session goes with no turn before
+		// taking its next one; past [sessionForgetAfter] it ranks as new.
+		awayFor time.Duration
+		// first and second label the two contending turns, in the order the
+		// target should answer them.
+		first, second string
+	}
 
-		acquireSlot := func(ctx context.Context) error {
-			mu.Lock()
-			if !serving {
-				serving = true
-				mu.Unlock()
-				return nil
-			}
-			ch := make(chan struct{})
-			waiters = append(waiters, ch)
-			mu.Unlock()
-			select {
-			case <-ch:
-				return nil
-			case <-ctx.Done():
-				mu.Lock()
-				waiters = slices.DeleteFunc(waiters, func(c chan struct{}) bool { return c == ch })
-				mu.Unlock()
-				return ctx.Err()
-			}
-		}
-		releaseSlot := func() {
-			mu.Lock()
-			if len(waiters) > 0 {
-				close(waiters[0])
-				waiters = waiters[1:]
-			} else {
-				serving = false
-			}
-			mu.Unlock()
-		}
+	tests := testy.NewTable[test]()
+	tests.Add("should serve the older session's returning turn first when it was away only briefly", test{
+		awayFor: 3 * time.Second,
+		first:   "A-second", second: "B-next",
+	})
+	tests.Add("should serve the younger session's turn first when the older one was away too long to remember", test{
+		awayFor: 30 * time.Hour,
+		first:   "B-next", second: "A-second",
+	})
 
-		type chatTurn struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		}
-		client := testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Error(err)
-				return nil, err
-			}
-			var chat struct {
-				Messages []chatTurn `json:"messages"`
-			}
-			if err := json.Unmarshal(body, &chat); err != nil {
-				t.Errorf("unparsable chat body %q: %v", body, err)
-				return nil, err
-			}
-			if len(chat.Messages) == 0 {
-				t.Errorf("chat body %q carries no messages", body)
-				return nil, errors.New("chat body carries no messages")
-			}
-			// The last message names the request, so a session's second turn
-			// stays distinguishable from its first.
-			who := chat.Messages[len(chat.Messages)-1].Content
-			if err := acquireSlot(r.Context()); err != nil {
-				return nil, err
-			}
-			if strings.Contains(who, "session D") {
-				timer := time.NewTimer(longGeneration)
-				select {
-				case <-r.Context().Done():
-					<-timer.C
-					releaseSlot()
-					return nil, r.Context().Err()
-				case <-timer.C:
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			const (
+				sysA = "answer in one word"
+				askA = "session A asks"
+				sysB = "answer at length"
+			)
+			bAsks := []string{admissionAskB, "session B asks again", "session B asks a third time", "session B asks a fourth time"}
+
+			// bTurn is B's nth turn, carrying the history that fixes B's rank
+			// at its first.
+			bTurn := func(n int) string {
+				messages := []string{admissionMsg("system", sysB)}
+				for i := range n + 1 {
+					if i > 0 {
+						messages = append(messages, admissionMsg("assistant", "at length"))
+					}
+					messages = append(messages, admissionMsg("user", bAsks[i]))
 				}
+				return admissionTurn(messages...)
 			}
-			releaseSlot()
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": {"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":%q}`, who))),
-			}, nil
+
+			target := &admissionTarget{}
+			poster := newAdmissionPoster(t, newAdmissionServer(t, admissionClient(t, target, nil)))
+			post := func(label, body string) {
+				go poster.post(t.Context(), label, body)
+			}
+
+			// A takes one turn, fixing its rank as the older session; B first
+			// appears a second behind it and then keeps taking turns through
+			// A's absence, each quiet stretch well short of a day, so B is
+			// still remembered when the two contend.
+			post("A-first", admissionTurn(admissionMsg("system", sysA), admissionMsg("user", askA)))
+			synctest.Wait()
+			time.Sleep(time.Second)
+
+			post("B-first", bTurn(0))
+			synctest.Wait()
+
+			for i, label := range []string{"B-second", "B-third"} {
+				time.Sleep(tt.awayFor / 3)
+				post(label, bTurn(i+1))
+				synctest.Wait()
+			}
+			time.Sleep(tt.awayFor / 3)
+
+			// The two sessions now contend: D holds the target's only decode
+			// slot for a long generation, A's returning turn waits there
+			// headerless, and B's next turn arrives last of all. Whether B
+			// displaces A is the whole question — it does when A has been away
+			// long enough to be forgotten, and does not when A still outranks
+			// it.
+			post("D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+			synctest.Wait()
+			time.Sleep(time.Second)
+
+			post("A-second", admissionTurn(
+				admissionMsg("system", sysA),
+				admissionMsg("user", askA),
+				admissionMsg("assistant", "word"),
+				admissionMsg("user", admissionAskA2),
+			))
+			synctest.Wait()
+			// A's turn waits past the admission grace period before B's next
+			// turn arrives, so displacing it is allowed.
+			time.Sleep(3 * time.Second)
+
+			post("B-next", bTurn(3))
+			synctest.Wait()
+
+			// D's generation ends and the target serves again. The first sleep
+			// spans D's original generation; the second spans the re-send the
+			// queue owes whichever request it displaced.
+			time.Sleep(admissionLongGeneration + time.Second)
+			time.Sleep(admissionLongGeneration + time.Second)
+			synctest.Wait()
+
+			poster.answeredOK("A-first", "B-first", "B-second", "B-third", "D-first", "B-next", "A-second")
+			if b, ok := poster.answered("B-next"); ok && !strings.Contains(b.Body.String(), bAsks[3]) {
+				t.Errorf("B's client received %q; want the backend's successful response naming %q", b.Body.String(), bAsks[3])
+			}
+			if order, ok := poster.answeredBefore(tt.first, tt.second); !ok {
+				t.Errorf("turns were answered in order %v; %s should be answered before %s", order, tt.first, tt.second)
+			}
 		})
-
-		srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-		}})
-		srv.logger = testLogger(t)
-
-		const (
-			sysA  = "answer in one word"
-			askA  = "session A asks"
-			askD  = "session D asks"
-			askB  = "session B asks"
-			askA2 = "session A asks again"
-		)
-		msg := func(role, content string) string {
-			return fmt.Sprintf(`{"role":%q,"content":%q}`, role, content)
-		}
-		turn := func(messages ...string) string {
-			return fmt.Sprintf(`{"model":"openai/gpt-4","messages":[%s]}`, strings.Join(messages, ","))
-		}
-
-		type answer struct {
-			label string
-			code  int
-			body  string
-		}
-		answers := make(chan answer, 4)
-		var orderMu sync.Mutex
-		var answered []string
-		post := func(label, body string) {
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			req.Header.Set("Authorization", "Bearer user-token")
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			srv.ServeHTTP(rec, req)
-			orderMu.Lock()
-			answered = append(answered, label)
-			orderMu.Unlock()
-			answers <- answer{label: label, code: rec.Code, body: rec.Body.String()}
-		}
-
-		// A's first turn completes, making A's conversation the oldest of the
-		// three; D then takes the target's only slot for a long generation;
-		// B arrives next and waits at the target. Fake time separates the
-		// arrivals so each conversation has a distinct age.
-		go post("A-first", turn(msg("system", sysA), msg("user", askA)))
-		synctest.Wait()
-		time.Sleep(time.Second)
-
-		go post("D-first", turn(msg("user", askD)))
-		synctest.Wait()
-		time.Sleep(time.Second)
-
-		go post("B-first", turn(msg("user", askB)))
-		synctest.Wait()
-		// B waits at the target past the admission grace period before A's
-		// next turn arrives, so displacing it is allowed.
-		time.Sleep(3 * time.Second)
-
-		// A's second turn arrives last of all and still outranks B: it carries
-		// A's original leading messages plus history.
-		go post("A-second", turn(msg("system", sysA), msg("user", askA), msg("assistant", "word"), msg("user", askA2)))
-		synctest.Wait()
-
-		// D's generation ends and the target serves again. The first sleep
-		// spans D's original generation; the second spans the re-send the
-		// queue owes whichever request it displaced.
-		time.Sleep(longGeneration + time.Second)
-		time.Sleep(longGeneration + time.Second)
-		synctest.Wait()
-
-		got := make(map[string]answer, 4)
-		for range 4 {
-			a := <-answers
-			got[a.label] = a
-		}
-		for label, a := range got {
-			if a.code != http.StatusOK {
-				t.Errorf("%s: status %d, want %d", label, a.code, http.StatusOK)
-			}
-		}
-		if b := got["B-first"]; !strings.Contains(b.body, askB) {
-			t.Errorf("B's client received %q; want the backend's successful response naming %q", b.body, askB)
-		}
-		orderMu.Lock()
-		defer orderMu.Unlock()
-		if i, j := slices.Index(answered, "A-second"), slices.Index(answered, "B-first"); i < 0 || j < 0 || i >= j {
-			t.Errorf("turns were answered in order %v; A's second turn should be answered before B's first", answered)
-		}
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on the
-// consumer's session-end signal, and a session idle past the backstop ranks as
-// new — until both land, sessionAges grows one entry per conversation forever.
+// TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on
+// the consumer's session-end signal — until it lands, sessionAges holds one
+// entry per conversation ever seen, since a stale entry is reset rather than
+// dropped.
 
 // Session ranks the admission cases depend on: D is the oldest and holds the
 // target's only slot for a generation, A outranks B, and B asks before A's
@@ -5786,12 +5717,14 @@ func newAdmissionServer(t *testing.T, client *http.Client) *server {
 }
 
 // admissionPoster posts chat turns at a server and keeps each answer under its
-// label, so a case can ask whether a request has been answered yet.
+// label, so a case can ask whether a request has been answered yet, and in
+// what order the answers reached their clients.
 type admissionPoster struct {
 	t       *testing.T
 	srv     http.Handler
 	mu      sync.Mutex
 	answers map[string]*httptest.ResponseRecorder
+	order   []string
 }
 
 func newAdmissionPoster(t *testing.T, srv http.Handler) *admissionPoster {
@@ -5810,6 +5743,7 @@ func (p *admissionPoster) post(ctx context.Context, label, body string) {
 	p.srv.ServeHTTP(rec, req)
 	p.mu.Lock()
 	p.answers[label] = rec
+	p.order = append(p.order, label)
 	p.mu.Unlock()
 }
 
@@ -5818,6 +5752,32 @@ func (p *admissionPoster) answered(label string) (*httptest.ResponseRecorder, bo
 	defer p.mu.Unlock()
 	rec, ok := p.answers[label]
 	return rec, ok
+}
+
+// answeredBefore reports whether the turn labeled first was answered before
+// the one labeled second. It also returns the order answered so far, for a
+// failure message. An unanswered label is not before anything.
+func (p *admissionPoster) answeredBefore(first, second string) ([]string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	order := slices.Clone(p.order)
+	i, j := slices.Index(order, first), slices.Index(order, second)
+	return order, i >= 0 && j >= 0 && i < j
+}
+
+// answeredOK fails the case unless every label named has been answered 200.
+func (p *admissionPoster) answeredOK(labels ...string) {
+	p.t.Helper()
+	for _, label := range labels {
+		rec, ok := p.answered(label)
+		if !ok {
+			p.t.Errorf("%s never received an answer", label)
+			continue
+		}
+		if rec.Code != http.StatusOK {
+			p.t.Errorf("%s: status %d, want %d", label, rec.Code, http.StatusOK)
+		}
+	}
 }
 
 // admissionQueueFormed posts the turns that leave B queued behind A's second
