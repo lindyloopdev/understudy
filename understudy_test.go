@@ -340,11 +340,14 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 	type test struct {
 		// ctx overrides the request context (defaults to t.Context()); set it to
 		// exercise cancellation paths.
-		ctx                 context.Context
-		requestBody         string
-		server              *server
-		wantStatus          int
-		wantBody            string
+		ctx         context.Context
+		requestBody string
+		server      *server
+		wantStatus  int
+		wantBody    string
+		// wantRawBody is compared byte for byte; use it for non-JSON bodies
+		// like streams, which wantBody's JSON comparison cannot match.
+		wantRawBody         string
 		wantBodyContains    []string
 		wantResponseHeaders http.Header
 	}
@@ -363,6 +366,32 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			wantStatus:          http.StatusOK,
 			wantBody:            `{"id":"chatcmpl-123","choices":[]}`,
 			wantResponseHeaders: http.Header{},
+		}
+	})
+
+	tests.AddFunc("should proxy every frame of a streamed 200 response body to client", func(t *testing.T) test {
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				// One frame per Read, as a stream delivers.
+				frames := []string{": keep-alive\n\n", "data: {\"id\":\"chatcmpl-123\"}\n\n", "data: [DONE]\n\n"}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						if len(frames) == 0 {
+							return 0, io.EOF
+						}
+						n := copy(p, frames[0])
+						if frames[0] = frames[0][n:]; frames[0] == "" {
+							frames = frames[1:]
+						}
+						return n, nil
+					})),
+					Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusOK,
+			wantRawBody:         ": keep-alive\n\ndata: {\"id\":\"chatcmpl-123\"}\n\ndata: [DONE]\n\n",
+			wantResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 		}
 	})
 
@@ -1062,6 +1091,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
 				t.Errorf("unexpected body: %s", d)
 			}
+		}
+		if tt.wantRawBody != "" && rr.Body.String() != tt.wantRawBody {
+			t.Errorf("unexpected body: got %q, want %q", rr.Body.String(), tt.wantRawBody)
 		}
 		for _, want := range tt.wantBodyContains {
 			if !strings.Contains(rr.Body.String(), want) {
@@ -6052,17 +6084,22 @@ func TestShouldServeTheOlderSessionsTurnFirstWhenWaitingFormsTheQueue(t *testing
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): the turn already being served
-// should be answered from the attempt that was already running, once, when the
-// wait forms the queue around it. Nothing pins that here: dropping the headered
-// check from the formation sweep leaves the whole suite green, so the one path
-// that could kill a live generation is unfenced.
+// TODO(TODO.d/what-a-queue-formation-costs.md): one formation should re-send
+// only the turns it had to take. The case above asserts the order the answers
+// come back in, which holds however much work the sweep destroys getting there.
 
-// TODO(TODO.d/session-ordered-admission.md): a turn that arrived within the
-// grace period should be answered from its first attempt when the wait forms
-// the queue, rather than canceled and re-sent for a generation it has not yet
-// had time to lose. Dropping the grace check from the formation sweep leaves
-// the whole suite green.
+// TODO(TODO.d/what-a-queue-formation-costs.md): the backend should be asked to
+// generate a turn once, even when the queue forms around that turn
+// mid-generation. Cancelling an attempt whose header has arrived throws away
+// prefill the backend has already done and pays for it a second time, which is
+// why the design calls cancelling free only before the header. Dropping the
+// headered check from the formation sweep leaves the whole suite green.
+
+// TODO(TODO.d/what-a-queue-formation-costs.md): a session whose turn had only just
+// reached the target should be answered before one whose turn had been waiting
+// there, since forming the queue takes the waiting turn and leaves the fresh one
+// where it is. Dropping the grace check from the formation sweep leaves the whole
+// suite green.
 
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

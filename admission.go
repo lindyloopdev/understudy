@@ -152,6 +152,10 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// The wait itself can form the queue: p headerless past its grace period
 	// with no higher-ranked arrival. p is that request only when it arrived
 	// beside one, so only then is its timer armed.
+	// TODO(TODO.d/what-a-queue-formation-costs.md): one timer is armed per such
+	// arrival and each sweeps everything outstanding, so nothing here bounds how
+	// often a turn released and re-sent can be taken again by a later arrival's
+	// timer. Whether the release rule already prevents it is unestablished.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
 			continue
