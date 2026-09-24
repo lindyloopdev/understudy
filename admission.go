@@ -148,6 +148,11 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 			return nil, context.Cause(ctx)
 		}
 	}
+	// TODO(TODO.d/refill-and-growth-admission.md): p reaches here whenever it
+	// outranks nothing above, regardless of whether some other outstanding
+	// request is already unconfirmed past its grace period — only the
+	// outranking check above holds p back. Growth should hold p on any such
+	// request, headered or not, not only ones it outranks.
 	q.outstanding = append(q.outstanding, p)
 	// The wait itself can form the queue: p headerless past its grace period
 	// with no higher-ranked arrival. p is that request only when it arrived
@@ -274,6 +279,14 @@ func (q *targetQueue) confirm(p *pending) {
 
 // finish ends p's standing at the target: its attempt is over, so it holds the
 // queue's next release no longer. Idempotent, so every exit path can call it.
+//
+// TODO(TODO.d/refill-and-growth-admission.md): q.check below releases its
+// next head only when nothing outstanding is unconfirmed — the grace-gated
+// growth rule, applied uniformly here regardless of whether p.confirmed is
+// true. A p that was confirmed should instead admit the next-ranked held
+// request unconditionally: no grace check, no regard for anything else
+// unconfirmed at the target, since p's own completion is proof its slot was
+// real. That refill path does not exist yet.
 func (q *targetQueue) finish(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

@@ -381,7 +381,8 @@ position is moot — leaving three cases:
    demote the target to `readmitAt`, replay the triggering request to the next
    candidate, recover via the half-open probe. *(A provider holding a queued
    request open with keep-alives. Silence before the response header is not a
-   stall on any backend: it waits — §Session-Ordered Admission.)*
+   stall either: it is bounded by §Session-Ordered Admission's bound on
+   silence, which counts content and so covers both sides of the header.)*
 2. **Subsequent-request pre-content stall** — replayable, but switching forfeits
    coherence → the same disposition **gated by a coherence-sized wait budget**:
    hold in place longer, replaying only once the budget is spent. This is
@@ -399,8 +400,10 @@ insignificant whitespace: the stall gate runs from the response header until the
 first content, and the idle deadline measures the gap between content events. An
 upstream that sends only keep-alives has produced nothing, so it reaches
 whichever bound applies — the stall gate between header and content, the idle
-deadline after it. Before the header no gate runs; that wait belongs to
-§Session-Ordered Admission.
+deadline after it. Before the header the gate is §Session-Ordered Admission's
+bound on silence: it counts from the request rather than from the header, so a
+backend that answers early and then says nothing is bounded on the same terms as
+one that never answers at all.
 
 Each
 entry is a full `(backend, model)` target, so a
@@ -1176,13 +1179,16 @@ ordering, never correctness. In the shared daemon the ordering is global across
 runs (§Shared understudy daemon). Session age is a policy slot: explicit
 classes (interactive over batch) compose without touching the mechanism.
 
-**It applies to every backend, and forms only under contention.** There is no
-per-backend marking and no capacity model. Requests go straight to the backend
-until a queue forms, one at a time while it exists, and straight through again
-once it drains — so where nothing contends, the discipline is indistinguishable
-from a plain relay. A remote that is slow to answer under load but has parallel
-headroom is sent one new request at a time while its queue exists; that
-under-use lasts only as long as the contention that formed the queue.
+**It applies to every target, and forms only under contention.** No configuration
+turns the discipline on, for a backend or for one of its models, and none
+declares a target's capacity. Requests go straight to their target until a queue
+forms there, at whatever that target absorbs while it exists (*How many requests
+a target holds* below), and straight through again once it drains — so where
+nothing contends, the discipline is indistinguishable from a plain relay. A
+remote that is slow to answer under load but has parallel headroom keeps that
+headroom fed: trying for more than the target has proven stops at the first
+request it leaves waiting, but refilling a slot a confirmed request just
+vacated never does.
 
 **The queue is keyed on the target.** Canonical `url + key + model` — health's
 key (§Understudy) — because that is the scope a provider limits and the scope a
@@ -1208,10 +1214,13 @@ contention. Two events form or grow a queue:
 
 - **An arrival outranks a waiting request.** Every outstanding headerless
   request past its grace period that ranks below the arrival is canceled and
-  queued with it, by rank. Requests that rank above the arrival stay outstanding.
+  queued with it, by rank. Requests that rank above the arrival stay
+  outstanding, and so does one that has its response header: it may be
+  prefilling, and ordering may not destroy work that may be underway.
 - **A request waits past its grace period.** Every outstanding headerless
-  request is canceled and queued except the highest-ranked unconfirmed one —
-  and that one too if another request is already unconfirmed.
+  request below the highest-ranked one is canceled and queued — and that one
+  too when a request already holding a header is the one the target has not
+  begun.
 
 A request with no response header has been given no work by a backend that
 admits before it answers (Kronk writes nothing, its status included, until a
@@ -1221,27 +1230,104 @@ prefill, and model load alike) cannot show the difference, and canceling there
 may discard a prefill in progress; that loss is accepted, and the reservation
 window below makes it rare.
 
-**The probe discipline.** A request is **confirmed** by its first content event
-(§Understudy, *Stalls* — a keep-alive is not content). The queue releases its
-head only when nothing unconfirmed is outstanding in its scope — its target, or
-the linked set — so once a queue exists at most one unconfirmed request, the
-**probe**, is at the backend. A request that has received a response header is
-never canceled by preemption: a header means admitted to the backend's queue,
-not to a slot, and the wire cannot tell queueing from prefill. A higher-ranked
-arrival therefore waits at the front of Understudy's queue until the probe
-confirms. The backend's own ordering matters only among requests left
-outstanding when a queue forms; after that there is nothing at the backend for
-it to reorder. The only other cancellations are the consumer abandoning a
-request and the consumer's time limit (below).
+**How many requests a target holds.** A request is **confirmed** by its first
+content event (§Understudy, *Stalls* — a keep-alive is not content). Two rules
+govern admission, and they answer different questions: whether to **refill** a
+slot just proven free, and whether to **grow** past what is proven at all.
 
-**Silence before a response header waits, on every backend.** Kronk waiting for
-a permit, Ollama queueing or prefilling or loading, and a remote holding a
-queued request all look identical before the header, and the ones with evidence
-behind them are alive. So no gate bounds the wait for a header — neither
-Understudy's own nor the transport's header timeout on the chat path. What
-bounds it is the backend's own error, the consumer's time limit, and the
-consumer's deadline. A stall after the header — keep-alives with no content — is
-§Understudy's pre-content stall, not this.
+**Refilling is unconditional.** The moment a confirmed request ends, that
+completion is itself the proof its slot was real, so the next-ranked request
+waiting is admitted immediately — no grace check, no regard for anything else
+outstanding at the target. Nothing is stored to make this decision: the trigger
+is the completion, and once whatever was waiting has been let in there is
+nothing left to remember.
+
+**Growing is not.** A request that is not a refill — a fresh arrival, or the
+very first attempt at a target that has shown nothing yet — is admitted only
+while nothing at its target is already unconfirmed past its grace period, and
+held otherwise, exactly as before. Growth is speculative, so it earns the
+caution refilling does not need: trying one more, one at a time, is how a
+target's ceiling is found, and staying held once a try fails to confirm is what
+stops finding out the hard way.
+
+Together the two rules divide a target's total honestly. What it holds is its
+own demonstrated concurrency, refilled as fast as it turns over, plus at most
+one further request growth is currently testing. Kronk, serving two streams,
+holds three: two generating, one being tried. A fifty-way remote holds
+fifty-one the same way — found by growth trying one more each time nothing has
+yet proven a limit. Refilling never needs either number; it only reacts to a
+completion that already happened.
+
+**Gating refills on the same grace period as growth would drain a wide, slow
+target.** A backend that can serve fifty at once but takes ten seconds to
+answer any given one exposes why the two rules must be separate: pacing
+replacements on the departing request's own header — one admitted, wait for it
+to prove itself, then admit the next — caps new admissions at roughly one per
+that latency, far slower than fifty genuinely concurrent streams turn over, and
+the gap widens as more finish while the pace-limited replacements are still
+working. Refilling on the completion itself has no such pace: two slots freeing
+together produce two replacements together, each triggered by its own event,
+bounded only by however many actually just freed.
+
+**A refill can be briefly wrong, and the rules that already exist bound it.**
+If a target's true capacity drops mid-flight, refilling has no way to know — it
+is still honoring completions from before the drop, and keeps admitting
+replacements until those replacements themselves fail to confirm. This is
+self-limiting, not unbounded: refilling only ever fires as often as something
+actually completes, and a target serving less also completes less, so its own
+rate falls with the target's real capacity without anything watching for it.
+Whatever it admits in the meantime answers to the same rules as anything else —
+a stuck refill is preemptable and subject to the bound on silence below exactly
+like a stuck growth attempt, so a stale assumption costs at most the time until
+that machinery catches up, never an unbounded pile-up.
+
+A target whose capacity falls is discovered this way, not tracked: nothing is
+stored, decayed, or ratcheted, because neither rule ever holds a belief about
+the target that could go stale. A drop shows up as growth's next try failing to
+confirm — the same evidence that found the ceiling in the first place.
+
+**Connections accepted are not capacity.** A backend that accepts fifty
+connections and streams four has forty-six waiting in *its* order, invisible to
+Understudy and beyond its ordering. Counting content rather than acceptance is
+what keeps them out: those forty-six sit unconfirmed past their grace periods,
+so admission stops at five and the rest wait in Understudy's queue, where rank
+governs. Among the requests a target genuinely serves at once, ordering is the
+target's, and that costs little — they complete within about a generation of
+each other, so a session's position among them is worth at most that, while its
+position in the queue is worth the whole wait.
+
+A request that has received a response header is never canceled **by
+preemption**: a header means admitted to the backend's queue, not to a slot, and
+the wire cannot tell queueing from prefill, so ordering may not destroy work
+that may be underway. A higher-ranked arrival waits at the front of Understudy's
+queue instead. Liveness may destroy it — below.
+
+**A bound on silence, keyed on content.** Kronk waiting for a permit, Ollama
+queueing or prefilling or loading, and a remote holding a queued request look
+identical before the header; so do a request queued behind honest contention and
+one routed to a dead node. Understudy cannot separate them from a single
+observation and does not try. It bounds them instead: a request that has
+produced no content within the bound is canceled and sent again, whether or not
+its header arrived.
+
+Keying that bound on content rather than on the header is what makes it reach
+the common case. On 2026-09-14 `deepseek-v4-flash` under load answered `200`
+after 12.5s and then sent nothing but `: keep-alive` lines for fifteen to
+nineteen minutes ([[stall-before-first-content-event]]) — every stuck request
+was headered, so a rule that spares headered requests spares all of them. Being
+wrong is cheap and one-directional: canceling mid-prefill discards tens of
+seconds, while the silence it ends runs to tens of minutes.
+
+The bound escalates with each attempt on one request, because a bound shorter
+than an honest time-to-first-content is worse than the stall it replaces — a
+cold model load that never fits inside it would be canceled and restarted
+forever. Its first value must clear honest queueing at a slow backend, where a
+request can wait many minutes for its header with nothing wrong, so it comes
+from the consumer's time limit where one is supplied and from the target's own
+turnover otherwise. When it fires on a backend that gives no work before its
+header, every headerless request at that target restarts together in
+Understudy's send order, so a retry restores rank order rather than scrambling
+it.
 
 **Who waits, and who fails over.** The wait budget is the one §Understudy's
 *Affinity and admission* derives from coherence. A later turn is bound to its

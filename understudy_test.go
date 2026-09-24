@@ -6101,6 +6101,43 @@ func TestShouldServeTheOlderSessionsTurnFirstWhenWaitingFormsTheQueue(t *testing
 // where it is. Dropping the grace check from the formation sweep leaves the whole
 // suite green.
 
+// TODO(TODO.d/refill-and-growth-admission.md): a confirmed request's completion
+// should admit the next-ranked held request immediately, with no grace check and
+// no regard for anything else unconfirmed at the target — refill does not exist
+// yet; every release still goes through growth's grace-gated path. Two of the
+// completions above ending close together, at a target slow enough to answer
+// that gating on header latency would visibly serialize the replacements, is
+// the case this is for.
+
+// TODO(TODO.d/refill-and-growth-admission.md): a request arriving after a slot
+// freed with nobody waiting, while something else at the target is
+// simultaneously unconfirmed past its grace period, should be held exactly as
+// if nothing had recently freed — it must not be admitted early just because a
+// slot opened moments before it arrived. Nothing is remembered across that gap
+// by design; this pins the deliberate absence of that memory.
+
+// TODO(TODO.d/refill-and-growth-admission.md): several requests arriving close
+// together, none of which has yet gone unconfirmed past its own grace period,
+// should all be admitted immediately with no queueing among them. This may
+// already hold by accident of the current code; nothing pins it.
+
+// TODO(TODO.d/refill-and-growth-admission.md): a refilled request that goes
+// unconfirmed past its grace period should be displaced by an outranking
+// arrival the same way a growth attempt would be, and a confirmed request that
+// ends with an error should trigger the same immediate refill as one that ends
+// cleanly — refilling earns no exemption from anything downstream of admission.
+
+// TODO(TODO.d/refill-and-growth-admission.md): a confirmed request's completion,
+// with the head of the wait list already abandoned by its own client, should
+// admit the request behind it rather than stalling on the departed one.
+
+// TODO(TODO.d/session-ordered-admission.md): an arrival that outranks only some
+// of several simultaneously outstanding requests should be answered only once
+// every one of them — including the ones it did not outrank — has resolved, not
+// only the ones it displaced; and a displaced request's replacement should
+// reach the target no sooner than the cancellation it displaced actually
+// completes, never in the same instant.
+
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex

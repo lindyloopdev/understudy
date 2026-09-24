@@ -4,7 +4,7 @@
 
 **Design:** [DESIGN.md §Session-Ordered
 Admission](../DESIGN.md#session-ordered-admission) — ordering, when a queue
-forms, the probe discipline, the 429 rule, the consumer's time limit, and Kronk
+forms, refill and growth, the 429 rule, the consumer's time limit, and Kronk
 configuration; [DESIGN.md §Understudy](../DESIGN.md#understudy) — *Affinity and
 admission* (session identity, the coherence-driven wait budget) and the
 `Retry-After` ladder; [DESIGN.md §Concurrency & Rate
@@ -27,10 +27,46 @@ limiter. The steps below remain, in order.
   `sessionAges` holds one entry per conversation ever seen — a stale entry is
   reset rather than dropped.
   - Tests: a session ended by the consumer returns ranked as new.
+- **The bound on silence is unbuilt.** DESIGN.md's *A bound on silence, keyed
+  on content* replaces the old "no gate bounds the wait for a header": a
+  request producing no content within the bound is canceled and sent again to
+  the same target, whether or not its header arrived, so a submitted request
+  is never silently unbounded regardless of contention. None of it exists yet.
+  - The bound fires on its own timer, independent of any arrival — a lone
+    wedged request with nobody else contending at that target must still
+    eventually retry, since nothing else will ever trigger a recheck of it.
+  - When it fires on a target that gives no work before its header, every
+    headerless request at that target restarts together, in rank order, so
+    the retry restores ordering rather than scrambling it.
+  - The bound escalates with each attempt on one request, so a legitimately
+    slow first attempt is not retried forever at an interval shorter than it
+    could ever succeed within.
+  - A mass-retry after such a restart follows growth's ordinary rule — burst
+    together, not serialized one at a time — since nothing about a retry
+    changes what growth already knows to do with a fresh admission.
+  - (open) Whether a new arrival accelerates the drop of an already-wedged
+    *headered* request, or only the bound's own independent timer ever
+    resolves it, is undecided.
+  - This composes with [[stall-before-first-content-event]]'s demote-and-
+    replay-to-a-different-candidate disposition, which answers a different
+    question (which target) for the same triggering silence; how the two
+    decide precedence is unsettled.
+  - Tests: a submitted request producing no content for longer than the bound,
+    with nothing else contending for its target, is eventually canceled and
+    retried with nobody else involved; several headerless requests at one
+    target, all wedged together, restart together and are re-admitted per
+    growth's burst rule rather than one at a time; a retry's interval is
+    longer than the previous attempt's.
 - **Test the probe-held arm of the waiting trigger.** No case stages a
   headered unconfirmed request ranked below a headerless one when the wait
   forms the queue, so the arm that queues the probe because preemption never
-  takes a headered request is unexercised.
+  takes a headered request is unexercised. This is the sweep's own
+  cancellation logic (`formByWaiting`), distinct from growth's admit-check
+  above — the admit-check decides whether a *new* arrival is let in; this
+  decides who the sweep takes once the wait trigger has already fired.
+  - Tests: the highest-ranked unconfirmed request at a target is taken by the
+    sweep, not spared as the probe, when a different, headered request is the
+    one currently unconfirmed at that target.
 - **Withhold status and headers until the first content.** The relay commits
   the upstream's status and headers as they arrive; hold them until the
   confirmation read-ahead (past SSE comments and leading JSON whitespace)
@@ -40,6 +76,20 @@ limiter. The steps below remain, in order.
     headerless requests ranked above the arrival stay outstanding; an
     uncontended backend never forms a queue; a consumer aborting a held
     request removes it; the queue drains back to straight-through.
+- **Two untested nuances of preemption, both already true of the code.**
+  First: a preempting arrival waits behind *every* unconfirmed request at its
+  target once it is queued, not only the ones it outranked — the release rule
+  is "nothing unconfirmed," not "nothing older unconfirmed," so an arrival that
+  only displaced some of the outstanding set still waits for the rest,
+  regardless of rank. Second: an outranking arrival is not dispatched the
+  instant it displaces a younger request — it is itself queued alongside the
+  displaced one and released only once that cancellation actually completes,
+  not in the same instant.
+  - Tests: an arrival that outranks only some of several simultaneously
+    outstanding requests is answered only after every one of them — including
+    the ones it did not outrank — has resolved; a displaced request's
+    replacement reaches the target no sooner than the cancellation it
+    displaced actually completes, never in the same instant.
 - **Who waits, and who fails over.** A later turn, and a first turn with no
   healthy untried alternate, wait in the queue. A first turn with a healthy
   alternate takes the walk and fails over rather than queue.
@@ -64,11 +114,18 @@ limiter. The steps below remain, in order.
   model's queue stops releasing when the top-ranked waiter is for another model,
   and that waiter is released when Understudy's count of the loaded model's
   running requests reaches zero. A request re-queued by the 429 rule counts
-  progress across the linked set. The link ends when either queue drains.
+  progress across the linked set. The link ends when either queue drains. This
+  must suspend refill for the loaded model too, not only growth — refill admits
+  unconditionally on a completion (DESIGN.md §Session-Ordered Admission, *How
+  many requests a target holds*), so without this carve-out it would keep
+  feeding the loaded model a replacement every time one finishes and its running
+  count would never reach zero, and the swap would never happen.
   - Tests: an older session's request for the unloaded model is served before a
     younger session's request for the loaded one; the loaded model's running
     requests are never canceled for the swap; the swap request is sent only
-    once no request for the loaded model is running.
+    once no request for the loaded model is running; a request waiting for the
+    loaded model itself is not refilled while a higher-ranked waiter for the
+    other model is pending.
 - **The concurrency limiter follows the queue.** Keep a held request taking no
   slot, and route a freed slot to the waiter from the oldest session rather
   than whichever wakes first — `upstreamLimiter.acquire` wakes its waiters in
