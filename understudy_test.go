@@ -5926,6 +5926,77 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 	})
 }
 
+// TestShouldAdmitTheHeldRequestAtAStreamedTargetsFirstContentWhileTheStreamIsStillOpen
+// verifies that a request held behind an unconfirmed one is admitted at that
+// request's first content, not at its completion; the occupier's stream is
+// kept open past that point.
+func TestShouldAdmitTheHeldRequestAtAStreamedTargetsFirstContentWhileTheStreamIsStillOpen(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Closed only after the test finishes, so the occupier's stream is
+		// still open while the held turn is admitted.
+		streamEnds := make(chan struct{})
+		t.Cleanup(func() { close(streamEnds) })
+
+		client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+			if ask != admissionAskD {
+				return admissionJSON(ask), nil
+			}
+			timer := time.NewTimer(admissionLongGeneration)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				return nil, context.Cause(r.Context())
+			case <-timer.C:
+			}
+			firstContent := true
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					if firstContent {
+						firstContent = false
+						return copy(p, "data: {\"id\":\"d-first\"}\n\n"), nil
+					}
+					<-streamEnds
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+
+		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+		post := func(label, body string) {
+			go poster.post(t.Context(), label, body)
+		}
+
+		// The occupier's turn takes the target directly and sits there
+		// unconfirmed past the admission grace period.
+		post("D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+		synctest.Wait()
+		time.Sleep(3 * time.Second)
+
+		// The younger turn queues behind the unconfirmed occupier.
+		post("younger-first", admissionTurn(admissionMsg("user", admissionAskYounger)))
+		synctest.Wait()
+		if _, ok := poster.answered("younger-first"); ok {
+			t.Error("the younger session's turn was answered while the occupier sat unconfirmed past its grace period; it belongs behind it in the queue")
+		}
+
+		// The occupier's answer reaches its first content; the stream stays open.
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+
+		rec, ok := poster.answered("younger-first")
+		if !ok {
+			t.Error("the younger session's turn was still held after the occupier's answer produced its first content; a confirmation admits the next waiter without waiting for the answer to finish")
+		} else if rec.Code != http.StatusOK {
+			t.Errorf("the younger session's client got status %d, want %d", rec.Code, http.StatusOK)
+		}
+		if _, ok := poster.answered("D-first"); ok {
+			t.Error("the occupier's answer finished; its stream was meant to stay open, so the younger session's admission cannot be pinned on the confirmation alone")
+		}
+	})
+}
+
 func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
