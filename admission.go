@@ -106,6 +106,11 @@ type pending struct {
 	preempted bool
 }
 
+// pastGrace reports whether p's grace period has elapsed as of now.
+func (p *pending) pastGrace(now time.Time) bool {
+	return !p.arrived.Add(admissionGracePeriod).After(now)
+}
+
 // enter admits an attempt to q's target, blocking while the queue holds it.
 // rank is the attempt's session age; cancel ends its upstream attempt when
 // preemption displaces it. A request the queue releases returns unblocked and
@@ -122,10 +127,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// given — and takes its place in line by rank. A headered request is never
 	// displaced: a header means the backend has admitted it, and the wire
 	// cannot tell queueing from prefill.
-	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): the grace-elapsed
-	// arithmetic below is one of four copies in this file; single-source it.
 	for _, o := range q.outstanding {
-		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) || !o.rank.After(rank) {
+		if o.headered || o.preempted || !o.pastGrace(now) || !o.rank.After(rank) {
 			continue
 		}
 		o.preempted = true
@@ -135,11 +138,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// Growth is speculative: an arrival that displaces nothing still waits
 	// behind any request unconfirmed past its grace period, headered or not.
 	held := len(q.waiting) > 0
-	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): another copy of
-	// the grace-elapsed arithmetic — do not fold `headered` into a shared
-	// helper here, since this check must stay header-blind.
 	for _, o := range q.outstanding {
-		if !o.confirmed && !o.arrived.Add(admissionGracePeriod).After(now) {
+		if !o.confirmed && o.pastGrace(now) {
 			held = true
 			break
 		}
@@ -170,10 +170,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// arrival and each sweeps everything outstanding, so nothing here bounds how
 	// often a turn released and re-sent can be taken again by a later arrival's
 	// timer. Whether the release rule already prevents it is unestablished.
-	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): a third copy of the
-	// grace-elapsed arithmetic; single-source it.
 	for _, o := range q.outstanding {
-		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
+		if o.headered || o.preempted || !o.pastGrace(now) {
 			continue
 		}
 		time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
@@ -212,10 +210,8 @@ func (q *targetQueue) formByWaiting(p *pending) {
 			probeHeld = true
 		}
 	}
-	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): a fourth copy of
-	// the grace-elapsed arithmetic; single-source it.
 	for _, o := range q.outstanding {
-		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
+		if o.headered || o.preempted || !o.pastGrace(now) {
 			continue
 		}
 		// TODO(TODO.d/session-ordered-admission.md): no case yet stages a
