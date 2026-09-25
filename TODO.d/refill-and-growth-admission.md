@@ -11,9 +11,7 @@ already exist bound it*, and *Connections accepted are not capacity*.
 Admission decides two different questions, and today's code only answers one
 of them. **Growth** — whether to try for more than a target has proven — is
 built: `targetQueue.enter` admits a new arrival while nothing outstanding is
-unconfirmed past its grace period, and holds it otherwise, though only by
-checking rank against outstanding headerless requests, not by checking
-whether *anything* is already unconfirmed regardless of rank or header state.
+unconfirmed past its grace period, and holds it otherwise.
 **Refill** — whether to immediately re-admit a replacement for a slot a
 confirmed request just vacated — does not exist at all: nothing in `enter`,
 `check`, or `attemptEnded` distinguishes "a confirmed stream just ended" from
@@ -59,19 +57,14 @@ replacements are still working.
     target where something else is simultaneously unconfirmed past its grace
     period, is held exactly as if nothing had recently freed — it is not
     admitted early just because a slot opened moments before it arrived.
-- **Growth is held by any unconfirmed request past grace, not only by rank.**
-  `enter`'s current check only cancels *outranked* headerless requests; it
-  never asks whether a *non-outranking* arrival should be held because
-  something else is already unconfirmed past grace, regardless of that
-  request's rank or header state. A fresh arrival that does not outrank
-  anything must still be held while anything at its target — headered or
-  headerless — is unconfirmed past its grace period.
-  - Tests: a fresh, non-outranking arrival is held without ever reaching the
-    target while a headerless request at that target is unconfirmed past its
-    grace period; the same, where the unconfirmed request is headered instead
-    (a target admitting to its own internal queue before serving, the way
-    Kronk can) — header state must not matter to this check, only
-    confirmation state.
+- **Pin the headered case of growth's hold-on-unconfirmed check.** Growth
+  holds an arrival while anything at its target is unconfirmed past grace;
+  its test covers the headerless occupant only. Add the headered counterpart:
+  a fresh, non-outranking arrival is held without ever reaching the target
+  while a *headered* request at that target is unconfirmed past its grace
+  period (a target admitting to its own internal queue before serving, the
+  way Kronk can) — header state must not matter to this check, only
+  confirmation state.
 - **Growth still bursts freely while nothing has proven a limit.** Multiple
   simultaneous arrivals, none of which has yet gone unconfirmed past its
   grace period, should all pass straight through — this may already hold by

@@ -122,6 +122,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// given — and takes its place in line by rank. A headered request is never
 	// displaced: a header means the backend has admitted it, and the wire
 	// cannot tell queueing from prefill.
+	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): the grace-elapsed
+	// arithmetic below is one of four copies in this file; single-source it.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) || !o.rank.After(rank) {
 			continue
@@ -130,7 +132,19 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 		q.insert(o)
 		o.cancel(errPreempted)
 	}
-	if len(q.waiting) > 0 {
+	// Growth is speculative: an arrival that displaces nothing still waits
+	// behind any request unconfirmed past its grace period, headered or not.
+	held := len(q.waiting) > 0
+	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): another copy of
+	// the grace-elapsed arithmetic — do not fold `headered` into a shared
+	// helper here, since this check must stay header-blind.
+	for _, o := range q.outstanding {
+		if !o.confirmed && !o.arrived.Add(admissionGracePeriod).After(now) {
+			held = true
+			break
+		}
+	}
+	if held {
 		q.insert(p)
 		q.mu.Unlock()
 		select {
@@ -148,11 +162,6 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 			return nil, context.Cause(ctx)
 		}
 	}
-	// TODO(TODO.d/refill-and-growth-admission.md): p reaches here whenever it
-	// outranks nothing above, regardless of whether some other outstanding
-	// request is already unconfirmed past its grace period — only the
-	// outranking check above holds p back. Growth should hold p on any such
-	// request, headered or not, not only ones it outranks.
 	q.outstanding = append(q.outstanding, p)
 	// The wait itself can form the queue: p headerless past its grace period
 	// with no higher-ranked arrival. p is that request only when it arrived
@@ -161,6 +170,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// arrival and each sweeps everything outstanding, so nothing here bounds how
 	// often a turn released and re-sent can be taken again by a later arrival's
 	// timer. Whether the release rule already prevents it is unestablished.
+	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): a third copy of the
+	// grace-elapsed arithmetic; single-source it.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
 			continue
@@ -201,6 +212,8 @@ func (q *targetQueue) formByWaiting(p *pending) {
 			probeHeld = true
 		}
 	}
+	// TODO(TODO.d/single-source-the-grace-elapsed-check.md): a fourth copy of
+	// the grace-elapsed arithmetic; single-source it.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || o.arrived.Add(admissionGracePeriod).After(now) {
 			continue

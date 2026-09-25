@@ -5929,18 +5929,19 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
-			raced  = "B raced answer"
-			resent = "B resent answer"
+			// askOlder is reused later as the arrival that displaces the
+			// younger session's headerless attempt.
+			askOlder     = "the older session asks"
+			askOlder2    = "the older session asks again"
+			askDisplaced = "the displaced session asks"
+			raced        = "displaced raced answer"
+			resent       = "displaced resent answer"
 		)
-		target := &admissionTarget{}
 		var mu sync.Mutex
 		attempts := 0
 
-		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
-			if ask != admissionAskB {
-				if err := target.serve(r.Context(), ask); err != nil {
-					return nil, err
-				}
+		client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+			if ask != askDisplaced {
 				return admissionJSON(ask), nil
 			}
 			mu.Lock()
@@ -5953,27 +5954,44 @@ func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *t
 				<-r.Context().Done()
 				return admissionJSON(raced), nil
 			}
-			if err := target.serve(r.Context(), ask); err != nil {
-				return nil, err
-			}
 			return admissionJSON(resent), nil
 		})
 
 		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-		admissionQueueFormed(t.Context(), t.Context(), poster)
 
-		time.Sleep(admissionLongGeneration + time.Second)
+		// The older session's first turn fixes its rank ahead of the
+		// displaced session, which has not arrived yet.
+		go poster.post(t.Context(), "older-first", admissionTurn(admissionMsg("user", askOlder)))
+		synctest.Wait()
+		time.Sleep(time.Second)
+
+		// The displaced session's turn reaches the target directly — nothing
+		// else is outstanding — and waits there headerless past its grace
+		// period.
+		go poster.post(t.Context(), "displaced", admissionTurn(admissionMsg("user", askDisplaced)))
+		synctest.Wait()
+		time.Sleep(admissionGracePeriod + time.Second)
+
+		// The older session's second turn outranks it, displacing the
+		// headerless attempt.
+		go poster.post(t.Context(), "older-second", admissionTurn(
+			admissionMsg("user", askOlder),
+			admissionMsg("assistant", "answered"),
+			admissionMsg("user", askOlder2),
+		))
+		synctest.Wait()
+		time.Sleep(time.Second)
 		synctest.Wait()
 
-		rec, ok := poster.answered("B-first")
+		rec, ok := poster.answered("displaced")
 		if !ok {
-			t.Fatal("B never received an answer")
+			t.Fatal("the displaced session never received an answer")
 		}
 		if rec.Code != http.StatusOK {
-			t.Errorf("B's client got status %d, want %d", rec.Code, http.StatusOK)
+			t.Errorf("the displaced session's client got status %d, want %d", rec.Code, http.StatusOK)
 		}
 		if got := rec.Body.String(); !strings.Contains(got, resent) || strings.Contains(got, raced) {
-			t.Errorf("B's client received %q; want the re-sent attempt's answer, not the response that raced its displacement", got)
+			t.Errorf("the displaced session's client received %q; want the re-sent attempt's answer, not the response that raced its displacement", got)
 		}
 	})
 }
@@ -6004,6 +6022,59 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 		if _, ok := poster.answered("A-second"); !ok {
 			t.Error("A's second turn never completed after the held request's client left")
 		}
+	})
+}
+
+// A headerless, unconfirmed turn past its grace period holds a
+// non-outranking arrival: the arrival never reaches the target until the turn
+// already there resolves.
+func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPastItsGracePeriod(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		target := &admissionTarget{}
+		var mu sync.Mutex
+		sends := map[string]int{}
+
+		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
+			mu.Lock()
+			sends[ask]++
+			mu.Unlock()
+			if err := target.serve(r.Context(), ask); err != nil {
+				return nil, err
+			}
+			return admissionJSON(ask), nil
+		})
+		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+		post := func(label, body string) {
+			go poster.post(t.Context(), label, body)
+		}
+
+		// The occupying session's turn reaches the target directly — nothing
+		// else contends — and blocks there headerless through its generation.
+		post("D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+		synctest.Wait()
+		time.Sleep(3 * time.Second)
+
+		// The younger session first appears now, so its turn outranks
+		// nothing at the target.
+		post("younger-first", admissionTurn(admissionMsg("user", admissionAskYounger)))
+		synctest.Wait()
+		time.Sleep(3 * time.Second)
+
+		mu.Lock()
+		sent := sends[admissionAskYounger]
+		mu.Unlock()
+		if sent != 0 {
+			t.Errorf("the target received %d requests for the younger session's turn; a non-outranking arrival is held while a headerless request sits unconfirmed past its grace period", sent)
+		}
+		if _, ok := poster.answered("younger-first"); ok {
+			t.Error("the younger session's turn was answered while the occupying session's turn was still unconfirmed at the target")
+		}
+
+		// The occupying session's generation ends; the held turn takes the
+		// target it freed and is answered.
+		time.Sleep(admissionLongGeneration + time.Second)
+		synctest.Wait()
+		poster.answeredOK("D-first", "younger-first")
 	})
 }
 
