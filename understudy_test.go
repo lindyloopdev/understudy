@@ -5857,6 +5857,9 @@ func admissionQueueFormed(ctx, bCtx context.Context, p *admissionPoster) {
 	synctest.Wait()
 }
 
+// TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent
+// verifies that a framing line is not content, whatever the Content-Type
+// claims.
 func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *testing.T) {
 	type test struct {
 		// opening is the stream's first framing line.
@@ -5874,54 +5877,70 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			target := &admissionTarget{}
-			// dataGate holds the first data: event back until the test lets
-			// it through.
-			dataGate := make(chan struct{})
+			const (
+				askStreamed = "the streamed session asks"
+				askHeld     = "the held session asks"
+			)
+			// Holds the streamed answer back past the turn's grace period.
+			answerBegins := make(chan struct{})
+			// Holds the stream's first data: event behind the opening framing line.
+			dataArrives := make(chan struct{})
+			// Keeps the stream open past the first data: event, so only that
+			// event can admit the held turn.
+			streamEnds := make(chan struct{})
+			t.Cleanup(func() { close(streamEnds) })
 
-			client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
-				if err := target.serve(r.Context(), ask); err != nil {
-					return nil, err
-				}
-				if ask != admissionAskA2 {
+			client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+				if ask != askStreamed {
 					return admissionJSON(ask), nil
 				}
-				stage := 0
+				select {
+				case <-r.Context().Done():
+					return nil, context.Cause(r.Context())
+				case <-answerBegins:
+				}
+				reads := 0
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					// Mislabeled on purpose: the body's own bytes, not the
 					// Content-Type, decide what counts as content.
 					Header: http.Header{"Content-Type": {"application/json"}},
 					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						switch stage {
-						case 0:
-							stage++
-							return copy(p, tt.opening), nil
+						reads++
+						switch reads {
 						case 1:
-							<-dataGate
-							stage++
-							return copy(p, "data: {\"id\":\"a-second\"}\n\n"), nil
+							return copy(p, tt.opening), nil
+						case 2:
+							<-dataArrives
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
 						}
+						<-streamEnds
 						return 0, io.EOF
 					})),
 				}, nil
 			})
 
 			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-			admissionQueueFormed(t.Context(), t.Context(), poster)
-
-			// D's generation ends, so A's second turn begins streaming.
-			time.Sleep(admissionLongGeneration + time.Second)
-			synctest.Wait()
-			if _, ok := poster.answered("B-first"); ok {
-				t.Errorf("B was answered while A's stream had sent only %q; a framing line is not content whatever the Content-Type claims, so the queue holds its next waiter", strings.TrimSpace(tt.opening))
+			post := func(label, ask string) {
+				go poster.post(t.Context(), label, admissionTurn(admissionMsg("user", ask)))
 			}
 
-			close(dataGate)
+			post("streamed", askStreamed)
 			synctest.Wait()
-			if _, ok := poster.answered("B-first"); !ok {
-				t.Error("B was still held after A's stream reached its first data: event, which confirms the attempt and frees the queue")
+			time.Sleep(admissionGracePeriod + time.Second)
+
+			post("held", askHeld)
+			synctest.Wait()
+
+			close(answerBegins)
+			synctest.Wait()
+			if _, ok := poster.answered("held"); ok {
+				t.Errorf("the held turn was answered while the stream ahead of it had sent only %q; a framing line is not content whatever the Content-Type claims", strings.TrimSpace(tt.opening))
 			}
+
+			close(dataArrives)
+			synctest.Wait()
+			poster.answeredOK("held")
 		})
 	})
 }
