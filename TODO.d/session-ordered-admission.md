@@ -57,7 +57,20 @@ limiter. The steps below remain, in order.
     target, all wedged together, restart together and are re-admitted per
     growth's burst rule rather than one at a time; a retry's interval is
     longer than the previous attempt's.
-- **Test the probe-held arm of the waiting trigger.** No case stages a
+- **Order turns already waiting at the target.** DESIGN.md's *What forms a
+  queue* has a request waiting past its grace period form the queue, so turns
+  sent together — before anything at the target was past its grace period —
+  and now waiting at the backend in its own order are still served oldest
+  session first. The wait trigger built for it (`formByWaiting`) is
+  unreachable: `targetQueue.enter` arms its timer only for an arrival beside a
+  request already unconfirmed past its grace period, and growth holds every
+  such arrival before it reaches that code. It never covered turns sent
+  together in the first place.
+  - Tests: two turns sent to one target within its grace period, the younger
+    session's first, both waiting there unanswered past it — the older
+    session's turn is served first.
+- **Test the probe-held arm of the waiting trigger** (waits on the item
+  above: the trigger must be reachable first). No case stages a
   headered unconfirmed request ranked below a headerless one when the wait
   forms the queue, so the arm that queues the probe because preemption never
   takes a headered request is unexercised. This is the sweep's own

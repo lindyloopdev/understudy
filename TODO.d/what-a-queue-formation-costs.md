@@ -9,18 +9,16 @@ discipline* (one unconfirmed request at the backend).
 Forming a queue cancels outstanding requests and re-sends them when it releases
 them, and the design rests that on a cost claim: "canceling it is free" for a
 headerless request, "because a backend that admits before it answers has given
-it no work". Nothing asserts the claim. The wait trigger's only test,
-`TestShouldServeTheOlderSessionsTurnFirstWhenWaitingFormsTheQueue`, asserts the
-order the answers come back in — which would hold just as well if every
-formation cancelled and re-sent every turn several times over. The arrival
-trigger does count what the target was sent
+it no work". Nothing asserts the claim. The arrival trigger counts what the
+target was sent
 (`TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway`); the
-wait trigger counts nothing.
+wait trigger has no test at all — it is currently unreachable
+([[session-ordered-admission]], *Order turns already waiting at the target*).
 
 Two arms of the sweep already carry inline markers in `understudy_test.go`,
-above `TestShouldServeTheOlderSessionsTurnFirstWhenWaitingFormsTheQueue`: a
-headered request must not be taken, and one still inside its grace period must
-not be either. Dropping either check leaves the whole suite green.
+below `TestShouldServeTheOlderSessionsTurnFirstWhenTheYoungerSessionsTurnArrivedEarlier`:
+a headered request must not be taken, and one still inside its grace period
+must not be either. Dropping either check leaves the whole suite green.
 
 ## Can the same turn be cancelled twice?
 
