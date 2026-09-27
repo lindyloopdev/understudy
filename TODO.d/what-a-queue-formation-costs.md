@@ -12,19 +12,20 @@ headerless request, "because a backend that admits before it answers has given
 it no work". Nothing asserts the claim. The arrival trigger counts what the
 target was sent
 (`TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway`); the
-wait trigger has no test at all — it is currently unreachable
-([[session-ordered-admission]], *Order turns already waiting at the target*).
+wait trigger has a test only for the order it produces (the "both turns
+already wait at the target" row of
+`TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst`),
+not for what it re-sends.
 
 Two arms of the sweep already carry inline markers in `understudy_test.go`,
-below `TestShouldServeTheOlderSessionsTurnFirstWhenTheYoungerSessionsTurnArrivedEarlier`:
+below `TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst`:
 a headered request must not be taken, and one still inside its grace period
 must not be either. Dropping either check leaves the whole suite green.
 
 ## Can the same turn be cancelled twice?
 
 Open question, mechanism first. `targetQueue.enter` arms one
-`time.AfterFunc(admissionGracePeriod, …)` per arrival that lands beside a
-headerless request already past its grace period, and each firing sweeps
+`time.AfterFunc(admissionGracePeriod, …)` per admission, and each firing sweeps
 everything outstanding. A re-sent attempt does not re-enter the queue, so it
 arms no timer of its own — but a later arrival's timer still sweeps it once
 the queue has admitted it, and admission stamps a fresh `arrived`, so it is

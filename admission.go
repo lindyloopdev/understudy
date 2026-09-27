@@ -164,19 +164,13 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	}
 	q.outstanding = append(q.outstanding, p)
 	// The wait itself can form the queue: p headerless past its grace period
-	// with no higher-ranked arrival. p is that request only when it arrived
-	// beside one, so only then is its timer armed.
-	// TODO(TODO.d/what-a-queue-formation-costs.md): one timer is armed per such
-	// arrival and each sweeps everything outstanding, so nothing here bounds how
-	// often a turn admitted and re-sent can be taken again by a later arrival's
-	// timer. Whether the admission rule already prevents it is unestablished.
-	for _, o := range q.outstanding {
-		if o.headered || o.preempted || !o.pastGrace(now) {
-			continue
-		}
-		time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
-		break
-	}
+	// is itself the evidence of contention, so every admission arms the timer.
+	// TODO(TODO.d/what-a-queue-formation-costs.md): one timer is armed per
+	// admission and each sweeps everything outstanding, so nothing here bounds
+	// how often a turn admitted and re-sent can be taken again by a later
+	// admission's timer. Whether the admission rule already prevents it is
+	// unestablished.
+	time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
 	q.mu.Unlock()
 	return p, nil
 }
