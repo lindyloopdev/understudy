@@ -8,41 +8,22 @@ target holds*, *Gating refills on the same grace period as growth would drain
 a wide, slow target*, *A refill can be briefly wrong, and the rules that
 already exist bound it*, and *Connections accepted are not capacity*.
 
-Admission decides two different questions, and today's code only answers one
-of them. **Growth** — whether to try for more than a target has proven — is
-built: `targetQueue.enter` admits a new arrival while nothing outstanding is
-unconfirmed past its grace period, and holds it otherwise.
-**Refill** — whether to immediately re-admit a replacement for a slot a
-confirmed request just vacated — does not exist at all: nothing in `enter`,
-`check`, or `attemptEnded` distinguishes "a confirmed stream just ended" from
-any other reason a slot became available, so every release still goes through
-growth's grace-gated path.
-
-The gap is not cosmetic. On a target that is wide but individually slow — many
-requests can run at once, but each takes a while to answer — gating every
-replacement on the departing request's own header paces new admissions at
-roughly one per that latency, far slower than the target actually turns over.
-Two slots freeing together should produce two replacements together; today
-they would be admitted one at a time, each waiting on the last one's own
-grace period, and the gap widens as more finish while the pace-limited
-replacements are still working.
+Admission decides two different questions. **Growth** — whether to try for
+more than a target has proven — admits a new arrival while nothing outstanding
+is unconfirmed past its grace period, and holds it otherwise. **Refill** —
+immediately re-admitting a replacement for a slot a confirmed request just
+vacated — admits the next-ranked held request unconditionally, with no grace
+check and no regard for anything else unconfirmed at the target.
 
 ## Work
 
-- **Refill on a completion is unconditional.** The moment a confirmed request
-  ends — successfully or with an error, since either way the slot it held is
-  free — the next-ranked held request is admitted immediately: no grace
-  check, no regard for anything else unconfirmed at the target. Nothing is
-  stored to decide this; the trigger is the completion itself.
-  - Tests: a confirmed request ending admits the next-ranked held request with
-    no delay, even while a separate request at the same target is currently
-    unconfirmed past its grace period; a confirmed request that ends with an
-    error still triggers the same immediate admission as one that ends
-    cleanly; two confirmed requests ending close together each independently
-    and immediately admit their own replacement, neither waiting on the
-    other's header or confirmation — the case DeepSeek/wide-backend behavior
-    depends on, staged with a doubled target slow enough to answer that
-    gating on header latency would visibly serialize the two.
+- **Test that a confirmed request ending with an error triggers the same
+  immediate refill as one that ends cleanly.**
+- **Test that two confirmed requests ending close together each independently
+  and immediately admit their own replacement, neither waiting on the other's
+  header or confirmation** — the case DeepSeek/wide-backend behavior depends
+  on, staged with a doubled target slow enough to answer that gating on header
+  latency would visibly serialize the two.
 - **A completion with nothing held admits nothing, and remembers nothing.**
   If the wait list is empty when a slot frees, there is no counter or belief
   left behind for a later arrival to consume — that arrival is a fresh

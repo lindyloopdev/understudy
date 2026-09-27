@@ -16,7 +16,7 @@ const admissionGracePeriod = 2 * time.Second
 
 // errPreempted is the cancellation cause for an upstream attempt displaced by
 // session-ordered admission — understudy's own signal, not a target failure.
-// The displaced attempt is re-sent when the queue releases it; nothing about
+// The displaced attempt is re-sent when the queue admits it; nothing about
 // it is recorded.
 var errPreempted = errors.New("displaced for an older session")
 
@@ -86,7 +86,7 @@ func (s *server) admissionQueue(key string) *targetQueue {
 // passes straight through.
 type targetQueue struct {
 	mu sync.Mutex
-	// outstanding holds every attempt at the target — sent, or released and
+	// outstanding holds every attempt at the target — sent, or admitted and
 	// on its way — until it ends or its first content confirms it.
 	outstanding []*pending
 	// waiting holds queued attempts in rank order, oldest session first.
@@ -100,7 +100,7 @@ type pending struct {
 	rank      time.Time
 	arrived   time.Time
 	cancel    context.CancelCauseFunc
-	released  chan struct{}
+	admitted  chan struct{}
 	headered  bool
 	confirmed bool
 	preempted bool
@@ -113,11 +113,11 @@ func (p *pending) pastGrace(now time.Time) bool {
 
 // enter admits an attempt to q's target, blocking while the queue holds it.
 // rank is the attempt's session age; cancel ends its upstream attempt when
-// preemption displaces it. A request the queue releases returns unblocked and
-// counts as outstanding from that moment, so it holds the queue's next release
-// until its first content confirms it.
+// preemption displaces it. A request the queue admits returns unblocked and
+// counts as outstanding from that moment, so it holds the queue's next
+// admission until its first content confirms it.
 func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time) (*pending, error) {
-	p := &pending{queue: q, rank: rank, cancel: cancel, released: make(chan struct{})}
+	p := &pending{queue: q, rank: rank, cancel: cancel, admitted: make(chan struct{})}
 	q.mu.Lock()
 	now := time.Now()
 	p.arrived = now
@@ -148,13 +148,13 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 		q.insert(p)
 		q.mu.Unlock()
 		select {
-		case <-p.released:
+		case <-p.admitted:
 			return p, nil
 		case <-ctx.Done():
 			q.mu.Lock()
 			defer q.mu.Unlock()
 			if !slices.Contains(q.waiting, p) {
-				// The queue released p as ctx was failing: the attempt goes on
+				// The queue admitted p as ctx was failing: the attempt goes on
 				// and surfaces its own cause.
 				return p, nil
 			}
@@ -168,8 +168,8 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	// beside one, so only then is its timer armed.
 	// TODO(TODO.d/what-a-queue-formation-costs.md): one timer is armed per such
 	// arrival and each sweeps everything outstanding, so nothing here bounds how
-	// often a turn released and re-sent can be taken again by a later arrival's
-	// timer. Whether the release rule already prevents it is unestablished.
+	// often a turn admitted and re-sent can be taken again by a later arrival's
+	// timer. Whether the admission rule already prevents it is unestablished.
 	for _, o := range q.outstanding {
 		if o.headered || o.preempted || !o.pastGrace(now) {
 			continue
@@ -186,7 +186,7 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 // contention. Every outstanding headerless request past its grace period is
 // canceled and queued by rank — canceling costs nothing, since no header
 // means no work was given — except the highest-ranked unconfirmed one, which
-// stays outstanding as the probe: the queue releases its next head only when
+// stays outstanding as the probe: the queue admits its next head only when
 // nothing unconfirmed is at the backend. If that unconfirmed request is
 // headered, the probe is queued too: preemption never takes a headered
 // request, so it already holds the slot the probe would wait for.
@@ -229,7 +229,7 @@ func (q *targetQueue) formByWaiting(p *pending) {
 // attemptEnded records the attempt's upstream call ending: err is nil when the
 // call returned a response, whose header has now arrived. It reports whether
 // the attempt was preempted — the one ending that is not a failure — so the
-// caller waits for the queue's release instead of recording or relaying
+// caller waits for the queue to admit it again instead of recording or relaying
 // anything. A response that slipped past a preemption decision is discarded:
 // the re-sent attempt is the one the client receives.
 func (q *targetQueue) attemptEnded(p *pending, err error) bool {
@@ -240,21 +240,21 @@ func (q *targetQueue) attemptEnded(p *pending, err error) bool {
 		return false
 	}
 	q.dropOutstanding(p)
-	q.check()
+	q.admitIfAllOutstandingConfirmed()
 	return p.preempted
 }
 
-// await blocks until the queue releases a displaced attempt, honoring ctx: a
+// await blocks until the queue admits a displaced attempt, honoring ctx: a
 // client that leaves while held is not kept waiting.
 func (q *targetQueue) await(ctx context.Context, p *pending) error {
 	select {
-	case <-p.released:
+	case <-p.admitted:
 		return nil
 	case <-ctx.Done():
 		q.mu.Lock()
 		defer q.mu.Unlock()
 		if !slices.Contains(q.waiting, p) {
-			// Released as ctx was failing; the re-send proceeds and fails with
+			// Admitted as ctx was failing; the re-send proceeds and fails with
 			// its own cause.
 			return nil
 		}
@@ -264,18 +264,18 @@ func (q *targetQueue) await(ctx context.Context, p *pending) error {
 }
 
 // rearm re-arms p for the re-sent attempt: a fresh upstream context to cancel
-// and a fresh release channel, so the re-send can itself be displaced. The
-// release stamped a fresh arrival, so the grace period restarts here.
+// and a fresh admitted channel, so the re-send can itself be displaced.
+// Admission stamped a fresh arrival, so the grace period restarts here.
 func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	p.preempted = false
 	p.cancel = cancel
-	p.released = make(chan struct{})
+	p.admitted = make(chan struct{})
 }
 
 // confirm records p's first content — the moment the target has begun
-// answering — which frees the queue to release its next waiter.
+// answering — which frees the queue to admit its next waiter.
 func (q *targetQueue) confirm(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -283,46 +283,51 @@ func (q *targetQueue) confirm(p *pending) {
 		return
 	}
 	p.confirmed = true
-	q.check()
+	q.admitIfAllOutstandingConfirmed()
 }
 
 // finish ends p's standing at the target: its attempt is over, so it holds the
-// queue's next release no longer. Idempotent, so every exit path can call it.
-//
-// TODO(TODO.d/refill-and-growth-admission.md): q.check below releases its
-// next head only when nothing outstanding is unconfirmed — the grace-gated
-// growth rule, applied uniformly here regardless of whether p.confirmed is
-// true. A p that was confirmed should instead admit the next-ranked held
-// request unconditionally: no grace check, no regard for anything else
-// unconfirmed at the target, since p's own completion is proof its slot was
-// real. That refill path does not exist yet.
+// queue's next admission no longer. A confirmed p refills its slot at once,
+// with no grace check; any other ending admits only through growth's
+// grace-gated check. It is not idempotent: finishing a confirmed p again
+// admits another waiter, so each attempt must be finished once.
 func (q *targetQueue) finish(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.dropOutstanding(p)
 	q.dropWaiting(p)
-	q.check()
-}
-
-// check releases the queue's head when nothing unconfirmed is outstanding:
-// once a queue exists, one request at a time sits at the target between
-// confirmations. The released head counts as outstanding from the release, so
-// the head behind it waits for the released one's own first content. Caller
-// holds q.mu.
-func (q *targetQueue) check() {
-	if len(q.waiting) == 0 {
+	if p.confirmed {
+		q.admit()
 		return
 	}
+	q.admitIfAllOutstandingConfirmed()
+}
+
+// admitIfAllOutstandingConfirmed admits the queue's head once every request
+// outstanding at the target has confirmed: once a queue exists, one request at
+// a time sits at the target between confirmations. Caller holds q.mu.
+func (q *targetQueue) admitIfAllOutstandingConfirmed() {
 	for _, o := range q.outstanding {
 		if !o.confirmed {
 			return
 		}
 	}
+	q.admit()
+}
+
+// admit admits the queue's next-ranked waiter, if any, consulting nothing
+// else at the target. The admitted waiter counts as outstanding from that
+// moment, so it holds the queue's next admission until its own first content
+// confirms it. Caller holds q.mu.
+func (q *targetQueue) admit() {
+	if len(q.waiting) == 0 {
+		return
+	}
 	p := q.waiting[0]
 	q.waiting = q.waiting[1:]
 	p.arrived = time.Now()
 	q.outstanding = append(q.outstanding, p)
-	close(p.released)
+	close(p.admitted)
 }
 
 // insert places p in the waiting line by rank, oldest session first. Caller

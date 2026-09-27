@@ -91,12 +91,12 @@ limiter. The steps below remain, in order.
     request removes it; the queue drains back to straight-through.
 - **Two untested nuances of preemption, both already true of the code.**
   First: a preempting arrival waits behind *every* unconfirmed request at its
-  target once it is queued, not only the ones it outranked — the release rule
+  target once it is queued, not only the ones it outranked — the admission rule
   is "nothing unconfirmed," not "nothing older unconfirmed," so an arrival that
   only displaced some of the outstanding set still waits for the rest,
   regardless of rank. Second: an outranking arrival is not dispatched the
   instant it displaces a younger request — it is itself queued alongside the
-  displaced one and released only once that cancellation actually completes,
+  displaced one and admitted only once that cancellation actually completes,
   not in the same instant.
   - Tests: an arrival that outranks only some of several simultaneously
     outstanding requests is answered only after every one of them — including
@@ -110,9 +110,9 @@ limiter. The steps below remain, in order.
     preferred target is contended; a later turn waits for its own target; a
     first turn with no alternate waits.
 - **A 429 on a request that waits re-queues it** at its rank. With
-  `Retry-After`: bench the target (the existing `recordRateLimited`) and release
+  `Retry-After`: bench the target (the existing `recordRateLimited`) and admit
   the highest-ranked request whose target is not benched. Without `Retry-After`,
-  while another request on its key is producing content: re-queue, release it
+  while another request on its key is producing content: re-queue, admit it
   when a request on its key finishes, and do not `throttle()` the limiter.
   Without `Retry-After` and nothing producing content: the ordinary ladder.
   Kronk's admission timeout is a bare `429` `resource_exhausted`, identical to
@@ -120,12 +120,12 @@ limiter. The steps below remain, in order.
   on the code.
   - Tests: a bare 429 while its key has a running stream is served once that
     stream ends, with the cap unchanged and no replay; a 429 with `Retry-After`
-    holds only its own target while others release; a bare 429 with nothing
+    holds only its own target while others are admitted; a bare 429 with nothing
     running takes the ladder.
 - **Linked models.** A busy refusal (`providers.ErrServerBusy`) links the queues
   of every model on that server into one ranking. While linked, the loaded
-  model's queue stops releasing when the top-ranked waiter is for another model,
-  and that waiter is released when Understudy's count of the loaded model's
+  model's queue stops admitting when the top-ranked waiter is for another model,
+  and that waiter is admitted when Understudy's count of the loaded model's
   running requests reaches zero. A request re-queued by the 429 rule counts
   progress across the linked set. The link ends when either queue drains. This
   must suspend refill for the loaded model too, not only growth — refill admits

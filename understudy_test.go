@@ -5946,74 +5946,140 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 	})
 }
 
-// TestShouldAdmitTheHeldRequestAtAStreamedTargetsFirstContentWhileTheStreamIsStillOpen
-// verifies that a request held behind an unconfirmed one is admitted at that
-// request's first content, not at its completion; the occupier's stream is
-// kept open past that point.
-func TestShouldAdmitTheHeldRequestAtAStreamedTargetsFirstContentWhileTheStreamIsStillOpen(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		// Closed only after the test finishes, so the occupier's stream is
-		// still open while the held turn is admitted.
-		streamEnds := make(chan struct{})
-		t.Cleanup(func() { close(streamEnds) })
+// TestShouldAdmitAHeldTurn verifies that a turn held behind an unconfirmed
+// request at its target is admitted when the test releases the fake backend,
+// and only then: each case keeps another turn unresolved throughout.
+func TestShouldAdmitAHeldTurn(t *testing.T) {
+	// upstreamReply is how the fake backend answers the request Understudy
+	// forwards to it.
+	type upstreamReply int
+	const (
+		// replyAtOnce: answers in full as soon as the request arrives.
+		replyAtOnce upstreamReply = iota
+		// replyContentWhenReleased: sends headers as soon as the request
+		// arrives, its first content when the test releases the backend, and
+		// keeps the stream open.
+		replyContentWhenReleased
+		// replyStreamsUntilReleased: starts streaming as soon as the request
+		// arrives, and finishes when the test releases the backend.
+		replyStreamsUntilReleased
+		// replyHeadersOnly: sends headers as soon as the request arrives, and
+		// never any content.
+		replyHeadersOnly
+	)
+	// turn is one conversation turn: the chat request the test's client sends
+	// to Understudy, and how the fake backend answers when Understudy forwards
+	// it.
+	type turn struct {
+		// inboundMessage is the user message the client sends. It identifies
+		// the turn: the fake backend reads it from the forwarded request, and
+		// the test uses it to check the client's response.
+		inboundMessage string
+		// after is how long the client waits before sending it.
+		after         time.Duration
+		upstreamReply upstreamReply
+	}
+	type test struct {
+		turns []turn
+		// held is the turn Understudy holds back, not forwarding it to the
+		// backend until the test releases the backend.
+		held string
+		// pending is a turn that stays unresolved throughout the test, so
+		// the release alone can have admitted held.
+		pending string
+	}
 
-		client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-			if ask != admissionAskD {
-				return admissionJSON(ask), nil
+	tests := testy.NewTable[test]()
+
+	tests.Add("should admit the held turn at the occupying turn's first content, while its stream stays open", test{
+		turns: []turn{
+			{inboundMessage: "occupier", upstreamReply: replyContentWhenReleased},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
+		},
+		held:    "held",
+		pending: "occupier",
+	})
+	tests.Add("should admit the held turn when a confirmed turn completes while another turn at the target is unconfirmed", test{
+		turns: []turn{
+			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleased},
+			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
+		},
+		held:    "held",
+		pending: "unconfirmed",
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			release := make(chan struct{})
+			// streamEnds, at test cleanup, ends every stream the release
+			// doesn't.
+			streamEnds := make(chan struct{})
+			t.Cleanup(func() { close(streamEnds) })
+
+			replies := map[string]upstreamReply{}
+			for _, tn := range tt.turns {
+				replies[tn.inboundMessage] = tn.upstreamReply
 			}
-			timer := time.NewTimer(admissionLongGeneration)
-			defer timer.Stop()
-			select {
-			case <-r.Context().Done():
-				return nil, context.Cause(r.Context())
-			case <-timer.C:
+			// now is closed, so its first content goes out at once.
+			now := make(chan struct{})
+			close(now)
+			// stream sends headers at once, its first content when contentAt
+			// closes (never, if contentAt is nil), and finishes when ends
+			// closes.
+			stream := func(r *http.Request, contentAt, ends <-chan struct{}) *http.Response {
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if contentAt != nil && reads == 1 {
+							select {
+							case <-r.Context().Done():
+								return 0, context.Cause(r.Context())
+							case <-contentAt:
+							}
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-ends:
+							return 0, io.EOF
+						}
+					})),
+				}
 			}
-			firstContent := true
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": {"text/event-stream"}},
-				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-					if firstContent {
-						firstContent = false
-						return copy(p, "data: {\"id\":\"d-first\"}\n\n"), nil
-					}
-					<-streamEnds
-					return 0, io.EOF
-				})),
-			}, nil
+			client := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+				switch replies[message] {
+				case replyContentWhenReleased:
+					return stream(r, release, streamEnds), nil
+				case replyStreamsUntilReleased:
+					return stream(r, now, release), nil
+				case replyHeadersOnly:
+					return stream(r, nil, streamEnds), nil
+				}
+				return admissionJSON(message), nil
+			})
+			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+
+			for _, tn := range tt.turns {
+				time.Sleep(tn.after)
+				go poster.post(t.Context(), tn.inboundMessage, admissionTurn(admissionMsg("user", tn.inboundMessage)))
+				synctest.Wait()
+			}
+			if _, ok := poster.answered(tt.held); ok {
+				t.Fatalf("setup: %q was answered on arrival; the case needs it held", tt.held)
+			}
+
+			close(release)
+			synctest.Wait()
+			if _, ok := poster.answered(tt.pending); ok {
+				t.Fatalf("setup: %q resolved; the case needs it pending, so that only the release can admit %q", tt.pending, tt.held)
+			}
+			poster.answeredOK(tt.held)
 		})
-
-		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-		post := func(label, body string) {
-			go poster.post(t.Context(), label, body)
-		}
-
-		// The occupier's turn takes the target directly and sits there
-		// unconfirmed past the admission grace period.
-		post("D-first", admissionTurn(admissionMsg("user", admissionAskD)))
-		synctest.Wait()
-		time.Sleep(3 * time.Second)
-
-		// The younger turn queues behind the unconfirmed occupier.
-		post("younger-first", admissionTurn(admissionMsg("user", admissionAskYounger)))
-		synctest.Wait()
-		if _, ok := poster.answered("younger-first"); ok {
-			t.Error("the younger session's turn was answered while the occupier sat unconfirmed past its grace period; it belongs behind it in the queue")
-		}
-
-		// The occupier's answer reaches its first content; the stream stays open.
-		time.Sleep(admissionLongGeneration + time.Second)
-		synctest.Wait()
-
-		rec, ok := poster.answered("younger-first")
-		if !ok {
-			t.Error("the younger session's turn was still held after the occupier's answer produced its first content; a confirmation admits the next waiter without waiting for the answer to finish")
-		} else if rec.Code != http.StatusOK {
-			t.Errorf("the younger session's client got status %d, want %d", rec.Code, http.StatusOK)
-		}
-		if _, ok := poster.answered("D-first"); ok {
-			t.Error("the occupier's answer finished; its stream was meant to stay open, so the younger session's admission cannot be pinned on the confirmation alone")
-		}
 	})
 }
 
@@ -6278,13 +6344,11 @@ func TestShouldServeTheOlderSessionsTurnFirstWhenTheYoungerSessionsTurnArrivedEa
 // where it is. Dropping the grace check from the formation sweep leaves the whole
 // suite green.
 
-// TODO(TODO.d/refill-and-growth-admission.md): a confirmed request's completion
-// should admit the next-ranked held request immediately, with no grace check and
-// no regard for anything else unconfirmed at the target — refill does not exist
-// yet; every release still goes through growth's grace-gated path. Two of the
-// completions above ending close together, at a target slow enough to answer
-// that gating on header latency would visibly serialize the replacements, is
-// the case this is for.
+// TODO(TODO.d/refill-and-growth-admission.md): two confirmed completions
+// ending close together, at a target slow enough to answer that gating on
+// header latency would visibly serialize the replacements, should each
+// independently and immediately admit their own replacement — neither waiting
+// on the other's header or confirmation.
 
 // TODO(TODO.d/refill-and-growth-admission.md): a request arriving after a slot
 // freed with nobody waiting, while something else at the target is

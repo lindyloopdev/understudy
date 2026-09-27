@@ -6,7 +6,7 @@
 — *What forms a queue* (canceling is free only before the header) and *The probe
 discipline* (one unconfirmed request at the backend).
 
-Forming a queue cancels outstanding requests and re-sends them when it releases
+Forming a queue cancels outstanding requests and re-sends them when it admits
 them, and the design rests that on a cost claim: "canceling it is free" for a
 headerless request, "because a backend that admits before it answers has given
 it no work". Nothing asserts the claim. The arrival trigger counts what the
@@ -27,11 +27,11 @@ Open question, mechanism first. `targetQueue.enter` arms one
 headerless request already past its grace period, and each firing sweeps
 everything outstanding. A re-sent attempt does not re-enter the queue, so it
 arms no timer of its own — but a later arrival's timer still sweeps it once
-`check` has released it, and `check` stamps a fresh `arrived`, so it is exempt
-only until it ages past the grace period again.
+the queue has admitted it, and admission stamps a fresh `arrived`, so it is
+exempt only until it ages past the grace period again.
 
 Against that, the probe discipline looks protective: once a queue exists the
-release rule leaves one unconfirmed request outstanding, and a lone outstanding
+admission rule leaves one unconfirmed request outstanding, and a lone outstanding
 request is the highest-ranked unconfirmed one, so the sweep spares it. The
 reachable case would need two unconfirmed requests outstanding with the
 re-sent one ranked below the other. Whether arrivals can produce that
@@ -45,5 +45,5 @@ because each repeat costs a whole generation on a contended backend.
   formation re-sends.
 - **Settle the repeat question.** Either demonstrate the arrangement that lets a
   turn be cancelled across two formations and bound it, or establish that the
-  release rule prevents it and record why, so the next reader does not have to
+  admission rule prevents it and record why, so the next reader does not have to
   re-derive it.

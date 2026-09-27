@@ -2244,7 +2244,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
 
 		// Session-ordered admission sits ahead of the slot: a request held by
-		// the queue takes no slot, and only a released one competes for one.
+		// the queue takes no slot, and only an admitted one competes for one.
 		// Uncontended, nothing queues and a request passes straight through.
 		queue := s.admissionQueue(healthKey(chosen, backend.Backends))
 		pend, err := queue.enter(ctx, cancel, s.sessionAge(convTenant, convKey))
@@ -2278,7 +2278,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// The send, retried wherever the queue displaces it. A displaced
 		// attempt is not a failure — the target is healthy and the client
 		// still waiting — so it records and shrinks nothing; it waits for the
-		// queue's release and sends the same bytes again.
+		// queue to admit it again and sends the same bytes again.
 		var resp *http.Response
 		var waited, acquired bool
 		// Per attempt: a re-sent attempt restamps sent, and only the attempt
@@ -2307,7 +2307,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			// TODO(TODO.d/session-ordered-admission.md): removing a held
 			// request whose client left goes no further than dropping it from
-			// the line here; the queue does not yet release around a departed
+			// the line here; the queue does not yet admit around a departed
 			// head.
 			if resp != nil {
 				_ = resp.Body.Close()

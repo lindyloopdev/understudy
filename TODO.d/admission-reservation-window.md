@@ -19,7 +19,7 @@ the next head.
   measurable from lindy transcript StepEnd timestamps; start from the observed
   gap distribution's upper-middle, not a guess.
 - A turn arriving within the window is submitted directly, uncontested; a
-  lapse releases the next queue head.
+  lapse admits the next queue head.
 - An explicit session-end signal from the consumer (lindy emits one per beat)
   releases the reservation immediately, so the timer covers only abnormal
   termination and non-participating consumers. It is the same signal
@@ -28,5 +28,5 @@ the next head.
   window covers short gaps, not max-gap; holding capacity for a non-requesting
   session is the waste the discipline exists to prevent. It keeps its rank.
 - Tests: a session returning within the window keeps its place with no
-  cancel/resubmit churn; a lapse releases the head; explicit release bypasses
+  cancel/resubmit churn; a lapse admits the head; explicit release bypasses
   the timer; a session with no queue behind it keeps running regardless.

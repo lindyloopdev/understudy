@@ -1133,9 +1133,9 @@ feeds the estimator. A bare 429 that §Session-Ordered Admission re-queues —
 another request in its scope still producing content — does not feed it either:
 it says the request was not yet served, not where the account's limit lies.
 
-**Waiting for a slot is ordered, and only released requests wait.** A request
+**Waiting for a slot is ordered, and only admitted requests wait.** A request
 held in the admission queue (§Session-Ordered Admission) takes no slot; only a
-request the queue releases competes for one, and when a slot frees, the waiter
+request the queue admits competes for one, and when a slot frees, the waiter
 from the oldest session takes it.
 
 **Per-upstream state outlives the tenant that taught it.** The learned cap is a property
@@ -1197,8 +1197,8 @@ parallel slots are both per loaded model. One server's models contend with each
 other only across a model swap, and that contention is **linked by evidence**:
 a busy refusal (a swap refused because the loaded model is mid-stream) links the
 server's models into one ranking. While linked, the loaded model's queue stops
-releasing whenever the top-ranked waiter is for another model; its running
-requests finish undisturbed, and the waiter is released the moment Understudy's
+admitting whenever the top-ranked waiter is for another model; its running
+requests finish undisturbed, and the waiter is admitted the moment Understudy's
 own count of the loaded model's running requests reaches zero, so the swap
 lands on an idle entry rather than being refused again. The link ends when
 either queue drains. On a server with several slots the swap waits for the
@@ -1344,11 +1344,11 @@ queue at its rank. Its scope is its target, or the linked set while models are
 linked.
 
 - **With `Retry-After`:** the target is benched until then (§Understudy,
-  health), and the queue releases around it — the highest-ranked request whose
+  health), and the queue admits around it — the highest-ranked request whose
   target is not benched goes next.
 - **Without `Retry-After`, while another request in scope is producing
   content:** the backend's own admission bound fired on a request that was
-  simply not yet served. It is released again when a request in scope finishes,
+  simply not yet served. It is admitted again when a request in scope finishes,
   so nothing is retried against a slot that is still held. It is not a capacity
   measurement, so the concurrency cap does not shrink.
 - **Without `Retry-After`, with nothing in scope producing content:** the

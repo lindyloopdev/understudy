@@ -39,7 +39,7 @@ break one of them:
   per-field expiry: drop the bound target at the idle TTL, and keep the rank
   until the last-seen time falls that far behind.
 - **`evictStaleHealth` sweeps health, but a `targetQueue` can hold goroutines
-  parked on a release.** Evicting a queue with waiters strands them, so the
+  parked waiting to be admitted.** Evicting a queue with waiters strands them, so the
   sweep must skip a queue that is not empty (or the queue must hold the record
   alive itself).
 
