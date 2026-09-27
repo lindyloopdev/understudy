@@ -5699,9 +5699,9 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 // suite green.
 
 // TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on
-// the consumer's session-end signal — until it lands, sessionAges holds one
-// entry per conversation ever seen, since a stale entry is reset rather than
-// dropped.
+// the consumer's session-end signal — until it lands, a dropped tenant's
+// conversation state is reclaimed by the forget backstop rather than at
+// teardown.
 
 // admissionAskD's turn holds the target's only slot for a long generation
 // ([admissionTarget.serve]); A and B are the two sessions

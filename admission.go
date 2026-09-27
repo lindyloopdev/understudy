@@ -42,9 +42,8 @@ type sessionRecord struct {
 // arrival.
 //
 // TODO(TODO.d/session-ordered-admission.md): the consumer's session-end signal
-// is unbuilt, and a stale entry is reset rather than dropped — so this record,
-// keyed on caller-supplied content, still holds one entry per conversation
-// ever seen.
+// is unbuilt, so a dropped tenant's conversation state is reclaimed by the
+// forget backstop rather than at teardown.
 func (s *server) sessionAge(tenant, key string) time.Time {
 	now := time.Now()
 	if key == "" {
@@ -52,17 +51,39 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.evictForgottenSessions(now)
 	ages, ok := s.sessionAges[tenant]
 	if !ok {
 		ages = make(map[string]sessionRecord)
 		s.sessionAges[tenant] = ages
 	}
-	if rec, ok := ages[key]; ok && now.Sub(rec.lastSeen) < sessionForgetAfter {
+	if rec, ok := ages[key]; ok {
 		ages[key] = sessionRecord{firstSeen: rec.firstSeen, lastSeen: now}
 		return rec.firstSeen
 	}
 	ages[key] = sessionRecord{firstSeen: now, lastSeen: now}
 	return now
+}
+
+// evictForgottenSessions drops every conversation quiet for
+// [sessionForgetAfter], and every tenant left with nothing.
+//
+// TODO(TODO.d/expose-operator-metrics.md): nothing tests this eviction. Test
+// it through the tracked-conversations gauge once it exists.
+//
+// Caller holds s.mu.
+func (s *server) evictForgottenSessions(now time.Time) {
+	for tenant, conversations := range s.sessionAges {
+		for key, rec := range conversations {
+			if now.Sub(rec.lastSeen) >= sessionForgetAfter {
+				delete(conversations, key)
+			}
+		}
+		// A tenant with nothing left is a run that ended.
+		if len(conversations) == 0 {
+			delete(s.sessionAges, tenant)
+		}
+	}
 }
 
 // admissionQueue returns the admission queue for a target's availability key

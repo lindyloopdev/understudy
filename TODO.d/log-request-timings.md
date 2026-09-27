@@ -27,14 +27,14 @@ target (Kronk on a large context, a cold model load) actually is.
 
 "First content" means: a stream's first `data:` event; any other body's first
 non-whitespace byte. Framing lines — SSE comments (keep-alives), `event:`,
-`id:`, `retry:` — are not content, whatever the Content-Type says. When
-session-ordered admission lands on `main`, use `confirmingReader`
-(`firstcontent.go`) as its detector rather than building a second one.
+`id:`, `retry:` — are not content, whatever the Content-Type says.
+`confirmingReader` (`firstcontent.go`) is the one detector: the relay's single
+callback both logs the time to first content and confirms the request for
+session-ordered admission.
 
 ## Work
 
 - **Log the time a request was held in the admission queue before it was
-  sent.** Only once session-ordered admission (branch `stallfix1132`) is on
-  `main`. Shows what admission costs each request.
+  sent.** Shows what admission costs each request.
 - (later) Timings for abandoned attempts — failovers and displacements — in
   `Attempt`.
