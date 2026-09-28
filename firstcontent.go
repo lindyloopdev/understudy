@@ -10,7 +10,9 @@ import (
 // non-whitespace byte of any other body. The body's bytes, not the response's
 // Content-Type, pick the rule; a stream is any opening SSE field line or ':'
 // comment, and only `data:` lines carry response content. After confirmation
-// the body passes through unscanned and unretained.
+// the body passes through unscanned and unretained; before it, only a bounded
+// prefix of the in-progress line is kept, since a pre-content line's length
+// is unbounded.
 type confirmingReader struct {
 	r         io.Reader
 	stream    bool
@@ -34,6 +36,9 @@ func (c *confirmingReader) Read(buf []byte) (int, error) {
 // the next queued request is never admitted.
 var sseFieldNames = []string{"data:", "event:", "id:", "retry:"}
 
+// dataField opens the only SSE line that carries response content.
+var dataField = []byte("data:")
+
 // sseFieldPrefix reports whether buf is a prefix of, or a whole, SSE field
 // name.
 func sseFieldPrefix(buf []byte) (prefix, complete bool) {
@@ -54,14 +59,18 @@ func (c *confirmingReader) scan(buf []byte) {
 	for _, b := range buf {
 		if c.stream {
 			if b == '\n' {
-				if bytes.HasPrefix(c.line, []byte("data:")) {
+				if bytes.HasPrefix(c.line, dataField) {
 					c.firstContent()
 					return
 				}
 				c.line = c.line[:0]
 				continue
 			}
-			c.line = append(c.line, b)
+			// Only enough of the line to recognize dataField at its newline is
+			// kept; the rest is dropped.
+			if len(c.line) < len(dataField) {
+				c.line = append(c.line, b)
+			}
 			continue
 		}
 		if len(c.line) == 0 && isJSONSpace(b) {
