@@ -2906,6 +2906,57 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the serving attempt's time to first content for a failed-over request", func(t *testing.T) test {
+		// Distinct delays so the logged time identifies the clock's start:
+		// 1s if timed from the serving attempt's send, 6s from the abandoned one's.
+		const (
+			failDelay  = 5 * time.Second
+			serveDelay = 1 * time.Second
+		)
+		rateLimited := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(failDelay)
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				Header:     http.Header{"Retry-After": {"60"}},
+			}, nil
+		})
+		serves := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(serveDelay)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		backend := func(rawURL, key string, client *http.Client) Backend {
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return Backend{ProviderType: "openai", Config: providers.Config{BaseURL: u, APIKey: key, HTTPClient: client}}
+		}
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{
+					Backends: map[string]Backend{
+						"a": backend("http://a/v1", "sk-a", rateLimited),
+						"b": backend("http://b/v1", "sk-b", serves),
+					},
+					Models: map[string]LogicalModel{"m": {Targets: []Target{
+						{backend: "a", model: "ma"},
+						{backend: "b", model: "mb"},
+					}}},
+				}, nil
+			}},
+			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"backend_name":          "b",
+				"time_to_first_content": serveDelay,
+			},
+		}
+	})
+
 	// TODO: should log a non-streamed reply's time to first content as the time
 	// to its first non-whitespace byte: a JSON body whose leading whitespace and
 	// opening '{' arrive after distinct delays.
@@ -2916,9 +2967,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	// (`eve`, then `nt: message`) must not be timed as content.
 	// TODO: should log no time to first content for a request whose response
 	// relayed none: a stream that ends after only keep-alive comments.
-	// TODO: should time a failed-over request from the serving attempt's send,
-	// not the abandoned attempt's: a first candidate that fails after a delay
-	// must not add that delay to the logged time.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
