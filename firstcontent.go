@@ -9,7 +9,8 @@ import (
 // first content: the first `data:` line of an SSE stream, or the first
 // non-whitespace byte of any other body. The body's bytes, not the response's
 // Content-Type, pick the rule; a stream is any opening SSE field line or ':'
-// comment, and only `data:` lines carry response content.
+// comment, and only `data:` lines carry response content. After confirmation
+// the body passes through unscanned and unretained.
 type confirmingReader struct {
 	r         io.Reader
 	stream    bool
@@ -20,7 +21,7 @@ type confirmingReader struct {
 
 func (c *confirmingReader) Read(buf []byte) (int, error) {
 	n, err := c.r.Read(buf)
-	if n > 0 {
+	if n > 0 && !c.confirmed {
 		c.scan(buf[:n])
 	}
 	return n, err
@@ -85,10 +86,11 @@ func (c *confirmingReader) scan(buf []byte) {
 	}
 }
 
-// firstContent calls content once.
+// firstContent calls content once and drops any line still being built.
 func (c *confirmingReader) firstContent() {
 	if !c.confirmed {
 		c.confirmed = true
+		c.line = nil
 		c.content()
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -2882,12 +2883,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	// TODO: should time a failed-over request from the serving attempt's send,
 	// not the abandoned attempt's: a first candidate that fails after a delay
 	// must not add that delay to the logged time.
-	// TODO: should not hold a streamed response's body in memory after its
-	// first content. confirmingReader keeps scanning past confirmation and never
-	// resets its line, so every later read appends up to its first newline: a
-	// 57,000-byte SSE stream read in 64-byte chunks left 24,091 bytes in
-	// c.line. The fix belongs in the one shared detector (stallfix1132 has the
-	// same code).
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
@@ -2925,6 +2920,109 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		})
 	})
 }
+
+func TestShouldRelayALongStreamWithoutHoldingItInMemory(t *testing.T) {
+	// Not parallel: the heap readings are process-wide, so nothing else may
+	// allocate between them.
+
+	// TODO(TODO.d/bound-the-detectors-pre-content-line.md): should not hold a
+	// pre-content line that never ends: an upstream that opens like SSE (a ':'
+	// comment or a field name) and then sends no newline grows the detector's
+	// line without bound.
+
+	// Reads are capped small so a detector still appending past its first
+	// content grows on every read.
+	const (
+		readCap   = 64
+		streamMin = 8 << 20
+	)
+	event := `data: {"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1769510400,"model":"gpt-5.2","choices":[{"index":0,"delta":{"content":"A streamed reply arrives one chunk at a time."},"finish_reason":null}]}` + "\n\n"
+
+	stream := make([]byte, 0, streamMin+2*len(event))
+	for len(stream) < streamMin {
+		stream = append(stream, event...)
+	}
+	stream = append(stream, "data: [DONE]\n\n"...)
+
+	var baseline, held uint64
+	client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(&smallReadReader{
+				r:     bytes.NewReader(stream),
+				limit: readCap,
+				atEOF: func() { held = liveHeap() },
+			}),
+		}, nil
+	})
+	srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+	}}, WithLogger(testLogger(t)))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer user-token")
+	w := &discardResponseWriter{header: make(http.Header)}
+
+	// The second reading is taken at the upstream's EOF, so it measures what
+	// the relay holds once its per-read garbage is collected.
+	baseline = liveHeap()
+	srv.ServeHTTP(w, req)
+
+	if w.status != http.StatusOK || w.written != len(stream) {
+		t.Fatalf("relayed status %d and %d bytes, want %d and the whole %d-byte stream", w.status, w.written, http.StatusOK, len(stream))
+	}
+	if limit := uint64(len(stream)) / 16; held > baseline && held-baseline >= limit {
+		t.Errorf("relaying a %d-byte stream held %d bytes at its end (limit %d): the relay must hold a small fixed amount, not an amount that grows with the stream",
+			len(stream), held-baseline, limit)
+	}
+}
+
+// liveHeap collects garbage and reports the bytes still reachable.
+func liveHeap() uint64 {
+	runtime.GC() //nolint:revive // call-to-gc: only a collection separates what is held from what is garbage.
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+// smallReadReader caps each Read at limit bytes, and calls atEOF, if set, when
+// its reader first reports [io.EOF].
+type smallReadReader struct {
+	r     io.Reader
+	limit int
+	atEOF func()
+}
+
+func (r *smallReadReader) Read(p []byte) (int, error) {
+	if len(p) > r.limit {
+		p = p[:r.limit]
+	}
+	n, err := r.r.Read(p)
+	if r.atEOF != nil && errors.Is(err, io.EOF) {
+		r.atEOF()
+		r.atEOF = nil
+	}
+	return n, err
+}
+
+// discardResponseWriter is an [http.ResponseWriter] that counts and drops body
+// bytes, so a test measuring memory can relay a large stream without
+// [httptest.ResponseRecorder] buffering it.
+type discardResponseWriter struct {
+	header  http.Header
+	status  int
+	written int
+}
+
+func (w *discardResponseWriter) Header() http.Header { return w.header }
+
+func (w *discardResponseWriter) Write(p []byte) (int, error) {
+	w.status = cmp.Or(w.status, http.StatusOK)
+	w.written += len(p)
+	return len(p), nil
+}
+
+func (w *discardResponseWriter) WriteHeader(status int) { w.status = status }
 
 // logRecordErrString renders a LogRecord error for comparison against a want map,
 // yielding "" for a nil error so a case that expects no error omits the key.
