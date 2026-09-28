@@ -2826,37 +2826,103 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the time from sending a request upstream to its first content", func(t *testing.T) test {
+		// Distinct delays: a clock stopped early (at the header, 1s, or the
+		// first framing line, 3s) reports a number the exact sum (10s) tells
+		// apart.
+		const (
+			headerDelay    = 1 * time.Second
+			keepAliveDelay = 2 * time.Second
+			eventDelay     = 3 * time.Second
+			dataDelay      = 4 * time.Second
+		)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(headerDelay)
+			// Inside the runner's bubble, so the pipe producer's waits
+			// advance its clock. Started with the response, so each delay
+			// follows the header's arrival.
+			bodyReader, bodyWriter := io.Pipe()
+			go func() {
+				defer bodyWriter.Close()
+				time.Sleep(keepAliveDelay)
+				_, _ = io.WriteString(bodyWriter, ": keep-alive\n\n")
+				time.Sleep(eventDelay)
+				_, _ = io.WriteString(bodyWriter, "event: message\n\n")
+				time.Sleep(dataDelay)
+				_, _ = io.WriteString(bodyWriter, `data: {"id":"chatcmpl-1","choices":[]}`+"\n\n")
+				_, _ = io.WriteString(bodyWriter, "data: [DONE]\n\n")
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       bodyReader,
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"time_to_first_content": headerDelay + keepAliveDelay + eventDelay + dataDelay,
+			},
+		}
+	})
+
+	// TODO: should log a non-streamed reply's time to first content as the time
+	// to its first non-whitespace byte: a JSON body whose leading whitespace and
+	// opening '{' arrive after distinct delays.
+	// TODO: should keep the time to the first data: event when later events
+	// arrive: a further data: event after its own delay must not move the time.
+	// TODO: should recognize a framing line split across reads as framing: an
+	// `event:` field name delivered in two writes with a delay between them
+	// (`eve`, then `nt: message`) must not be timed as content.
+	// TODO: should log no time to first content for a request whose response
+	// relayed none: a stream that ends after only keep-alive comments.
+	// TODO: should time a failed-over request from the serving attempt's send,
+	// not the abandoned attempt's: a first candidate that fails after a delay
+	// must not add that delay to the logged time.
+	// TODO: should not hold a streamed response's body in memory after its
+	// first content. confirmingReader keeps scanning past confirmation and never
+	// resets its line, so every later read appends up to its first newline: a
+	// 57,000-byte SSE stream read in 64-byte chunks left 24,091 bytes in
+	// c.line. The fix belongs in the one shared detector (stallfix1132 has the
+	// same code).
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
-		srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
+		synctest.Test(t, func(t *testing.T) {
+			srv := New(tt.validator, append([]Option{WithLogger(testLogger(t))}, tt.opts...)...)
 
-		req, err := http.NewRequestWithContext(t.Context(), cmp.Or(tt.method, http.MethodPost), cmp.Or(tt.path, "/v1/chat/completions"), strings.NewReader(tt.requestBody))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer user-token")
-		req.Header.Set("Content-Type", "application/json")
-
-		ctx := WithLogCtx(req.Context())
-		srv.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
-
-		rec, _ := LogRecordFromContext(ctx)
-		got := map[string]any{
-			"error":           logRecordErrString(rec.Err),
-			"backend_name":    rec.BackendName,
-			"model_requested": rec.ModelRequested,
-			"model_upstream":  rec.ModelUpstream,
-			"upstream_status": float64(rec.UpstreamStatus),
-			"excluded":        rec.Excluded,
-		}
-		for k := range got {
-			if _, present := tt.want[k]; !present {
-				delete(got, k)
+			req, err := http.NewRequestWithContext(t.Context(), cmp.Or(tt.method, http.MethodPost), cmp.Or(tt.path, "/v1/chat/completions"), strings.NewReader(tt.requestBody))
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if d := gocmp.Diff(tt.want, got, errorText); d != "" {
-			t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
-		}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+
+			ctx := WithLogCtx(req.Context())
+			srv.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+
+			rec, _ := LogRecordFromContext(ctx)
+			got := map[string]any{
+				"error":                 logRecordErrString(rec.Err),
+				"backend_name":          rec.BackendName,
+				"model_requested":       rec.ModelRequested,
+				"model_upstream":        rec.ModelUpstream,
+				"upstream_status":       float64(rec.UpstreamStatus),
+				"excluded":              rec.Excluded,
+				"time_to_first_content": rec.TimeToFirstContent,
+			}
+			for k := range got {
+				if _, present := tt.want[k]; !present {
+					delete(got, k)
+				}
+			}
+			if d := gocmp.Diff(tt.want, got, errorText); d != "" {
+				t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
+			}
+		})
 	})
 }
 

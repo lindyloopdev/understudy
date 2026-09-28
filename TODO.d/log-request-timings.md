@@ -8,11 +8,11 @@ on content*: its first value comes "from the target's own turnover" where the
 consumer supplies no time limit, which needs each target's observed time to
 first content.
 
-Nothing records how long a request takes to produce its first content, so the
-silence bound has no data to size its first value from, and no one can say
-what the longest healthy wait on a slow target (Kronk on a large context, a
-cold model load) actually is. `LogRecord` and `Attempt` record backends,
-models, statuses, and errors, but no timings.
+The silence bound still has no data until lindy records the field next to what
+only it knows, and no one can say what the longest healthy wait on a slow
+target (Kronk on a large context, a cold model load) actually is. `LogRecord`
+and `Attempt` record backends, models, statuses, and errors, but no header or
+queue timings.
 
 ## Where it belongs
 
@@ -29,19 +29,12 @@ models, statuses, and errors, but no timings.
 
 "First content" means: a stream's first `data:` event; any other body's first
 non-whitespace byte. Framing lines — SSE comments (keep-alives), `event:`,
-`id:`, `retry:` — are not content, whatever the Content-Type says. `main` has
-no code that detects it. Branch `stallfix1132` does: `confirmingReader` in
-`admission.go`, which session-ordered admission uses to confirm a request.
-Logging built on `main` needs the same rule; when the two branches meet there
-must be one detector, not two.
+`id:`, `retry:` — are not content, whatever the Content-Type says. When
+session-ordered admission lands on `main`, use `confirmingReader`
+(`firstcontent.go`) as its detector rather than building a second one.
 
 ## Work
 
-- **Log the time from sending a request upstream to its first content**, for
-  the attempt that served it. The number the silence bound needs.
-  - Tests: a request whose upstream sends content after a known delay is
-    logged with that delay; framing lines before the content do not count as
-    its first content.
 - **Log the time from sending a request upstream to its response header.**
   The gap between this and the first-content time is the stall
   [[stall-before-first-content-event]] describes: header early, content never.

@@ -35,8 +35,8 @@ reintroduce one.
   comment lines (streamed) or leading JSON whitespace (non-streamed —
   `isJSONSpace`) before committing status and headers to the client. A gate
   timeout before content demotes the target and replays the request to the next
-  candidate. The read-ahead is shared with [[session-ordered-admission]]'s
-  confirmation; whichever lands first builds it.
+  candidate. Build the gate on `confirmingReader` (`firstcontent.go`), shared
+  with [[session-ordered-admission]]'s confirmation.
 - **(open) Keep-alives from a busy local server are not a stall.** Kronk sends
   its 15s keep-alive while a request with a header waits in its own queue —
   where session-ordered admission deliberately parks the probe at the default

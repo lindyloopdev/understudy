@@ -1410,6 +1410,10 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
+	// TimeToFirstContent is the time from sending the serving attempt's
+	// request upstream to that attempt's first content, or zero when no
+	// content was relayed.
+	TimeToFirstContent time.Duration
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
 	// backends a listing could not use or could not reach. A chat request records
@@ -1507,6 +1511,12 @@ func addLogCalled(ctx context.Context, backend, upstreamModel string, status int
 func setLogUpstreamStatus(ctx context.Context, status int) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.UpstreamStatus = status
+	}
+}
+
+func setLogTimeToFirstContent(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeToFirstContent = d
 	}
 }
 
@@ -2216,6 +2226,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if s.httpClient != nil {
 			sel.cfg.HTTPClient = s.httpClient
 		}
+		// Per attempt: only the attempt that reaches the relay below reads
+		// sent, so a failed failover attempt never sets the record's timing.
+		sent := time.Now()
 		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
@@ -2320,7 +2333,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, err = io.Copy(w, &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel})
+		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
+		_, err = io.Copy(w, &confirmingReader{
+			r: relay,
+			content: func() {
+				setLogTimeToFirstContent(r.Context(), time.Since(sent))
+			},
+		})
 		_ = resp.Body.Close()
 		releaseHeld()
 		cancel(nil)
