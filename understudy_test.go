@@ -3023,9 +3023,41 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO: should log a non-streamed reply's time to first content as the time
-	// to its first non-whitespace byte: a JSON body whose leading whitespace and
-	// opening '{' arrive after distinct delays.
+	tests.AddFunc("should log a non-streamed reply's time to first content at its first non-whitespace byte", func(t *testing.T) test {
+		// Distinct delays so the logged time shows which byte stopped the
+		// clock: 6s at the '{', 3s had it stopped at the leading whitespace.
+		const (
+			headerDelay     = 1 * time.Second
+			whitespaceDelay = 2 * time.Second
+			jsonDelay       = 3 * time.Second
+		)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(headerDelay)
+			bodyReader, bodyWriter := io.Pipe()
+			go func() {
+				defer bodyWriter.Close()
+				time.Sleep(whitespaceDelay)
+				_, _ = io.WriteString(bodyWriter, "\n \t\r\n")
+				time.Sleep(jsonDelay)
+				_, _ = io.WriteString(bodyWriter, `{"id":"chatcmpl-1","choices":[]}`)
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       bodyReader,
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"time_to_first_content": headerDelay + whitespaceDelay + jsonDelay,
+			},
+		}
+	})
+
 	// TODO: should keep the time to the first data: event when later events
 	// arrive: a further data: event after its own delay must not move the time.
 
