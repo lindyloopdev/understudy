@@ -1396,8 +1396,9 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 }
 
 // LogRecord carries the per-request telemetry only understudy can supply: which
-// backend and model served, the upstream status, and the real error behind an
-// obfuscated body. Generic HTTP facts (response status, byte counts) are
+// backend and model served, the upstream status, the real error behind an
+// obfuscated body, and the serving attempt's times to its response header and
+// first content. Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
 type LogRecord struct {
@@ -1410,6 +1411,14 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
+	// TimeToResponseHeader is the time from sending the serving attempt's
+	// request upstream to that attempt's response header, or zero when no
+	// attempt served the request.
+	TimeToResponseHeader time.Duration
+	// TimeToFirstContent is the time from sending the serving attempt's
+	// request upstream to that attempt's first content, or zero when no
+	// content was relayed.
+	TimeToFirstContent time.Duration
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
 	// backends a listing could not use or could not reach. A chat request records
@@ -1507,6 +1516,18 @@ func addLogCalled(ctx context.Context, backend, upstreamModel string, status int
 func setLogUpstreamStatus(ctx context.Context, status int) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.UpstreamStatus = status
+	}
+}
+
+func setLogTimeToFirstContent(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeToFirstContent = d
+	}
+}
+
+func setLogTimeToResponseHeader(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeToResponseHeader = d
 	}
 }
 
@@ -2216,6 +2237,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if s.httpClient != nil {
 			sel.cfg.HTTPClient = s.httpClient
 		}
+		// Per attempt: only the attempt that reaches the relay below reads
+		// sent, so a failed failover attempt never sets the record's timing.
+		sent := time.Now()
 		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
@@ -2302,6 +2326,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			break
 		}
+		// Chat returns once the response header arrives, so this measures
+		// from the same sent instant as first content.
+		setLogTimeToResponseHeader(r.Context(), time.Since(sent))
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
 		for _, h := range sensitiveResponseHeaders {
@@ -2320,7 +2347,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, err = io.Copy(w, &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel})
+		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
+		_, err = io.Copy(w, &confirmingReader{
+			r: relay,
+			content: func() {
+				setLogTimeToFirstContent(r.Context(), time.Since(sent))
+			},
+		})
 		_ = resp.Body.Close()
 		releaseHeld()
 		cancel(nil)
