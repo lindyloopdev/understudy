@@ -2903,9 +2903,29 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO: should log zero times to response header and first content for a
-	// request no attempt served: its only target answers with an error after a
-	// delay, so a time recorded for the failed attempt would show as that delay.
+	tests.AddFunc("should log zero times to response header and first content for a request no attempt served", func(t *testing.T) test {
+		// The failure follows a delay, so any time recorded for the failed
+		// attempt is nonzero and fails the zero expectation.
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(2 * time.Second)
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"invalid api key"}}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"error":                   "upstream returned status 401: invalid api key",
+				"time_to_response_header": time.Duration(0),
+				"time_to_first_content":   time.Duration(0),
+			},
+		}
+	})
 
 	tests.AddFunc("should take a data: line of any length as first content", func(t *testing.T) test {
 		// The later [DONE] event has its own delay, so a detector that missed
