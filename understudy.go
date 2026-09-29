@@ -1396,8 +1396,9 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 }
 
 // LogRecord carries the per-request telemetry only understudy can supply: which
-// backend and model served, the upstream status, and the real error behind an
-// obfuscated body. Generic HTTP facts (response status, byte counts) are
+// backend and model served, the upstream status, the real error behind an
+// obfuscated body, and the serving attempt's times to its response header and
+// first content. Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
 type LogRecord struct {
@@ -1410,6 +1411,10 @@ type LogRecord struct {
 	ModelUpstream  string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
+	// TimeToResponseHeader is the time from sending the serving attempt's
+	// request upstream to that attempt's response header, or zero when no
+	// attempt served the request.
+	TimeToResponseHeader time.Duration
 	// TimeToFirstContent is the time from sending the serving attempt's
 	// request upstream to that attempt's first content, or zero when no
 	// content was relayed.
@@ -1517,6 +1522,12 @@ func setLogUpstreamStatus(ctx context.Context, status int) {
 func setLogTimeToFirstContent(ctx context.Context, d time.Duration) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.TimeToFirstContent = d
+	}
+}
+
+func setLogTimeToResponseHeader(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeToResponseHeader = d
 	}
 }
 
@@ -2315,6 +2326,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			break
 		}
+		// Chat returns once the response header arrives, so this measures
+		// from the same sent instant as first content.
+		setLogTimeToResponseHeader(r.Context(), time.Since(sent))
 		setLogUpstreamStatus(r.Context(), resp.StatusCode)
 
 		for _, h := range sensitiveResponseHeaders {

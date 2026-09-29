@@ -1045,9 +1045,10 @@ would be lost.
 **understudy owns its telemetry record; what a consumer does with it is the consumer's.**
 understudy's telemetry is understudy's, so its log record — the **`LogRecord`** value type —
 lives in understudy and holds **only what understudy can supply**: which backend and model
-served, the upstream status, and the real error behind an obfuscated body. Generic HTTP facts —
-response status, byte counts — are deliberately **not** on it: they are not understudy-specific,
-so putting them here would be understudy laying claim to facts that aren't its to own. A consumer
+served, the upstream status, the real error behind an obfuscated body, and how long the serving
+attempt took to its response header and to its first content — timed from its send upstream,
+which only understudy sees. Generic HTTP facts — response status, byte counts — are deliberately
+**not** on it: they are not understudy-specific, so putting them here would be understudy laying claim to facts that aren't its to own. A consumer
 installs a record with `WithLogCtx` (which derives and returns the context), understudy's
 handlers populate it in place, and the consumer reads it back as a **value copy** with
 `LogRecordFromContext` (which reports presence). understudy neither emits a log line nor assumes a

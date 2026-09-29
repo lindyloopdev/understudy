@@ -2869,6 +2869,44 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the time from sending a request upstream to its response header", func(t *testing.T) test {
+		// Distinct delays, so each logged value identifies whether the
+		// header or the first content produced it.
+		const (
+			headerDelay = 1 * time.Second
+			dataDelay   = 2 * time.Second
+		)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(headerDelay)
+			bodyReader, bodyWriter := io.Pipe()
+			go func() {
+				defer bodyWriter.Close()
+				time.Sleep(dataDelay)
+				_, _ = io.WriteString(bodyWriter, `data: {"id":"chatcmpl-1","choices":[]}`+"\n\n")
+				_, _ = io.WriteString(bodyWriter, "data: [DONE]\n\n")
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       bodyReader,
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"time_to_response_header": headerDelay,
+				"time_to_first_content":   headerDelay + dataDelay,
+			},
+		}
+	})
+
+	// TODO: should log zero times to response header and first content for a
+	// request no attempt served: its only target answers with an error after a
+	// delay, so a time recorded for the failed attempt would show as that delay.
+
 	tests.AddFunc("should take a data: line of any length as first content", func(t *testing.T) test {
 		// The later [DONE] event has its own delay, so a detector that missed
 		// the long line and fired on [DONE] reports a later time.
@@ -3111,13 +3149,14 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 
 			rec, _ := LogRecordFromContext(ctx)
 			got := map[string]any{
-				"error":                 logRecordErrString(rec.Err),
-				"backend_name":          rec.BackendName,
-				"model_requested":       rec.ModelRequested,
-				"model_upstream":        rec.ModelUpstream,
-				"upstream_status":       float64(rec.UpstreamStatus),
-				"excluded":              rec.Excluded,
-				"time_to_first_content": rec.TimeToFirstContent,
+				"error":                   logRecordErrString(rec.Err),
+				"backend_name":            rec.BackendName,
+				"model_requested":         rec.ModelRequested,
+				"model_upstream":          rec.ModelUpstream,
+				"upstream_status":         float64(rec.UpstreamStatus),
+				"excluded":                rec.Excluded,
+				"time_to_response_header": rec.TimeToResponseHeader,
+				"time_to_first_content":   rec.TimeToFirstContent,
 			}
 			for k := range got {
 				if _, present := tt.want[k]; !present {

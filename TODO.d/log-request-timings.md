@@ -10,9 +10,7 @@ first content.
 
 The silence bound still has no data until lindy records the field next to what
 only it knows, and no one can say what the longest healthy wait on a slow
-target (Kronk on a large context, a cold model load) actually is. `LogRecord`
-and `Attempt` record backends, models, statuses, and errors, but no header or
-queue timings.
+target (Kronk on a large context, a cold model load) actually is.
 
 ## Where it belongs
 
@@ -35,11 +33,6 @@ session-ordered admission lands on `main`, use `confirmingReader`
 
 ## Work
 
-- **Log the time from sending a request upstream to its response header.**
-  The gap between this and the first-content time is the stall
-  [[stall-before-first-content-event]] describes: header early, content never.
-  - Tests: a request whose upstream sends its header after one delay and its
-    content after another is logged with both.
 - **Log the time a request was held in the admission queue before it was
   sent.** Only once session-ordered admission (branch `stallfix1132`) is on
   `main`. Shows what admission costs each request.
