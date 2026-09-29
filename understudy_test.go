@@ -2957,14 +2957,49 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the first data: event's time when an event: line arrives split across reads", func(t *testing.T) test {
+		// The delays differ so a detector that reads the name's second
+		// half as content reports 6s, not 10s.
+		const (
+			headerDelay = 1 * time.Second
+			headDelay   = 2 * time.Second
+			tailDelay   = 3 * time.Second
+			dataDelay   = 4 * time.Second
+		)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(headerDelay)
+			bodyReader, bodyWriter := io.Pipe()
+			go func() {
+				defer bodyWriter.Close()
+				time.Sleep(headDelay)
+				_, _ = io.WriteString(bodyWriter, "eve")
+				time.Sleep(tailDelay)
+				_, _ = io.WriteString(bodyWriter, "nt: message\n\n")
+				time.Sleep(dataDelay)
+				_, _ = io.WriteString(bodyWriter, `data: {"id":"chatcmpl-1","choices":[]}`+"\n\n")
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       bodyReader,
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"time_to_first_content": headerDelay + headDelay + tailDelay + dataDelay,
+			},
+		}
+	})
+
 	// TODO: should log a non-streamed reply's time to first content as the time
 	// to its first non-whitespace byte: a JSON body whose leading whitespace and
 	// opening '{' arrive after distinct delays.
 	// TODO: should keep the time to the first data: event when later events
 	// arrive: a further data: event after its own delay must not move the time.
-	// TODO: should recognize a framing line split across reads as framing: an
-	// `event:` field name delivered in two writes with a delay between them
-	// (`eve`, then `nt: message`) must not be timed as content.
 	// TODO: should log no time to first content for a request whose response
 	// relayed none: a stream that ends after only keep-alive comments.
 
