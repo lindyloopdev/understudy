@@ -2995,13 +2995,39 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log a zero time to first content for a stream of only keep-alive comments", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			time.Sleep(1 * time.Second)
+			bodyReader, bodyWriter := io.Pipe()
+			go func() {
+				defer bodyWriter.Close()
+				time.Sleep(2 * time.Second)
+				_, _ = io.WriteString(bodyWriter, ": keep-alive\n\n")
+				time.Sleep(3 * time.Second)
+				_, _ = io.WriteString(bodyWriter, ": keep-alive\n\n")
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       bodyReader,
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"time_to_first_content": time.Duration(0),
+			},
+		}
+	})
+
 	// TODO: should log a non-streamed reply's time to first content as the time
 	// to its first non-whitespace byte: a JSON body whose leading whitespace and
 	// opening '{' arrive after distinct delays.
 	// TODO: should keep the time to the first data: event when later events
 	// arrive: a further data: event after its own delay must not move the time.
-	// TODO: should log no time to first content for a request whose response
-	// relayed none: a stream that ends after only keep-alive comments.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
