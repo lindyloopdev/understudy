@@ -7,11 +7,11 @@ three dispositions" (the content boundary, pre-content stalls, and "a keep-alive
 is not progress"); [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
 (the probe a pre-content demotion relies on);
 [DESIGN.md §Session-Ordered Admission](../DESIGN.md#session-ordered-admission)
-— *A bound on silence, keyed on content*, which now runs a gate before the
+— *A first-content timeout*, which runs a gate before the
 header too (retrying the same target, preserving rank); this file's gate is
 the separate question of demoting a target and replaying to a *different*
-candidate, and the two now need to agree on precedence — see the open note in
-[[session-ordered-admission]]'s own bound-on-silence item.
+candidate, and the two need to agree on precedence — see the open note in
+[[session-ordered-admission]]'s own first-content-timeout item.
 
 An upstream that sends `200` and then holds the stream open with SSE comment
 lines is pre-content: understudy withholds its status, headers, and comment
@@ -33,8 +33,8 @@ Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
 
 The damaging shape here is the one after the header — this file's demote-and-
 replay disposition never applied before one arrived, and still does not.
-Silence before the header is no longer ungated, though: [[session-ordered-admission]]'s
-own bound on silence now covers it, by retrying the same target rather than
+Silence before the header is gated: [[session-ordered-admission]]'s
+own first-content timeout covers it, by retrying the same target rather than
 replaying to a different one. The two gates answer different questions
 (replay elsewhere vs. retry in place) for what can be the same triggering
 silence, and which takes precedence is unsettled.

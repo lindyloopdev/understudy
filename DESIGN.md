@@ -381,8 +381,8 @@ position is moot — leaving three cases:
    demote the target to `readmitAt`, replay the triggering request to the next
    candidate, recover via the half-open probe. *(A provider holding a queued
    request open with keep-alives. Silence before the response header is not a
-   stall either: it is bounded by §Session-Ordered Admission's bound on
-   silence, which counts content and so covers both sides of the header.)*
+   stall either: it is bounded by §Session-Ordered Admission's first-content
+   timeout, which counts content and so covers both sides of the header.)*
 2. **Subsequent-request pre-content stall** — replayable, but switching forfeits
    coherence → the same disposition **gated by a coherence-sized wait budget**:
    hold in place longer, replaying only once the budget is spent. This is
@@ -401,9 +401,9 @@ first content, and the idle deadline measures the gap between content events. An
 upstream that sends only keep-alives has produced nothing, so it reaches
 whichever bound applies — the stall gate between header and content, the idle
 deadline after it. Before the header the gate is §Session-Ordered Admission's
-bound on silence: it counts from the request rather than from the header, so a
-backend that answers early and then says nothing is bounded on the same terms as
-one that never answers at all.
+first-content timeout: it counts from the request rather than from the header,
+so a backend that answers early and then says nothing is bounded on the same
+terms as one that never answers at all.
 
 Each
 entry is a full `(backend, model)` target, so a
@@ -1277,9 +1277,9 @@ self-limiting, not unbounded: refilling only ever fires as often as something
 actually completes, and a target serving less also completes less, so its own
 rate falls with the target's real capacity without anything watching for it.
 Whatever it admits in the meantime answers to the same rules as anything else —
-a stuck refill is preemptable and subject to the bound on silence below exactly
-like a stuck growth attempt, so a stale assumption costs at most the time until
-that machinery catches up, never an unbounded pile-up.
+a stuck refill is preemptable and subject to the first-content timeout below
+exactly like a stuck growth attempt, so a stale assumption costs at most the
+time until that machinery catches up, never an unbounded pile-up.
 
 A target whose capacity falls is discovered this way, not tracked: nothing is
 stored, decayed, or ratcheted, because neither rule ever holds a belief about
@@ -1302,15 +1302,15 @@ the wire cannot tell queueing from prefill, so ordering may not destroy work
 that may be underway. A higher-ranked arrival waits at the front of Understudy's
 queue instead. Liveness may destroy it — below.
 
-**A bound on silence, keyed on content.** Kronk waiting for a permit, Ollama
-queueing or prefilling or loading, and a remote holding a queued request look
-identical before the header; so do a request queued behind honest contention and
-one routed to a dead node. Understudy cannot separate them from a single
-observation and does not try. It bounds them instead: a request that has
-produced no content within the bound is canceled and sent again, whether or not
-its header arrived.
+**A first-content timeout.** Kronk waiting for a permit, Ollama queueing or
+prefilling or loading, and a remote holding a queued request look identical
+before the header; so do a request queued behind honest contention and one
+routed to a dead node. Understudy cannot separate them from a single observation
+and does not try. It bounds them instead: a request that has produced no content
+within the timeout is canceled and sent again, whether or not its header
+arrived.
 
-Keying that bound on content rather than on the header is what makes it reach
+Keying that timeout on content rather than on the header is what makes it reach
 the common case. On 2026-09-14 `deepseek-v4-flash` under load answered `200`
 after 12.5s and then sent nothing but `: keep-alive` lines for fifteen to
 nineteen minutes ([[stall-before-first-content-event]]) — every stuck request
@@ -1318,9 +1318,9 @@ was headered, so a rule that spares headered requests spares all of them. Being
 wrong is cheap and one-directional: canceling mid-prefill discards tens of
 seconds, while the silence it ends runs to tens of minutes.
 
-The bound escalates with each attempt on one request, because a bound shorter
-than an honest time-to-first-content is worse than the stall it replaces — a
-cold model load that never fits inside it would be canceled and restarted
+The timeout escalates with each attempt on one request, because a timeout
+shorter than an honest time-to-first-content is worse than the stall it replaces
+— a cold model load that never fits inside it would be canceled and restarted
 forever. Its first value must clear honest queueing at a slow backend, where a
 request can wait many minutes for its header with nothing wrong, so it comes
 from the consumer's time limit where one is supplied and from the target's own

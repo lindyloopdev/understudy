@@ -55,7 +55,7 @@ check and no regard for anything else unconfirmed at the target.
 - **A stuck refill answers to the same rules as a stuck growth attempt.**
   Refilling is not an exemption from anything downstream of admission — a
   refilled request that fails to confirm is preemptable by an outranking
-  arrival and subject to the bound on silence exactly like a growth attempt
+  arrival and subject to the first-content timeout exactly like a growth attempt
   that fails to confirm.
   - Tests: a refilled request that goes unconfirmed past its grace period is
     displaced by an outranking arrival the same way a growth attempt would

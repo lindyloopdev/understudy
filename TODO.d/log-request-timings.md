@@ -3,14 +3,14 @@
 **Tag:** understudy / observability
 
 **Design:** [DESIGN.md §Session-Ordered
-Admission](../DESIGN.md#session-ordered-admission) — *A bound on silence, keyed
-on content*: its first value comes "from the target's own turnover" where the
-consumer supplies no time limit, which needs each target's observed time to
-first content.
+Admission](../DESIGN.md#session-ordered-admission) — *A first-content timeout*:
+its first value comes "from the target's own turnover" where the consumer
+supplies no time limit, which needs each target's observed time to first
+content.
 
-The silence bound still has no data until lindy records the field next to what
-only it knows, and no one can say what the longest healthy wait on a slow
-target (Kronk on a large context, a cold model load) actually is.
+The first-content timeout still has no data until lindy records the field next
+to what only it knows, and no one can say what the longest healthy wait on a
+slow target (Kronk on a large context, a cold model load) actually is.
 
 ## Where it belongs
 

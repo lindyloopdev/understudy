@@ -31,31 +31,31 @@ limiter. The steps below remain, in order.
   tenant registry can call so the state goes at teardown instead.
   - Tests: a tenant dropped by the registry leaves no conversation state
     behind once its last request has ended.
-- **The bound on silence is unbuilt.** DESIGN.md's *A bound on silence, keyed
-  on content* replaces the old "no gate bounds the wait for a header": a
-  request producing no content within the bound is canceled and sent again to
+- **The first-content timeout is unbuilt.** DESIGN.md's *A first-content
+  timeout* replaces the old "no gate bounds the wait for a header": a
+  request producing no content within the timeout is canceled and sent again to
   the same target, whether or not its header arrived, so a submitted request
   is never silently unbounded regardless of contention. None of it exists yet.
-  - The bound fires on its own timer, independent of any arrival — a lone
+  - The timeout fires on its own timer, independent of any arrival — a lone
     wedged request with nobody else contending at that target must still
     eventually retry, since nothing else will ever trigger a recheck of it.
   - When it fires on a target that gives no work before its header, every
     headerless request at that target restarts together, in rank order, so
     the retry restores ordering rather than scrambling it.
-  - The bound escalates with each attempt on one request, so a legitimately
+  - The timeout escalates with each attempt on one request, so a legitimately
     slow first attempt is not retried forever at an interval shorter than it
     could ever succeed within.
   - A mass-retry after such a restart follows growth's ordinary rule — burst
     together, not serialized one at a time — since nothing about a retry
     changes what growth already knows to do with a fresh admission.
   - (open) Whether a new arrival accelerates the drop of an already-wedged
-    *headered* request, or only the bound's own independent timer ever
+    *headered* request, or only the timeout's own independent timer ever
     resolves it, is undecided.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two
     decide precedence is unsettled.
-  - Tests: a submitted request producing no content for longer than the bound,
+  - Tests: a submitted request producing no content for longer than the timeout,
     with nothing else contending for its target, is eventually canceled and
     retried with nobody else involved; several headerless requests at one
     target, all wedged together, restart together and are re-admitted per
