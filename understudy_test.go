@@ -6226,6 +6226,10 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		// replyHeadersOnly: sends headers as soon as the request arrives, and
 		// never any content.
 		replyHeadersOnly
+		// replyStreamsUntilReleasedThenBreaks: starts streaming as soon as the
+		// request arrives, and breaks off with an error when the test releases
+		// the backend.
+		replyStreamsUntilReleasedThenBreaks
 	)
 	// turn is one conversation turn: the chat request the test's client sends
 	// to Understudy, and how the fake backend answers when Understudy forwards
@@ -6268,6 +6272,15 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		held:    "held",
 		pending: "unconfirmed",
 	})
+	tests.Add("should send a request held back from a busy backend as soon as one of the backend's streaming answers breaks off with an error", test{
+		turns: []turn{
+			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleasedThenBreaks},
+			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
+		},
+		held:    "held",
+		pending: "unconfirmed",
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -6285,9 +6298,9 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 			now := make(chan struct{})
 			close(now)
 			// stream sends headers at once, its first content when contentAt
-			// closes (never, if contentAt is nil), and finishes when ends
-			// closes.
-			stream := func(r *http.Request, contentAt, ends <-chan struct{}) *http.Response {
+			// closes (never, if contentAt is nil), and finishes with endErr
+			// when ends closes.
+			stream := func(r *http.Request, contentAt, ends <-chan struct{}, endErr error) *http.Response {
 				reads := 0
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -6306,7 +6319,7 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 						case <-r.Context().Done():
 							return 0, context.Cause(r.Context())
 						case <-ends:
-							return 0, io.EOF
+							return 0, endErr
 						}
 					})),
 				}
@@ -6314,11 +6327,13 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 			client := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
 				switch replies[message] {
 				case replyContentWhenReleased:
-					return stream(r, release, streamEnds), nil
+					return stream(r, release, streamEnds, io.EOF), nil
 				case replyStreamsUntilReleased:
-					return stream(r, now, release), nil
+					return stream(r, now, release, io.EOF), nil
 				case replyHeadersOnly:
-					return stream(r, nil, streamEnds), nil
+					return stream(r, nil, streamEnds, io.EOF), nil
+				case replyStreamsUntilReleasedThenBreaks:
+					return stream(r, now, release, io.ErrUnexpectedEOF), nil
 				}
 				return admissionJSON(message), nil
 			})
@@ -6515,9 +6530,8 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 
 // TODO(TODO.d/refill-and-growth-admission.md): a refilled request that goes
 // unconfirmed past its grace period should be displaced by an outranking
-// arrival the same way a growth attempt would be, and a confirmed request that
-// ends with an error should trigger the same immediate refill as one that ends
-// cleanly — refilling earns no exemption from anything downstream of admission.
+// arrival the same way a growth attempt would be — refilling earns no
+// exemption from anything downstream of admission.
 
 // TODO(TODO.d/refill-and-growth-admission.md): a confirmed request's completion,
 // with the head of the wait list already abandoned by its own client, should

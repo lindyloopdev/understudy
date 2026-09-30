@@ -17,8 +17,6 @@ check and no regard for anything else unconfirmed at the target.
 
 ## Work
 
-- **Test that a confirmed request ending with an error triggers the same
-  immediate refill as one that ends cleanly.**
 - **Test that two confirmed requests ending close together each independently
   and immediately admit their own replacement, neither waiting on the other's
   header or confirmation** — the case DeepSeek/wide-backend behavior depends
