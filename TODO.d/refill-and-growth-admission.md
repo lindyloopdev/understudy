@@ -53,7 +53,9 @@ check and no regard for anything else unconfirmed at the target.
   pins it.
   - Tests: several requests arriving close together, all still within their
     individual grace periods, are all admitted immediately with no queueing
-    among them.
+    among them; once a formed queue has drained — every waiter admitted and
+    resolved, nothing left unconfirmed past its grace period — a later
+    arrival passes straight through again.
 - **A stuck refill answers to the same rules as a stuck growth attempt.**
   Refilling is not an exemption from anything downstream of admission — a
   refilled request that fails to confirm is preemptable by an outranking

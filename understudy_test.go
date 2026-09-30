@@ -6034,6 +6034,115 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 	})
 }
 
+// statusWritingRecorder records whether a status was written; a plain
+// recorder defaults its code to 200 before anything is written, so it cannot.
+type statusWritingRecorder struct {
+	*httptest.ResponseRecorder
+	wroteStatus bool
+}
+
+func (r *statusWritingRecorder) WriteHeader(code int) {
+	r.wroteStatus = true
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func (r *statusWritingRecorder) Write(p []byte) (int, error) {
+	r.wroteStatus = true
+	return r.ResponseRecorder.Write(p)
+}
+
+// TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyWhenItsFirstContentArrives
+// verifies that an upstream answer ahead of its first content reaches the
+// client as nothing, and that the first content releases the whole answer:
+// status, headers, and every byte sent, in order.
+func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyWhenItsFirstContentArrives(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ask        = "the streaming session asks"
+			keepAlives = ": keep-alive\n\n: keep-alive\n\n"
+			dataLine   = "data: {\"id\":\"streamed\"}\n\n"
+		)
+		firstContent := make(chan struct{})
+		// streamEnds keeps the stream open past the assertions, so the answer
+		// under them is exactly the bytes the upstream has sent.
+		streamEnds := make(chan struct{})
+		t.Cleanup(func() { close(streamEnds) })
+
+		client := admissionClient(t, nil, func(r *http.Request, _ string) (*http.Response, error) {
+			reads := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": {"text/event-stream"},
+					"X-Upstream":   {"upstreams-own-header"},
+				},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					reads++
+					switch reads {
+					case 1:
+						return copy(p, keepAlives), nil
+					case 2:
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-firstContent:
+						}
+						return copy(p, dataLine), nil
+					}
+					<-streamEnds
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+
+		rec := &statusWritingRecorder{ResponseRecorder: httptest.NewRecorder()}
+		go func() {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(admissionTurn(admissionMsg("user", ask))))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			req.Header.Set("Authorization", "Bearer user-token")
+			req.Header.Set("Content-Type", "application/json")
+			newAdmissionServer(t, client).ServeHTTP(rec, req)
+		}()
+		synctest.Wait()
+
+		if rec.wroteStatus {
+			t.Error("the client was sent a status while the upstream had sent no content, want none")
+		}
+		if len(rec.Header()) != 0 {
+			t.Errorf("the client was sent headers %v while the upstream had sent no content, want none", rec.Header())
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("the client was sent body %q while the upstream had sent only keep-alive lines, want none", rec.Body.String())
+		}
+
+		close(firstContent)
+		synctest.Wait()
+
+		if !rec.wroteStatus || rec.Code != http.StatusOK {
+			t.Errorf("once the first content arrived the client was sent status %d (written %t), want the upstream's %d", rec.Code, rec.wroteStatus, http.StatusOK)
+		}
+		if got := rec.Header().Get("X-Upstream"); got != "upstreams-own-header" {
+			t.Errorf("once the first content arrived the client was sent X-Upstream %q, want the upstream's %q", got, "upstreams-own-header")
+		}
+		if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+			t.Errorf("once the first content arrived the client was sent Content-Type %q, want the upstream's %q", got, "text/event-stream")
+		}
+		if got, want := rec.Body.String(), keepAlives+dataLine; got != want {
+			t.Errorf("once the first content arrived the client was sent body %q, want every byte the upstream had sent, in order: %q", got, want)
+		}
+	})
+}
+
+// TODO(TODO.d/stall-before-first-content-event.md): an upstream whose body
+// ends without ever reaching content — only keep-alive lines or leading
+// whitespace, then the end — should still reach the client whole when it
+// ends: the upstream's status, its headers, and the bytes it sent. Nothing
+// tests it; the case above holds its stream open past the assertions.
+
 // TestShouldAdmitAHeldTurn verifies that a turn held behind an unconfirmed
 // request at its target is admitted when the test releases the fake backend,
 // and only then: each case keeps another turn unresolved throughout.

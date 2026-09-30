@@ -14,10 +14,13 @@ candidate, and the two now need to agree on precedence — see the open note in
 [[session-ordered-admission]]'s own bound-on-silence item.
 
 An upstream that sends `200` and then holds the stream open with SSE comment
-lines is treated as mid-stream: no demotion, no replay — nothing gates the
-attempt between the header and the first content. The stream idle watchdog
-(`idleReader`, `streamIdleTimeout`) resets on any byte, so the same keep-alives
-defeat it too, and the request runs until the client gives up.
+lines is pre-content: understudy withholds its status, headers, and comment
+lines until the first content, so nothing is committed to the client and the
+attempt could still be replayed. Nothing acts on that yet: no gate times the
+wait between the header and the first content, and the stream idle watchdog
+(`idleReader`, `streamIdleTimeout`) resets on any byte, so the same
+keep-alives defeat it too, and the request still runs until the client gives
+up.
 
 Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
 
@@ -38,12 +41,18 @@ silence, and which takes precedence is unsettled.
 
 ## Work
 
-- Gate from the response header to the first content: read ahead past SSE
-  comment lines (streamed) or leading JSON whitespace (non-streamed —
-  `isJSONSpace`) before committing status and headers to the client. A gate
-  timeout before content demotes the target and replays the request to the next
-  candidate. Build the gate on `confirmingReader` (`firstcontent.go`), shared
-  with [[session-ordered-admission]]'s confirmation.
+- **Test a body that ends before any content.** The relay withholds an
+  upstream's status, headers, and pre-content bytes until its first content,
+  and releases them when the body ends if no content ever came; nothing
+  tests that release.
+  - Tests: an upstream that sends its status, headers, and only keep-alive
+    lines before its body ends reaches the client with that status, those
+    headers, and those bytes.
+- Gate from the response header to the first content: a gate timeout before
+  content demotes the target and replays the request to the next candidate.
+  The read-ahead it needs is built — the relay withholds status, headers, and
+  pre-content bytes until `confirmingReader` (`firstcontent.go`) finds
+  content — so a timed-out attempt has committed nothing to the client.
 - **(open) Keep-alives from a busy local server are not a stall.** Kronk sends
   its 15s keep-alive while a request with a header waits in its own queue —
   where session-ordered admission deliberately parks the probe at the default

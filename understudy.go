@@ -1634,6 +1634,43 @@ func cause(ctx context.Context, err error) error {
 	return err
 }
 
+// withheldResponse withholds an upstream answer ahead of its first content:
+// the status, headers, and body bytes it hands over — including the comment
+// lines and leading whitespace ahead of that content — are held, not dropped,
+// so commit can send every byte in order.
+type withheldResponse struct {
+	w      http.ResponseWriter
+	header http.Header
+	status int
+	held   bytes.Buffer
+	sent   bool
+}
+
+// Write holds the body's bytes until commit releases them.
+func (h *withheldResponse) Write(p []byte) (int, error) {
+	if h.sent {
+		return h.w.Write(p)
+	}
+	_, _ = h.held.Write(p)
+	return len(p), nil
+}
+
+// commit sends the withheld answer — status, headers, then the held bytes, in
+// order. Only the first call sends anything: the relay calls it at the first
+// content and again where the copy ends, since a body that never reached
+// content still ended and its client is still owed the answer.
+func (h *withheldResponse) commit() {
+	if h.sent {
+		return
+	}
+	h.sent = true
+	maps.Copy(h.w.Header(), h.header)
+	h.w.WriteHeader(h.status)
+	// Discarding the write's error is deliberate: a client gone by this write
+	// surfaces on the next one or at the copy's end.
+	_, _ = h.w.Write(h.held.Bytes())
+}
+
 // Error envelope `type` values. The first three are OpenAI-spec, written by
 // [writeJSONError]; the upstream_* values are understudy's own, written by the
 // rejects that end a request rather than relay it.
@@ -2441,19 +2478,17 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			resp.Header.Del("Content-Length")
 		}
 
-		// TODO(TODO.d/session-ordered-admission.md): the consumer's time limit
-		// withholds the upstream's status and headers until the first content;
-		// this cycle commits them as the upstream sends them.
-		maps.Copy(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
 		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
-		_, err = io.Copy(w, &confirmingReader{
+		held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
+		_, err = io.Copy(held, &confirmingReader{
 			r: relay,
 			content: func() {
+				held.commit()
 				queue.confirm(pend)
 				setLogTimeToFirstContent(r.Context(), time.Since(sent))
 			},
 		})
+		held.commit()
 		_ = resp.Body.Close()
 		queue.finish(pend)
 		releaseHeld()

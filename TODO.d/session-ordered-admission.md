@@ -71,15 +71,6 @@ limiter. The steps below remain, in order.
   - Tests: the highest-ranked unconfirmed request at a target is taken by the
     sweep, not spared as the probe, when a different, headered request is the
     one currently unconfirmed at that target.
-- **Withhold status and headers until the first content.** The relay commits
-  the upstream's status and headers as they arrive; hold them until the
-  confirmation read-ahead (past SSE comments and leading JSON whitespace)
-  finds content.
-  - Tests against a fake contended backend: a request whose header arrived is
-    never displaced; a request within its grace period is not canceled;
-    headerless requests ranked above the arrival stay outstanding; an
-    uncontended backend never forms a queue; a consumer aborting a held
-    request removes it; the queue drains back to straight-through.
 - **Two untested nuances of preemption, both already true of the code.**
   First: a preempting arrival waits behind *every* unconfirmed request at its
   target once it is queued, not only the ones it outranked — the admission rule
