@@ -2264,6 +2264,31 @@ func TestRewriteModel(t *testing.T) {
 	})
 }
 
+// stalledStreamFirstEvent is a complete SSE event so the stream stalls only
+// after the client has received content.
+const stalledStreamFirstEvent = "data: {}\n\n"
+
+// sseData returns the data of each event in an SSE body, in order, dropping
+// framing so tests compare only what a client reads.
+func sseData(body string) []string {
+	var events []string
+	var data []string
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if data != nil {
+				events = append(events, strings.Join(data, "\n"))
+				data = nil
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "data:"); ok {
+			data = append(data, strings.TrimPrefix(v, " "))
+		}
+	}
+	return events
+}
+
 func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := testy.HTTPClient(func(req *http.Request) (*http.Response, error) {
@@ -2272,7 +2297,7 @@ func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 			body := io.NopCloser(readerFunc(func(p []byte) (int, error) {
 				if first {
 					first = false
-					return copy(p, "data"), nil
+					return copy(p, stalledStreamFirstEvent), nil
 				}
 				<-reqCtx.Done()
 				return 0, reqCtx.Err()
@@ -2297,8 +2322,8 @@ func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Errorf("status: got %d, want 200", rr.Code)
 		}
-		if got := rr.Body.String(); got != "data" {
-			t.Errorf("body: got %q, want %q", got, "data")
+		if d := gocmp.Diff([]string{"{}"}, sseData(rr.Body.String())); d != "" {
+			t.Errorf("events the client received before the stall (-want +got):\n%s", d)
 		}
 	})
 }
@@ -2384,7 +2409,7 @@ func TestChatCompletionsRecordsErrorOnStalledStream(t *testing.T) {
 			body := io.NopCloser(readerFunc(func(p []byte) (int, error) {
 				if first {
 					first = false
-					return copy(p, "data"), nil
+					return copy(p, stalledStreamFirstEvent), nil
 				}
 				<-reqCtx.Done()
 				return 0, reqCtx.Err()
