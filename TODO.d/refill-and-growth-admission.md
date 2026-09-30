@@ -38,20 +38,18 @@ check and no regard for anything else unconfirmed at the target.
     admitted early just because a slot opened moments before it arrived.
 - **Pin the headered case of growth's hold-on-unconfirmed check.** Growth
   holds an arrival while anything at its target is unconfirmed past grace;
-  its test covers the headerless occupant only. Add the headered counterpart:
+  `TestShouldSendOrHoldARequestOnArrival` covers the headerless occupant
+  only. Add the headered counterpart as a row there:
   a fresh, non-outranking arrival is held without ever reaching the target
   while a *headered* request at that target is unconfirmed past its grace
   period (a target admitting to its own internal queue before serving, the
   way Kronk can) — header state must not matter to this check, only
   confirmation state.
-- **Growth still bursts freely while nothing has proven a limit.** Multiple
-  simultaneous arrivals, none of which has yet gone unconfirmed past its
-  grace period, should all pass straight through — this may already hold by
-  accident of the current code (nothing currently stops it), but nothing
-  pins it.
-  - Tests: several requests arriving close together, all still within their
-    individual grace periods, are all admitted immediately with no queueing
-    among them; once a formed queue has drained — every waiter admitted and
+- **Growth bursts freely again once a formed queue has drained.** A burst
+  of arrivals, none yet unconfirmed past its grace period, is pinned to pass
+  straight through; nothing pins that the same holds after a queue has
+  formed and drained.
+  - Tests: once a formed queue has drained — every waiter admitted and
     resolved, nothing left unconfirmed past its grace period — a later
     arrival passes straight through again.
 - **A stuck refill answers to the same rules as a stuck growth attempt.**

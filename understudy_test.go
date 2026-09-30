@@ -6457,59 +6457,6 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 	})
 }
 
-// A headerless, unconfirmed turn past its grace period holds a
-// non-outranking arrival: the arrival never reaches the target until the turn
-// already there resolves.
-func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPastItsGracePeriod(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		target := newAdmissionTarget(t)
-		var mu sync.Mutex
-		sends := map[string]int{}
-
-		client := admissionClient(t, target, func(r *http.Request, ask string) (*http.Response, error) {
-			mu.Lock()
-			sends[ask]++
-			mu.Unlock()
-			if err := target.serve(r.Context(), ask); err != nil {
-				return nil, err
-			}
-			return admissionJSON(ask), nil
-		})
-		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-		post := func(label, body string) {
-			go poster.post(t.Context(), label, body)
-		}
-
-		// The occupying session's turn reaches the target directly — nothing
-		// else contends — and blocks there headerless through its generation.
-		post("occupier", admissionTurn(admissionMsg("user", admissionAskLong)))
-		synctest.Wait()
-		time.Sleep(3 * time.Second)
-
-		// The younger session first appears now, so its turn outranks
-		// nothing at the target.
-		post("younger", admissionTurn(admissionMsg("user", admissionAskYounger)))
-		synctest.Wait()
-		time.Sleep(3 * time.Second)
-
-		mu.Lock()
-		sent := sends[admissionAskYounger]
-		mu.Unlock()
-		if sent != 0 {
-			t.Errorf("the target received %d requests for the younger session's turn; a non-outranking arrival is held while a headerless request sits unconfirmed past its grace period", sent)
-		}
-		if _, ok := poster.answered("younger"); ok {
-			t.Error("the younger session's turn was answered while the occupying session's turn was still unconfirmed at the target")
-		}
-
-		// The occupying session's generation ends; the held turn takes the
-		// target it freed and is answered.
-		target.endLongGeneration()
-		synctest.Wait()
-		poster.answeredOK("occupier", "younger")
-	})
-}
-
 // TODO(TODO.d/refill-and-growth-admission.md): two confirmed completions
 // ending close together, at a target slow enough to answer that gating on
 // header latency would visibly serialize the replacements, should each
@@ -6523,10 +6470,82 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 // slot opened moments before it arrived. Nothing is remembered across that gap
 // by design; this pins the deliberate absence of that memory.
 
-// TODO(TODO.d/refill-and-growth-admission.md): several requests arriving close
-// together, none of which has yet gone unconfirmed past its own grace period,
-// should all be admitted immediately with no queueing among them. This may
-// already hold by accident of the current code; nothing pins it.
+// TestShouldSendOrHoldARequestOnArrival verifies which arriving requests
+// Understudy sends to the backend. Every request already at the backend stays
+// silent; one silent past the grace period is the sign the backend is full.
+func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
+	// arrival is one session's request.
+	type arrival struct {
+		// ask is the user message the client sends; it is also the session's
+		// first message, so every arrival is a session of its own.
+		ask string
+		// after is how long the client waits after the previous arrival
+		// before sending it.
+		after time.Duration
+	}
+	type test struct {
+		arrivals []arrival
+		// reached is the asks the backend received by the time the last
+		// arrival was sent, in order.
+		reached []string
+	}
+
+	tests := testy.NewTable[test]()
+	tests.Add("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", test{
+		arrivals: []arrival{
+			{ask: "the first session asks"},
+			{ask: "the second session asks", after: admissionGracePeriod / 4},
+			{ask: "the third session asks", after: admissionGracePeriod / 4},
+		},
+		reached: []string{"the first session asks", "the second session asks", "the third session asks"},
+	})
+	tests.Add("should hold a newer session's request arriving while another at the backend has been silent past the grace period", test{
+		arrivals: []arrival{
+			{ask: "the older session asks"},
+			{ask: "the newer session asks", after: admissionGracePeriod + time.Second},
+		},
+		reached: []string{"the older session asks"},
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			// answer keeps every request at the backend silent until
+			// cleanup, so none frees a place for another.
+			answer := make(chan struct{})
+			t.Cleanup(func() { close(answer) })
+			var mu sync.Mutex
+			var reached []string
+			client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+				mu.Lock()
+				reached = append(reached, ask)
+				mu.Unlock()
+				select {
+				case <-r.Context().Done():
+					return nil, context.Cause(r.Context())
+				case <-answer:
+				}
+				return admissionJSON(ask), nil
+			})
+			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+
+			for _, a := range tt.arrivals {
+				time.Sleep(a.after)
+				go poster.post(t.Context(), a.ask, admissionTurn(admissionMsg("user", a.ask)))
+				synctest.Wait()
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if d := gocmp.Diff(tt.reached, reached); d != "" {
+				t.Errorf("requests the backend received on their arrival (-want +got):\n%s", d)
+			}
+		})
+	})
+}
+
+// TODO(TODO.d/refill-and-growth-admission.md): once a formed queue has
+// drained — every waiter sent and answered, nothing silent past its grace
+// period — a later arrival should reach the backend on arrival again.
 
 // TODO(TODO.d/refill-and-growth-admission.md): a refilled request that goes
 // unconfirmed past its grace period should be displaced by an outranking
