@@ -41,13 +41,14 @@ silence, and which takes precedence is unsettled.
 
 ## Work
 
-- **Test a body that ends before any content.** The relay withholds an
-  upstream's status, headers, and pre-content bytes until its first content,
-  and releases them when the body ends if no content ever came; nothing
-  tests that release.
-  - Tests: an upstream that sends its status, headers, and only keep-alive
-    lines before its body ends reaches the client with that status, those
-    headers, and those bytes.
+- **Test a body that is only leading whitespace before it ends.** The relay
+  withholds an upstream's status, headers, and pre-content bytes until its
+  first content, and releases them when the body ends if no content ever
+  came; a body of only keep-alive lines is tested, one of only leading
+  whitespace is not.
+  - Tests: an upstream that sends its status, headers, and only leading
+    whitespace before its body ends reaches the client with that status,
+    those headers, and those bytes.
 - Gate from the response header to the first content: a gate timeout before
   content demotes the target and replays the request to the next candidate.
   The read-ahead it needs is built — the relay withholds status, headers, and
