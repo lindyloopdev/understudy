@@ -6098,8 +6098,9 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 		err  error
 	}
 	type test struct {
-		// next is what the upstream's body yields after its keep-alive lines,
-		// once the test releases it.
+		// opening is the upstream's body before the test holds it; not content.
+		opening string
+		// next is what the body yields after opening, once the test releases it.
 		next []read
 	}
 
@@ -6107,13 +6108,17 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 
 	tests := testy.NewTable[test]()
 	tests.Add("should receive the upstream's answer when its first content arrives", test{
-		next: []read{{data: "data: {\"id\":\"streamed\"}\n\n"}},
+		opening: keepAlives,
+		next:    []read{{data: "data: {\"id\":\"streamed\"}\n\n"}},
 	})
-	tests.Add("should receive the upstream's answer when its body ends without content", test{
-		next: []read{{err: io.EOF}},
+	tests.Add("should receive the upstream's answer when its body ends after only keep-alive lines", test{
+		opening: keepAlives,
+		next:    []read{{err: io.EOF}},
 	})
-	// TODO(TODO.d/stall-before-first-content-event.md): a body that is only
-	// leading whitespace, then its end, should reach the client whole too.
+	tests.Add("should receive the upstream's answer when its body ends after only leading whitespace", test{
+		opening: "\n  \r\n\t",
+		next:    []read{{err: io.EOF}},
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -6135,7 +6140,7 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
 						reads++
 						if reads == 1 {
-							return copy(p, keepAlives), nil
+							return copy(p, tt.opening), nil
 						}
 						if reads == 2 {
 							select {
@@ -6174,7 +6179,7 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 				t.Errorf("the client was sent headers %v while the upstream had sent no content, want none", rec.Header())
 			}
 			if rec.Body.Len() != 0 {
-				t.Errorf("the client was sent body %q while the upstream had sent only keep-alive lines, want none", rec.Body.String())
+				t.Errorf("the client was sent body %q while the upstream had sent no content, want none", rec.Body.String())
 			}
 
 			close(upstreamGoesOn)
@@ -6190,7 +6195,7 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 				t.Errorf("once the upstream went on the client was sent Content-Type %q, want the upstream's %q", got, "text/event-stream")
 			}
 			var want strings.Builder
-			want.WriteString(keepAlives)
+			want.WriteString(tt.opening)
 			for _, r := range tt.next {
 				want.WriteString(r.data)
 			}
