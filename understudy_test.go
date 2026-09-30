@@ -5563,7 +5563,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			{label: "occupier-opening", asks: []string{occupier}},
 			{label: "older-opening", after: time.Second, asks: []string{older}},
 			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{occupier, admissionAskD}, upstreamReply: replyStreamsFromRelease},
+			{label: "occupier", after: time.Second, asks: []string{occupier, admissionAskLong}, upstreamReply: replyStreamsFromRelease},
 			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 			{label: "older", after: 500 * time.Millisecond, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 		},
@@ -5573,7 +5573,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		turns: []turn{
 			{label: "older-opening", asks: []string{older}},
 			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{admissionAskD}, upstreamReply: replyStreamsFromRelease},
+			{label: "occupier", after: time.Second, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
 			{label: "younger", after: 500 * time.Millisecond, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 			{label: "older", after: 500 * time.Millisecond, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 		},
@@ -5585,7 +5585,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		turns: []turn{
 			{label: "older-opening", asks: []string{older}},
 			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{admissionAskD}, upstreamReply: replyStreamsFromRelease},
+			{label: "occupier", after: time.Second, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
 			{label: "older", after: time.Second, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 		},
@@ -5600,7 +5600,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			{label: "younger-opening", after: time.Second, asks: []string{younger}},
 			{label: "younger-second", after: 10 * time.Hour, asks: []string{younger, younger + " (2)"}},
 			{label: "younger-third", after: 10 * time.Hour, asks: []string{younger, younger + " (3)"}},
-			{label: "occupier", after: 10 * time.Hour, asks: []string{admissionAskD}, upstreamReply: replyStreamsFromRelease},
+			{label: "occupier", after: 10 * time.Hour, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
 			{label: "older", after: time.Second, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 		},
@@ -5728,13 +5728,10 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 // conversation state is reclaimed by the forget backstop rather than at
 // teardown.
 
-// admissionAskD's turn holds the target's only slot for a long generation
-// ([admissionTarget.serve]); A and B are the two sessions
-// [admissionQueueFormed] stages behind it.
+// admissionAskLong is the occupying session's ask, whose turn holds the
+// target's only slot for a long generation ([admissionTarget.serve]).
 const (
-	admissionAskD           = "session D asks"
-	admissionAskB           = "session B asks"
-	admissionAskA2          = "session A asks again"
+	admissionAskLong        = "the occupying session asks for a long answer"
 	admissionLongGeneration = 3 * time.Minute
 )
 
@@ -5787,7 +5784,7 @@ func (a *admissionTarget) release() {
 }
 
 // serve runs one request through the target's slot, holding it for
-// [admissionLongGeneration] when ask is D's. A canceled generation still
+// [admissionLongGeneration] when ask is the occupying session's. A canceled generation still
 // occupies the slot to the end: the target offers no finer-grained
 // interruption than that.
 func (a *admissionTarget) serve(ctx context.Context, ask string) error {
@@ -5795,7 +5792,7 @@ func (a *admissionTarget) serve(ctx context.Context, ask string) error {
 		return err
 	}
 	defer a.release()
-	if ask != admissionAskD {
+	if ask != admissionAskLong {
 		return nil
 	}
 	timer := time.NewTimer(admissionLongGeneration)
@@ -5935,38 +5932,38 @@ func (p *admissionPoster) answeredOK(labels ...string) {
 	}
 }
 
-// admissionQueueFormed posts the turns that leave B queued behind A's second
-// turn: D takes the target's only slot, A's first turn fixes A's age, B waits
-// at the target past the grace period with no header, and A's second turn
-// outranks it and displaces it. D asks first so it outranks A: an arrival
-// displaces every headerless request ranked below it, and a displaced D
-// generation would re-run ahead of B. B posts under bCtx so a case can take
-// its client away while it waits.
-func admissionQueueFormed(ctx, bCtx context.Context, p *admissionPoster) {
-	// A's second turn repeats its first turn's messages, which fix A's rank,
-	// so only this function needs them by name.
-	const (
-		sysA = "answer in one word"
-		askA = "session A asks"
-	)
+// admissionQueueFormed posts the turns that leave the younger session's turn
+// queued behind the older session's second turn: the occupying session takes
+// the target's only slot, the older session's opening turn fixes its age, the
+// younger session's turn waits at the target past the grace period with no
+// header, and the older session's second turn outranks it and displaces it.
+// The occupying session asks first so it outranks the older one: an arrival
+// displaces every headerless request ranked below it, and a displaced
+// occupying generation would re-run ahead of the younger session's turn. The
+// younger session posts under youngerCtx so a case can take its client away
+// while it waits.
+func admissionQueueFormed(ctx, youngerCtx context.Context, p *admissionPoster) {
+	// The older session's second turn repeats its opening turn's messages,
+	// which fix its rank, so only this function needs them by name.
+	const olderSystem = "answer in one word"
 
-	go p.post(ctx, "D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+	go p.post(ctx, "occupier", admissionTurn(admissionMsg("user", admissionAskLong)))
 	synctest.Wait()
 	time.Sleep(time.Second)
 
-	go p.post(ctx, "A-first", admissionTurn(admissionMsg("system", sysA), admissionMsg("user", askA)))
+	go p.post(ctx, "older-opening", admissionTurn(admissionMsg("system", olderSystem), admissionMsg("user", admissionAskOlder)))
 	synctest.Wait()
 	time.Sleep(time.Second)
 
-	go p.post(bCtx, "B-first", admissionTurn(admissionMsg("user", admissionAskB)))
+	go p.post(youngerCtx, "younger", admissionTurn(admissionMsg("user", admissionAskYounger)))
 	synctest.Wait()
 	time.Sleep(3 * time.Second)
 
-	go p.post(ctx, "A-second", admissionTurn(
-		admissionMsg("system", sysA),
-		admissionMsg("user", askA),
+	go p.post(ctx, "older", admissionTurn(
+		admissionMsg("system", olderSystem),
+		admissionMsg("user", admissionAskOlder),
 		admissionMsg("assistant", "word"),
-		admissionMsg("user", admissionAskA2),
+		admissionMsg("user", admissionAskOlder+" again"),
 	))
 	synctest.Wait()
 }
@@ -6380,26 +6377,26 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 		target := &admissionTarget{}
 
 		poster := newAdmissionPoster(t, newAdmissionServer(t, admissionClient(t, target, nil)))
-		bCtx, clientGoesAway := context.WithCancel(t.Context())
-		admissionQueueFormed(t.Context(), bCtx, poster)
+		youngerCtx, clientGoesAway := context.WithCancel(t.Context())
+		admissionQueueFormed(t.Context(), youngerCtx, poster)
 
 		clientGoesAway()
 		synctest.Wait()
 
-		rec, ok := poster.answered("B-first")
+		rec, ok := poster.answered("younger")
 		if !ok {
-			t.Fatal("B's request was still held after its client went away; a held request does not outlive the client waiting for it")
+			t.Fatal("the younger session's request was still held after its client went away; a held request does not outlive the client waiting for it")
 		}
 		if rec.Code == http.StatusOK {
-			t.Errorf("B's client got status %d after going away; want an error", rec.Code)
+			t.Errorf("the younger session's client got status %d after going away; want an error", rec.Code)
 		}
 
 		// A departed client leaves the queue intact for the requests it held
 		// up.
 		time.Sleep(admissionLongGeneration + time.Second)
 		synctest.Wait()
-		if _, ok := poster.answered("A-second"); !ok {
-			t.Error("A's second turn never completed after the held request's client left")
+		if _, ok := poster.answered("older"); !ok {
+			t.Error("the older session's second turn never completed after the held request's client left")
 		}
 	})
 }
@@ -6429,13 +6426,13 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 
 		// The occupying session's turn reaches the target directly — nothing
 		// else contends — and blocks there headerless through its generation.
-		post("D-first", admissionTurn(admissionMsg("user", admissionAskD)))
+		post("occupier", admissionTurn(admissionMsg("user", admissionAskLong)))
 		synctest.Wait()
 		time.Sleep(3 * time.Second)
 
 		// The younger session first appears now, so its turn outranks
 		// nothing at the target.
-		post("younger-first", admissionTurn(admissionMsg("user", admissionAskYounger)))
+		post("younger", admissionTurn(admissionMsg("user", admissionAskYounger)))
 		synctest.Wait()
 		time.Sleep(3 * time.Second)
 
@@ -6445,7 +6442,7 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 		if sent != 0 {
 			t.Errorf("the target received %d requests for the younger session's turn; a non-outranking arrival is held while a headerless request sits unconfirmed past its grace period", sent)
 		}
-		if _, ok := poster.answered("younger-first"); ok {
+		if _, ok := poster.answered("younger"); ok {
 			t.Error("the younger session's turn was answered while the occupying session's turn was still unconfirmed at the target")
 		}
 
@@ -6453,7 +6450,7 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 		// target it freed and is answered.
 		time.Sleep(admissionLongGeneration + time.Second)
 		synctest.Wait()
-		poster.answeredOK("D-first", "younger-first")
+		poster.answeredOK("occupier", "younger")
 	})
 }
 
