@@ -5729,11 +5729,9 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 // teardown.
 
 // admissionAskLong is the occupying session's ask, whose turn holds the
-// target's only slot for a long generation ([admissionTarget.serve]).
-const (
-	admissionAskLong        = "the occupying session asks for a long answer"
-	admissionLongGeneration = 3 * time.Minute
-)
+// target's only slot until the test ends its generation
+// ([admissionTarget.serve]).
+const admissionAskLong = "the occupying session asks for a long answer"
 
 // admissionAskOlder and admissionAskYounger open two sessions whose turns
 // contend for one target; the older session is the one seen first.
@@ -5749,6 +5747,23 @@ type admissionTarget struct {
 	mu      sync.Mutex
 	serving bool
 	waiters []chan struct{}
+
+	longGenerationEnds chan struct{}
+	endOnce            sync.Once
+}
+
+// newAdmissionTarget registers [admissionTarget.endLongGeneration] as a
+// cleanup, so a test that fails before ending the generation leaves nothing
+// blocked.
+func newAdmissionTarget(t *testing.T) *admissionTarget {
+	a := &admissionTarget{longGenerationEnds: make(chan struct{})}
+	t.Cleanup(a.endLongGeneration)
+	return a
+}
+
+// endLongGeneration ends the occupying session's generation.
+func (a *admissionTarget) endLongGeneration() {
+	a.endOnce.Do(func() { close(a.longGenerationEnds) })
 }
 
 func (a *admissionTarget) acquire(ctx context.Context) error {
@@ -5783,10 +5798,10 @@ func (a *admissionTarget) release() {
 	a.serving = false
 }
 
-// serve runs one request through the target's slot, holding it for
-// [admissionLongGeneration] when ask is the occupying session's. A canceled generation still
-// occupies the slot to the end: the target offers no finer-grained
-// interruption than that.
+// serve runs one request through the target's slot, holding it until
+// [admissionTarget.endLongGeneration] when ask is the occupying session's. A
+// canceled generation still occupies the slot to the end: the target offers
+// no finer-grained interruption than that.
 func (a *admissionTarget) serve(ctx context.Context, ask string) error {
 	if err := a.acquire(ctx); err != nil {
 		return err
@@ -5795,13 +5810,11 @@ func (a *admissionTarget) serve(ctx context.Context, ask string) error {
 	if ask != admissionAskLong {
 		return nil
 	}
-	timer := time.NewTimer(admissionLongGeneration)
-	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		<-timer.C
+		<-a.longGenerationEnds
 		return ctx.Err()
-	case <-timer.C:
+	case <-a.longGenerationEnds:
 	}
 	return nil
 }
@@ -6374,7 +6387,7 @@ func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *t
 
 func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		target := &admissionTarget{}
+		target := newAdmissionTarget(t)
 
 		poster := newAdmissionPoster(t, newAdmissionServer(t, admissionClient(t, target, nil)))
 		youngerCtx, clientGoesAway := context.WithCancel(t.Context())
@@ -6393,7 +6406,7 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 
 		// A departed client leaves the queue intact for the requests it held
 		// up.
-		time.Sleep(admissionLongGeneration + time.Second)
+		target.endLongGeneration()
 		synctest.Wait()
 		if _, ok := poster.answered("older"); !ok {
 			t.Error("the older session's second turn never completed after the held request's client left")
@@ -6406,7 +6419,7 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 // already there resolves.
 func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPastItsGracePeriod(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		target := &admissionTarget{}
+		target := newAdmissionTarget(t)
 		var mu sync.Mutex
 		sends := map[string]int{}
 
@@ -6448,7 +6461,7 @@ func TestShouldHoldANonOutrankingArrivalWhileAHeaderlessRequestIsUnconfirmedPast
 
 		// The occupying session's generation ends; the held turn takes the
 		// target it freed and is answered.
-		time.Sleep(admissionLongGeneration + time.Second)
+		target.endLongGeneration()
 		synctest.Wait()
 		poster.answeredOK("occupier", "younger")
 	})
