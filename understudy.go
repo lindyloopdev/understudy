@@ -2144,13 +2144,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var throttled *failedAttempt
 	var lastFailure *failedAttempt
 	var remaining []Target
-	// sends counts this request's attempts on the walk, so the first-content
-	// timeout can escalate with each.
+	// timeoutEscalations counts this walk's re-sends that the first-content
+	// timeout itself caused; those are the only ones that double the next
+	// attempt's timeout, since a displacement says nothing about how slow
+	// the target is.
 	//
-	// TODO(TODO.d/session-ordered-admission.md): only attempts at one target
-	// that the timeout itself ended should escalate it: a failover's new
-	// target starts at the first value, and a displacement leaves it as it was.
-	var sends int
+	// TODO(TODO.d/session-ordered-admission.md): a failover's new target
+	// should start at the timeout's first value, not the escalated one this
+	// count reaches it with.
+	var timeoutEscalations int
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
@@ -2348,8 +2350,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					sel.cfg.HTTPClient = s.httpClient
 				}
 				sent = time.Now()
-				sends++
-				queue.armFirstContentTimeout(pend, sends)
+				queue.armFirstContentTimeout(pend, timeoutEscalations)
 				resp, sendErr = sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 			}
 			if sendErr == nil && !queue.attemptEnded(pend, nil) {
@@ -2382,6 +2383,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// request whose client left goes no further than dropping it from
 			// the line here; the queue does not yet admit around a departed
 			// head.
+			if queue.takeFirstContentTimedOut(pend) {
+				timeoutEscalations++
+			}
 			if resp != nil {
 				_ = resp.Body.Close()
 				resp = nil

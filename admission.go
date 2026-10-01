@@ -127,15 +127,16 @@ type targetQueue struct {
 // pending is one attempt's standing at a target queue: its rank, when it
 // reached the target, and how far the target's answer has come.
 type pending struct {
-	queue             *targetQueue
-	rank              time.Time
-	arrived           time.Time
-	cancel            context.CancelCauseFunc
-	admitted          chan struct{}
-	headered          bool
-	confirmed         bool
-	preempted         bool
-	firstContentTimer *time.Timer
+	queue                *targetQueue
+	rank                 time.Time
+	arrived              time.Time
+	cancel               context.CancelCauseFunc
+	admitted             chan struct{}
+	headered             bool
+	confirmed            bool
+	preempted            bool
+	firstContentTimedOut bool
+	firstContentTimer    *time.Timer
 }
 
 // pastGrace reports whether p's grace period has elapsed as of now.
@@ -278,17 +279,18 @@ func (q *targetQueue) attemptEnded(p *pending, err error) bool {
 // armFirstContentTimeout arms the first-content timeout for p's current
 // attempt: no content within the timeout — whether the attempt is still
 // waiting for its header or reading a body that has sent none — ends the
-// attempt and the request is sent again. It doubles with each attempt so an
-// honest attempt slower than the first is not canceled and restarted forever.
-// First content disables it: once content has arrived, silence is the stream
-// idle deadline's to bound, not this timeout's.
-func (q *targetQueue) armFirstContentTimeout(p *pending, attempt int) {
+// attempt and the request is sent again. escalations is how many of the
+// request's earlier re-sends this timeout itself caused; each doubles this
+// attempt's timeout, so an honest attempt slower than the first is not
+// canceled and restarted forever. First content disables it: once content has
+// arrived, silence is the stream idle deadline's to bound, not this timeout's.
+func (q *targetQueue) armFirstContentTimeout(p *pending, escalations int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<(attempt-1), func() { q.firstContentTimedOut(p) })
+	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<escalations, func() { q.expireFirstContentTimeout(p) })
 }
 
-// firstContentTimedOut preempts p's attempt when its first-content timeout
+// expireFirstContentTimeout preempts p's attempt when its first-content timeout
 // expires with no content arrived. Ending it commits nothing to the client —
 // the relay withholds the upstream's status, headers, and pre-content bytes
 // until first content — so the request can be sent again to the same target.
@@ -297,15 +299,26 @@ func (q *targetQueue) armFirstContentTimeout(p *pending, attempt int) {
 // backend that gives no work before its header, every headerless request at
 // that target should restart together in send order, so the retry restores
 // ordering rather than scrambling it; this ends only the one attempt.
-func (q *targetQueue) firstContentTimedOut(p *pending) {
+func (q *targetQueue) expireFirstContentTimeout(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if p.confirmed || p.preempted || !slices.Contains(q.outstanding, p) {
 		return
 	}
 	p.preempted = true
+	p.firstContentTimedOut = true
 	q.insert(p)
 	p.cancel(errors.New("no content within the first-content timeout"))
+}
+
+// takeFirstContentTimedOut reports whether p's latest attempt timed out waiting
+// for its first content, and clears the mark so each time-out is counted once.
+func (q *targetQueue) takeFirstContentTimedOut(p *pending) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	timedOut := p.firstContentTimedOut
+	p.firstContentTimedOut = false
+	return timedOut
 }
 
 // await blocks until the queue admits a displaced attempt, honoring ctx: a

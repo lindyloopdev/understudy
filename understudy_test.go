@@ -6485,6 +6485,68 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
+	tests.AddFunc("should cut a displaced request's re-sent attempt at the first-content timeout's first value, sending it a third time", func(t *testing.T) test {
+		const (
+			olderMessage     = "the older session butts in"
+			olderMessage2    = "the older session butts in again"
+			displacedMessage = "the displaced session asks on"
+			thirdAnswer      = "displaced third answer"
+		)
+		received := &receivedAsks{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage != displacedMessage {
+				return sseAnswer(inboundMessage), nil
+			}
+			switch received.count(inboundMessage) {
+			case 1:
+				// The first attempt waits at the target with no header,
+				// until the older session's second turn displaces it.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			case 2:
+				// The re-sent attempt answers with a header at once and
+				// then sends no content, until the attempt is withdrawn.
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			return sseAnswer(thirdAnswer), nil
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				// The older session's first turn fixes its rank ahead of the
+				// displaced session, which has not arrived yet.
+				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
+				// The displaced session's turn reaches the target directly
+				// and waits there headerless past its grace period.
+				{inboundMessage: displacedMessage, body: admissionTurn(admissionMsg("user", displacedMessage)), after: time.Second},
+				// The older session's second turn outranks it, displacing
+				// the headerless attempt; the re-send the displacement
+				// causes then waits out the timeout.
+				{inboundMessage: olderMessage2, body: admissionTurn(
+					admissionMsg("user", olderMessage),
+					admissionMsg("assistant", "answered"),
+					admissionMsg("user", olderMessage2),
+				), after: admissionGracePeriod + time.Second},
+			},
+			// The re-sent attempt reaches the target at the last arrival
+			// and is cut at the timeout's first value, 60s later. Had the
+			// displacement doubled the timeout, the third send would still
+			// be a minute away at this check.
+			wait:     70 * time.Second,
+			followed: displacedMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, thirdAnswer)},
+			sends:    3,
+		}
+	})
 	tests.AddFunc("should relay a stream past the first-content timeout once its content has begun, without sending the request again", func(t *testing.T) test {
 		const message = "the streaming session asks"
 		received := &receivedAsks{}
@@ -6523,11 +6585,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
-	// TODO(TODO.d/session-ordered-admission.md): only the timeout's own
-	// re-sends to one target should escalate it. A request displaced and
-	// re-sent should have its next attempt cut at the first value, not a
-	// doubled one; after a failover, the new target's first attempt should be
-	// cut at the first value too.
+	// TODO(TODO.d/session-ordered-admission.md): after a failover, the new
+	// target's first attempt should be cut at the timeout's first value, not
+	// the escalated one the walk reaches it with.
 
 	// TODO(TODO.d/session-ordered-admission.md): a stream whose first content
 	// arrives at the very instant its first-content timeout fires should reach

@@ -38,11 +38,11 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - Escalate only on the timeout's own re-sends to one target. Today every
-    send of the request escalates it, across the whole failover walk.
+  - Cut a failover's new target's first attempt at the first-content
+    timeout's first value, not at the escalated value the walk's earlier
+    re-sends reach the count with.
     - Tests: after a failover, the new target's first attempt is cut at the
-      first value; a request displaced and re-sent is cut at the first value
-      on its next attempt.
+      first value.
   - Record first content before sending it to the client. The relay sends
     it first, so a timeout firing in between can cut a stream whose content
     the client already has.
