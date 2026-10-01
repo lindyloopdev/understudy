@@ -23,7 +23,3 @@ stays green with no test diff.
 - **One meaning per `attemptEnded` call.** It is called after a header
   arrives, after a failed send, and after the relay, with a different
   question each time; once the loop is split, each call has one place.
-- **Name the inbound message plainly in the admission tests.** "Ask" names
-  the last user message the client sends (`admissionAsk`, `admissionAskLong`,
-  `admissionAskOlder`/`Younger`, `receivedAsks`, `ask` parameters);
-  `inboundMessage` is the name the newer tables use.

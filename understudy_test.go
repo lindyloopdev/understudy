@@ -5540,10 +5540,10 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		// after is how long the client waits, after the previous turn, before
 		// sending this one.
 		after time.Duration
-		// asks are the user messages of the turn's conversation, in order; the
-		// first identifies its session, and the last is what the fake backend
-		// sees. Each is unique across the case.
-		asks          []string
+		// userMessages are the turn's user messages, in order; the first
+		// identifies its session, and the last is what the fake backend sees.
+		// Each is unique across the case.
+		userMessages  []string
 		upstreamReply upstreamReply
 	}
 	type test struct {
@@ -5555,30 +5555,30 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 
 	const (
 		occupier = "the occupying session asks"
-		older    = admissionAskOlder
-		younger  = admissionAskYounger
+		older    = admissionOlderMessage
+		younger  = admissionYoungerMessage
 	)
 
 	tests := testy.NewTable[test]()
 
 	tests.Add("should send the older session's turn first when Understudy holds both turns behind a higher-ranked occupier, the younger's having arrived first", test{
 		turns: []turn{
-			{label: "occupier-opening", asks: []string{occupier}},
-			{label: "older-opening", after: time.Second, asks: []string{older}},
-			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{occupier, admissionAskLong}, upstreamReply: replyStreamsFromRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-			{label: "older", after: 500 * time.Millisecond, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
+			{label: "occupier-opening", userMessages: []string{occupier}},
+			{label: "older-opening", after: time.Second, userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "occupier", after: time.Second, userMessages: []string{occupier, admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 		},
 		first: "older", second: "younger",
 	})
 	tests.Add("should send the older session's turn first when both turns already wait at the target, the younger's having arrived first", test{
 		turns: []turn{
-			{label: "older-opening", asks: []string{older}},
-			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
-			{label: "younger", after: 500 * time.Millisecond, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-			{label: "older", after: 500 * time.Millisecond, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
+			{label: "older-opening", userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
+			{label: "younger", after: 500 * time.Millisecond, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
 		},
 		first: "older", second: "younger",
 	})
@@ -5586,11 +5586,11 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	// still remembered, keeps its turn first.
 	tests.Add("should send the older session's turn first when the younger's arrives behind it", test{
 		turns: []turn{
-			{label: "older-opening", asks: []string{older}},
-			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "occupier", after: time.Second, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
-			{label: "older", after: time.Second, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
+			{label: "older-opening", userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
+			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 		},
 		first: "older", second: "younger",
 	})
@@ -5599,13 +5599,13 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	// the older session returns after more than a day.
 	tests.Add("should send the younger session's turn first when the older session was away too long to remember", test{
 		turns: []turn{
-			{label: "older-opening", asks: []string{older}},
-			{label: "younger-opening", after: time.Second, asks: []string{younger}},
-			{label: "younger-second", after: 10 * time.Hour, asks: []string{younger, younger + " (2)"}},
-			{label: "younger-third", after: 10 * time.Hour, asks: []string{younger, younger + " (3)"}},
-			{label: "occupier", after: 10 * time.Hour, asks: []string{admissionAskLong}, upstreamReply: replyStreamsFromRelease},
-			{label: "older", after: time.Second, asks: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, asks: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
+			{label: "older-opening", userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "younger-second", after: 10 * time.Hour, userMessages: []string{younger, younger + " (2)"}},
+			{label: "younger-third", after: 10 * time.Hour, userMessages: []string{younger, younger + " (3)"}},
+			{label: "occupier", after: 10 * time.Hour, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
+			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
 		},
 		first: "younger", second: "older",
 	})
@@ -5621,9 +5621,9 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			streamEnds := make(chan struct{})
 			t.Cleanup(func() { close(streamEnds) })
 
-			byAsk := map[string]turn{}
+			byMessage := map[string]turn{}
 			for _, tn := range tt.turns {
-				byAsk[tn.asks[len(tn.asks)-1]] = tn
+				byMessage[tn.userMessages[len(tn.userMessages)-1]] = tn
 			}
 
 			// received records every attempt the backend receives, in the order
@@ -5635,10 +5635,10 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			}
 			var mu sync.Mutex
 			var received []*attempt
-			client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-				tn := byAsk[ask]
+			client := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+				tn := byMessage[inboundMessage]
 				if tn.upstreamReply == replyAtOnce {
-					return admissionJSON(ask), nil
+					return admissionJSON(inboundMessage), nil
 				}
 				a := &attempt{label: tn.label}
 				mu.Lock()
@@ -5653,7 +5653,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 				case <-release:
 				}
 				if tn.upstreamReply == replyAtRelease {
-					return admissionJSON(ask), nil
+					return admissionJSON(inboundMessage), nil
 				}
 				reads := 0
 				return &http.Response{
@@ -5677,12 +5677,12 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 
 			for _, tn := range tt.turns {
 				time.Sleep(tn.after)
-				messages := make([]string, 0, 2*len(tn.asks))
-				for i, ask := range tn.asks {
+				messages := make([]string, 0, 2*len(tn.userMessages))
+				for i, message := range tn.userMessages {
 					if i > 0 {
 						messages = append(messages, admissionMsg("assistant", "word"))
 					}
-					messages = append(messages, admissionMsg("user", ask))
+					messages = append(messages, admissionMsg("user", message))
 				}
 				go poster.post(t.Context(), tn.label, admissionTurn(messages...))
 				synctest.Wait()
@@ -5731,16 +5731,16 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 // conversation state is reclaimed by the forget backstop rather than at
 // teardown.
 
-// admissionAskLong is the occupying session's ask, whose turn holds the
-// target's only slot until the test ends its generation
+// admissionLongMessage is the occupying session's message, whose turn holds
+// the target's only slot until the test ends its generation
 // ([admissionTarget.serve]).
-const admissionAskLong = "the occupying session asks for a long answer"
+const admissionLongMessage = "the occupying session asks for a long answer"
 
-// admissionAskOlder and admissionAskYounger open two sessions whose turns
-// contend for one target; the older session is the one seen first.
+// admissionOlderMessage and admissionYoungerMessage open two sessions whose
+// turns contend for one target; the older session is the one seen first.
 const (
-	admissionAskOlder   = "the older session asks"
-	admissionAskYounger = "the younger session asks"
+	admissionOlderMessage   = "the older session asks"
+	admissionYoungerMessage = "the younger session asks"
 )
 
 // admissionTarget doubles a model server with a single decode slot: it serves
@@ -5802,15 +5802,15 @@ func (a *admissionTarget) release() {
 }
 
 // serve runs one request through the target's slot, holding it until
-// [admissionTarget.endLongGeneration] when ask is the occupying session's. A
-// canceled generation still occupies the slot to the end: the target offers
-// no finer-grained interruption than that.
-func (a *admissionTarget) serve(ctx context.Context, ask string) error {
+// [admissionTarget.endLongGeneration] when inboundMessage is the occupying
+// session's. A canceled generation still occupies the slot to the end: the
+// target offers no finer-grained interruption than that.
+func (a *admissionTarget) serve(ctx context.Context, inboundMessage string) error {
 	if err := a.acquire(ctx); err != nil {
 		return err
 	}
 	defer a.release()
-	if ask != admissionAskLong {
+	if inboundMessage != admissionLongMessage {
 		return nil
 	}
 	select {
@@ -5835,13 +5835,10 @@ func admissionTurn(messages ...string) string {
 	return fmt.Sprintf(`{"model":"openai/gpt-4","messages":[%s]}`, strings.Join(messages, ","))
 }
 
-// admissionAsk reports a request's last message, which names the request for a
-// doubled target: a session's second turn stays distinguishable from its
-// first.
-//
-// TODO(TODO.d/simplify-the-send-loop.md): "ask" here and across the admission
-// tests names the inbound message; rename it inboundMessage throughout.
-func admissionAsk(t *testing.T, r *http.Request) string {
+// admissionInboundMessage reports a request's last message, which names the
+// request for a doubled target: a session's second turn stays
+// distinguishable from its first.
+func admissionInboundMessage(t *testing.T, r *http.Request) string {
 	t.Helper()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -5870,20 +5867,20 @@ func admissionJSON(id string) *http.Response {
 	}
 }
 
-// admissionClient hands each request to handle along with the ask that names
-// it. A nil handle serves every request through the slot and answers with the
-// ask's own name.
-func admissionClient(t *testing.T, target *admissionTarget, handle func(r *http.Request, ask string) (*http.Response, error)) *http.Client {
+// admissionClient hands each request to handle along with the inbound
+// message that names it. A nil handle serves every request through the slot
+// and answers with that message as its id.
+func admissionClient(t *testing.T, target *admissionTarget, handle func(r *http.Request, inboundMessage string) (*http.Response, error)) *http.Client {
 	if handle == nil {
-		handle = func(r *http.Request, ask string) (*http.Response, error) {
-			if err := target.serve(r.Context(), ask); err != nil {
+		handle = func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			if err := target.serve(r.Context(), inboundMessage); err != nil {
 				return nil, err
 			}
-			return admissionJSON(ask), nil
+			return admissionJSON(inboundMessage), nil
 		}
 	}
 	return testy.HTTPClient(func(r *http.Request) (*http.Response, error) {
-		return handle(r, admissionAsk(t, r))
+		return handle(r, admissionInboundMessage(t, r))
 	})
 }
 
@@ -5966,23 +5963,23 @@ func admissionQueueFormed(ctx, youngerCtx context.Context, p *admissionPoster) {
 	// which fix its rank, so only this function needs them by name.
 	const olderSystem = "answer in one word"
 
-	go p.post(ctx, "occupier", admissionTurn(admissionMsg("user", admissionAskLong)))
+	go p.post(ctx, "occupier", admissionTurn(admissionMsg("user", admissionLongMessage)))
 	synctest.Wait()
 	time.Sleep(time.Second)
 
-	go p.post(ctx, "older-opening", admissionTurn(admissionMsg("system", olderSystem), admissionMsg("user", admissionAskOlder)))
+	go p.post(ctx, "older-opening", admissionTurn(admissionMsg("system", olderSystem), admissionMsg("user", admissionOlderMessage)))
 	synctest.Wait()
 	time.Sleep(time.Second)
 
-	go p.post(youngerCtx, "younger", admissionTurn(admissionMsg("user", admissionAskYounger)))
+	go p.post(youngerCtx, "younger", admissionTurn(admissionMsg("user", admissionYoungerMessage)))
 	synctest.Wait()
 	time.Sleep(3 * time.Second)
 
 	go p.post(ctx, "older", admissionTurn(
 		admissionMsg("system", olderSystem),
-		admissionMsg("user", admissionAskOlder),
+		admissionMsg("user", admissionOlderMessage),
 		admissionMsg("assistant", "word"),
-		admissionMsg("user", admissionAskOlder+" again"),
+		admissionMsg("user", admissionOlderMessage+" again"),
 	))
 	synctest.Wait()
 }
@@ -6008,8 +6005,8 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			const (
-				askStreamed = "the streamed session asks"
-				askHeld     = "the held session asks"
+				streamedMessage = "the streamed session asks"
+				heldMessage     = "the held session asks"
 			)
 			// Holds the streamed answer back past the turn's grace period.
 			answerBegins := make(chan struct{})
@@ -6020,9 +6017,9 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 			streamEnds := make(chan struct{})
 			t.Cleanup(func() { close(streamEnds) })
 
-			client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-				if ask != askStreamed {
-					return admissionJSON(ask), nil
+			client := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+				if inboundMessage != streamedMessage {
+					return admissionJSON(inboundMessage), nil
 				}
 				select {
 				case <-r.Context().Done():
@@ -6051,15 +6048,15 @@ func TestShouldHoldTheNextWaiterUntilAStreamedTargetReachesItsFirstDataEvent(t *
 			})
 
 			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-			post := func(label, ask string) {
-				go poster.post(t.Context(), label, admissionTurn(admissionMsg("user", ask)))
+			post := func(label, message string) {
+				go poster.post(t.Context(), label, admissionTurn(admissionMsg("user", message)))
 			}
 
-			post("streamed", askStreamed)
+			post("streamed", streamedMessage)
 			synctest.Wait()
 			time.Sleep(admissionGracePeriod + time.Second)
 
-			post("held", askHeld)
+			post("held", heldMessage)
 			synctest.Wait()
 
 			close(answerBegins)
@@ -6128,7 +6125,7 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			const ask = "the streaming session asks"
+			const message = "the streaming session asks"
 			upstreamGoesOn := make(chan struct{})
 			// streamEnds keeps the stream open past the assertions, so the answer
 			// under them is exactly the bytes the upstream has sent.
@@ -6167,7 +6164,7 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 			rec := &statusWritingRecorder{ResponseRecorder: httptest.NewRecorder()}
 			go func() {
 				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
-					strings.NewReader(admissionTurn(admissionMsg("user", ask))))
+					strings.NewReader(admissionTurn(admissionMsg("user", message))))
 				if err != nil {
 					t.Error(err)
 					return
@@ -6398,7 +6395,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		models   map[string]LogicalModel
 		// received records the inbound messages of the requests that reach
 		// the followed request's target.
-		received *receivedAsks
+		received *receivedMessages
 		arrivals []arrival
 		// wait is how long the test waits after the last arrival before
 		// looking at the answer.
@@ -6420,7 +6417,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			raced            = "displaced raced answer"
 			resent           = "displaced resent answer"
 		)
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
 			received.add(inboundMessage)
 			if inboundMessage != displacedMessage {
@@ -6460,7 +6457,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 	})
 	tests.AddFunc("should answer with the second send when the target stays silent past the first-content timeout, which doubles for that send", func(t *testing.T) test {
 		const message = "the lone session asks a target that stays silent"
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
 			received.add(sentMessage)
 			if received.count(sentMessage) == 1 {
@@ -6497,7 +6494,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			displacedMessage = "the displaced session asks on"
 			thirdAnswer      = "displaced third answer"
 		)
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
 			received.add(inboundMessage)
 			if inboundMessage != displacedMessage {
@@ -6554,7 +6551,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 	})
 	tests.AddFunc("should relay a stream past the first-content timeout once its content has begun, without sending the request again", func(t *testing.T) test {
 		const message = "the streaming session asks"
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
 			received.add(sentMessage)
 			reads := 0
@@ -6591,7 +6588,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 	})
 	tests.AddFunc("should cut a failover's new target's first attempt at the first-content timeout's first value, sending the request again", func(t *testing.T) test {
 		const message = "the lone session asks a logical model whose first target refuses it"
-		receivedA, receivedB := &receivedAsks{}, &receivedAsks{}
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
 		targetA := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
 			receivedA.add(sentMessage)
 			if receivedA.count(sentMessage) == 1 {
@@ -6729,42 +6726,43 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 // independently and immediately admit their own replacement — neither waiting
 // on the other's header or confirmation.
 
-// receivedAsks records, in order, the asks that reach a fake backend.
-type receivedAsks struct {
-	mu   sync.Mutex
-	asks []string
+// receivedMessages records, in order, the inbound messages of the requests
+// that reach a fake backend.
+type receivedMessages struct {
+	mu       sync.Mutex
+	messages []string
 }
 
-func (r *receivedAsks) add(ask string) {
+func (r *receivedMessages) add(message string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.asks = append(r.asks, ask)
+	r.messages = append(r.messages, message)
 }
 
-func (r *receivedAsks) count(ask string) int {
+func (r *receivedMessages) count(message string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := 0
-	for _, a := range r.asks {
-		if a == ask {
+	for _, a := range r.messages {
+		if a == message {
 			n++
 		}
 	}
 	return n
 }
 
-func (r *receivedAsks) all() []string {
+func (r *receivedMessages) all() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return slices.Clone(r.asks)
+	return slices.Clone(r.messages)
 }
 
-// silentBackend is a fake backend that records every ask it receives into
-// received and sends no response until the request's client goes away,
-// failing with the client's cancellation cause.
-func silentBackend(t *testing.T, received *receivedAsks) *http.Client {
-	return admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-		received.add(ask)
+// silentBackend is a fake backend that records every inbound message it
+// receives into received and sends no response until the request's client
+// goes away, failing with the client's cancellation cause.
+func silentBackend(t *testing.T, received *receivedMessages) *http.Client {
+	return admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+		received.add(inboundMessage)
 		<-r.Context().Done()
 		return nil, context.Cause(r.Context())
 	})
@@ -6776,9 +6774,9 @@ func silentBackend(t *testing.T, received *receivedAsks) *http.Client {
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// arrival is one session's request.
 	type arrival struct {
-		// ask is the user message the client sends; it is also the session's
-		// first message, so every arrival is a session of its own.
-		ask string
+		// inboundMessage is the user message the client sends; it is also the
+		// session's first message, so every arrival is a session of its own.
+		inboundMessage string
 		// after is how long the client waits after the previous arrival
 		// before sending it.
 		after time.Duration
@@ -6786,35 +6784,35 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	type test struct {
 		// backend is the fake backend Understudy sends to.
 		backend  *http.Client
-		received *receivedAsks
+		received *receivedMessages
 		arrivals []arrival
-		// reached is the asks the backend received by the time the last
-		// arrival was sent, in order.
+		// reached is the inbound messages the backend received by the time the
+		// last arrival was sent, in order.
 		reached []string
 	}
 
 	tests := testy.NewTable[test]()
 	tests.AddFunc("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", func(t *testing.T) test {
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		return test{
 			backend:  silentBackend(t, received),
 			received: received,
 			arrivals: []arrival{
-				{ask: "the first session asks"},
-				{ask: "the second session asks", after: admissionGracePeriod / 4},
-				{ask: "the third session asks", after: admissionGracePeriod / 4},
+				{inboundMessage: "the first session asks"},
+				{inboundMessage: "the second session asks", after: admissionGracePeriod / 4},
+				{inboundMessage: "the third session asks", after: admissionGracePeriod / 4},
 			},
 			reached: []string{"the first session asks", "the second session asks", "the third session asks"},
 		}
 	})
 	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period", func(t *testing.T) test {
-		received := &receivedAsks{}
+		received := &receivedMessages{}
 		return test{
 			backend:  silentBackend(t, received),
 			received: received,
 			arrivals: []arrival{
-				{ask: "the older session asks"},
-				{ask: "the newer session asks", after: admissionGracePeriod + time.Second},
+				{inboundMessage: "the older session asks"},
+				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{"the older session asks"},
 		}
@@ -6823,11 +6821,11 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// place it freed is not owed to a later arrival.
 	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period, though a request there completed with nobody waiting", func(t *testing.T) test {
 		const completes = "the middle session asks"
-		received := &receivedAsks{}
-		backend := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-			received.add(ask)
-			if ask == completes {
-				return admissionJSON(ask), nil
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == completes {
+				return admissionJSON(inboundMessage), nil
 			}
 			<-r.Context().Done()
 			return nil, context.Cause(r.Context())
@@ -6836,9 +6834,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			backend:  backend,
 			received: received,
 			arrivals: []arrival{
-				{ask: "the oldest session asks"},
-				{ask: completes, after: admissionGracePeriod / 2},
-				{ask: "the newest session asks", after: admissionGracePeriod + time.Second},
+				{inboundMessage: "the oldest session asks"},
+				{inboundMessage: completes, after: admissionGracePeriod / 2},
+				{inboundMessage: "the newest session asks", after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{"the oldest session asks", completes},
 		}
@@ -6850,7 +6848,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 
 			for _, a := range tt.arrivals {
 				time.Sleep(a.after)
-				go poster.post(t.Context(), a.ask, admissionTurn(admissionMsg("user", a.ask)))
+				go poster.post(t.Context(), a.inboundMessage, admissionTurn(admissionMsg("user", a.inboundMessage)))
 				synctest.Wait()
 			}
 
