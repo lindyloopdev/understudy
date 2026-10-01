@@ -1318,16 +1318,18 @@ was headered, so a rule that spares headered requests spares all of them. Being
 wrong is cheap and one-directional: canceling mid-prefill discards tens of
 seconds, while the silence it ends runs to tens of minutes.
 
-The timeout escalates with each attempt on one request, because a timeout
+The timeout escalates with each attempt it ends at one target, because a timeout
 shorter than an honest time-to-first-content is worse than the stall it replaces
 — a cold model load that never fits inside it would be canceled and restarted
-forever. Its first value must clear honest queueing at a slow backend, where a
-request can wait many minutes for its header with nothing wrong, so it comes
-from the consumer's time limit where one is supplied and from the target's own
-turnover otherwise. When it fires on a backend that gives no work before its
-header, every headerless request at that target restarts together in
-Understudy's send order, so a retry restores rank order rather than scrambling
-it.
+forever. Only its own expiry escalates it: a displacement says nothing about how
+long the target takes, and one target's slowness says nothing about another's,
+so a request that fails over starts again at the first value. Its first value
+must clear honest queueing at a slow backend, where a request can wait many
+minutes for its header with nothing wrong, so it comes from the consumer's time
+limit where one is supplied and from the target's own turnover otherwise. When
+it fires on a backend that gives no work before its header, every headerless
+request at that target restarts together in Understudy's send order, so a retry
+restores rank order rather than scrambling it.
 
 **Who waits, and who fails over.** The wait budget is the one §Understudy's
 *Affinity and admission* derives from coherence. A later turn is bound to its

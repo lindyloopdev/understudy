@@ -2144,19 +2144,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var throttled *failedAttempt
 	var lastFailure *failedAttempt
 	var remaining []Target
-	// timeoutEscalations counts this walk's re-sends that the first-content
-	// timeout itself caused; those are the only ones that double the next
-	// attempt's timeout, since a displacement says nothing about how slow
-	// the target is.
-	//
-	// TODO(TODO.d/session-ordered-admission.md): a failover's new target
-	// should start at the timeout's first value, not the escalated one this
-	// count reaches it with.
-	var timeoutEscalations int
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
 		chosen, chosenDemoted, logicalTargets = Target{}, false, nil
+		// Counts this target's re-sends the first-content timeout caused;
+		// only those double the next attempt's timeout, since a
+		// displacement says nothing about how slow the target is. A
+		// failover's new target starts at the timeout's first value.
+		var timeoutEscalations int
 
 		cr := &countingReader{ReadCloser: io.NopCloser(bytes.NewReader(bodyBytes))}
 		body, err := rewriteModel(cr, func(model string) (string, error) {

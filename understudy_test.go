@@ -6392,7 +6392,12 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		after time.Duration
 	}
 	type test struct {
-		backend  *http.Client
+		// backends are the fake targets the server is configured with,
+		// keyed by backend name.
+		backends map[string]*http.Client
+		models   map[string]LogicalModel
+		// received records the inbound messages of the requests that reach
+		// the followed request's target.
 		received *receivedAsks
 		arrivals []arrival
 		// wait is how long the test waits after the last arrival before
@@ -6400,7 +6405,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		wait time.Duration
 		// followed is the inbound message of the request the test follows;
 		// events is the data of the events its client should receive, and
-		// sends how many times the backend should receive it.
+		// sends how many times the backend serving it should receive it.
 		followed string
 		events   []string
 		sends    int
@@ -6430,7 +6435,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(resent), nil
 		})
 		return test{
-			backend:  backend,
+			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -6476,7 +6481,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backend:  backend,
+			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     initialFirstContentTimeout + 90*time.Second + time.Second,
@@ -6519,7 +6524,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(thirdAnswer), nil
 		})
 		return test{
-			backend:  backend,
+			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -6575,7 +6580,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}, nil
 		})
 		return test{
-			backend:  backend,
+			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     initialFirstContentTimeout + 30*time.Second + time.Second,
@@ -6584,10 +6589,53 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    1,
 		}
 	})
-
-	// TODO(TODO.d/session-ordered-admission.md): after a failover, the new
-	// target's first attempt should be cut at the timeout's first value, not
-	// the escalated one the walk reaches it with.
+	tests.AddFunc("should cut a failover's new target's first attempt at the first-content timeout's first value, sending the request again", func(t *testing.T) test {
+		const message = "the lone session asks a logical model whose first target refuses it"
+		receivedA, receivedB := &receivedAsks{}, &receivedAsks{}
+		targetA := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			receivedA.add(sentMessage)
+			if receivedA.count(sentMessage) == 1 {
+				// The first target sends no content, until the timeout
+				// cuts the attempt.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// It then refuses the re-sent request, so the walk fails over
+			// to the second target.
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)),
+			}, nil
+		})
+		targetB := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			receivedB.add(sentMessage)
+			if receivedB.count(sentMessage) == 1 {
+				// The second target's first attempt sends no content, until
+				// the timeout cuts it at its first value.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"a": targetA, "b": targetB},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: receivedB,
+			arrivals: []arrival{{inboundMessage: message, body: fmt.Sprintf(`{"model":"m","messages":[%s]}`, admissionMsg("user", message))}},
+			// The first target's attempt is cut at 60s and its re-send
+			// refused, so the second target receives the request then and is
+			// cut at the timeout's first value, 60s later. At 125s the
+			// answer has arrived only if that timeout was not doubled.
+			wait:     125 * time.Second,
+			followed: message,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
+			sends:    2,
+		}
+	})
 
 	// TODO(TODO.d/session-ordered-admission.md): a stream whose first content
 	// arrives at the very instant its first-content timeout fires should reach
@@ -6607,7 +6655,19 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+			backends := make(map[string]Backend, len(tt.backends))
+			for name, client := range tt.backends {
+				backends[name] = Backend{ProviderType: "openai", Config: providers.Config{
+					BaseURL:    &url.URL{Scheme: "http", Host: name, Path: "/v1"},
+					APIKey:     "sk-" + name,
+					HTTPClient: client,
+				}}
+			}
+			srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return &BackendConfig{Backends: backends, Models: tt.models}, nil
+			}})
+			srv.logger = testLogger(t)
+			poster := newAdmissionPoster(t, srv)
 
 			for _, a := range tt.arrivals {
 				time.Sleep(a.after)
