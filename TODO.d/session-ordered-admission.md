@@ -31,20 +31,34 @@ limiter. The steps below remain, in order.
   tenant registry can call so the state goes at teardown instead.
   - Tests: a tenant dropped by the registry leaves no conversation state
     behind once its last request has ended.
-- **The first-content timeout is unbuilt.** DESIGN.md's *A first-content
-  timeout* replaces the old "no gate bounds the wait for a header": a
-  request producing no content within the timeout is canceled and sent again to
-  the same target, whether or not its header arrived, so a submitted request
-  is never silently unbounded regardless of contention. None of it exists yet.
-  - The timeout fires on its own timer, independent of any arrival — a lone
-    wedged request with nobody else contending at that target must still
-    eventually retry, since nothing else will ever trigger a recheck of it.
+- **Finish the first-content timeout.** DESIGN.md's *A first-content
+  timeout* is built for one request at a time: an attempt with no content
+  within its timeout — 60s, doubling with each attempt — is canceled and sent
+  again to the same target, on its own timer. What remains:
+  - Take the first value from the consumer's own time limit when one is
+    supplied, rather than the 60s default sized from lindy's
+    notes/2026-09-30-time-to-first-content-measurements.md.
+  - Escalate only on the timeout's own re-sends to one target. Today every
+    send of the request escalates it, across the whole failover walk.
+    - Tests: after a failover, the new target's first attempt is cut at the
+      first value; a request displaced and re-sent is cut at the first value
+      on its next attempt.
+  - Record first content before sending it to the client. The relay sends
+    it first, so a timeout firing in between can cut a stream whose content
+    the client already has.
+    - Tests: a stream whose first content arrives at the instant its timeout
+      fires reaches its client whole and is not sent again.
+  - Tie each timeout's firing to the attempt it was armed for. A timeout that
+    fired just as its attempt was re-sent can cut the re-sent attempt at once.
+    - Tests: a re-sent request gets its full timeout even when the previous
+      attempt's timeout fired as it was re-sent.
+  - Keep the doubling from overflowing. Past about 28 attempts the timeout
+    wraps, and the request is re-sent in a tight loop.
+    - Tests: a target silent through many timeouts in a row keeps receiving
+      the request at ever-longer intervals.
   - When it fires on a target that gives no work before its header, every
     headerless request at that target restarts together, in rank order, so
     the retry restores ordering rather than scrambling it.
-  - The timeout escalates with each attempt on one request, so a legitimately
-    slow first attempt is not retried forever at an interval shorter than it
-    could ever succeed within.
   - A mass-retry after such a restart follows growth's ordinary rule — burst
     together, not serialized one at a time — since nothing about a retry
     changes what growth already knows to do with a fresh admission.
@@ -55,12 +69,9 @@ limiter. The steps below remain, in order.
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two
     decide precedence is unsettled.
-  - Tests: a submitted request producing no content for longer than the timeout,
-    with nothing else contending for its target, is eventually canceled and
-    retried with nobody else involved; several headerless requests at one
-    target, all wedged together, restart together and are re-admitted per
-    growth's burst rule rather than one at a time; a retry's interval is
-    longer than the previous attempt's.
+  - Tests: several headerless requests at one target, all wedged together,
+    restart together and are re-admitted per growth's burst rule rather than
+    one at a time.
 - **Test the probe-held arm of the waiting trigger.** No case stages a
   headered unconfirmed request ranked below a headerless one when the wait
   forms the queue, so the arm that queues the probe because preemption never

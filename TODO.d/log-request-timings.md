@@ -8,9 +8,9 @@ its first value comes "from the target's own turnover" where the consumer
 supplies no time limit, which needs each target's observed time to first
 content.
 
-The first-content timeout still has no data until lindy records the field next
-to what only it knows, and no one can say what the longest healthy wait on a
-slow target (Kronk on a large context, a cold model load) actually is.
+lindy's request log records both timings, and its
+notes/2026-09-30-time-to-first-content-measurements.md sized the timeout's
+first value from them. What remains is the timings this does not yet record.
 
 ## Where it belongs
 

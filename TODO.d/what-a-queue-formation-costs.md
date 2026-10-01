@@ -10,9 +10,9 @@ Forming a queue cancels outstanding requests and re-sends them when it admits
 them, and the design rests that on a cost claim: "canceling it is free" for a
 headerless request, "because a backend that admits before it answers has given
 it no work". Nothing asserts the claim. The arrival trigger counts what the
-target was sent
-(`TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway`); the
-wait trigger has a test only for the order it produces (the "both turns
+target was sent (the displaced row of
+`TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent`);
+the wait trigger has a test only for the order it produces (the "both turns
 already wait at the target" row of
 `TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst`),
 not for what it re-sends.

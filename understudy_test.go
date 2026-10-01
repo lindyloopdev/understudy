@@ -2328,24 +2328,28 @@ func TestChatCompletionsBoundsStalledStream(t *testing.T) {
 	})
 }
 
-// TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader pins DESIGN's
-// "silence before a response header waits, on every backend": a backend that
-// stays silent for an hour before its header still serves. An hour outruns any
-// header timeout a caller might reasonably configure.
+// TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader pins that a
+// backend which stays silent for an hour before its response header still
+// serves, through the shared production HTTP client: no header timeout in
+// that client cuts the wait. An hour outruns the first-content timeout's
+// first value, so the request gets there only because the timeout escalates
+// with each re-send.
 func TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		clientConn, backendConn := net.Pipe()
-
 		const completion = `{"id":"chatcmpl-slow-header","object":"chat.completion","choices":[]}`
 
-		// The backend actor is released and joined however the request ends,
-		// so no goroutine outlives the test.
+		// The actors are released and joined however the request ends, so
+		// no goroutine outlives the test.
 		release := make(chan struct{})
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			defer backendConn.Close()
-			req, err := http.ReadRequest(bufio.NewReader(backendConn))
+		var actors sync.WaitGroup
+		defer func() {
+			close(release)
+			actors.Wait()
+		}()
+		serveSlowHeader := func(conn net.Conn) {
+			defer actors.Done()
+			defer conn.Close()
+			req, err := http.ReadRequest(bufio.NewReader(conn))
 			if err != nil {
 				return
 			}
@@ -2355,15 +2359,11 @@ func TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader(t *testing.T)
 			case <-release:
 				return
 			}
-			_, _ = fmt.Fprintf(backendConn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(completion), completion)
-		}()
-		defer func() {
-			close(release)
-			<-done
-		}()
+			_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(completion), completion)
+		}
 
 		// The doubled client carries the shared production client's settings,
-		// with only the dial swapped for the pipe, so the header-wait policy
+		// with only the dial swapped for the pipes, so the header-wait policy
 		// under test is the production one.
 		shared := providers.Config{}.Client()
 		doubled := *shared
@@ -2373,6 +2373,9 @@ func TestShouldServeABackendThatTakesAnHourToSendItsResponseHeader(t *testing.T)
 		}
 		transport := sharedTransport.Clone()
 		transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			clientConn, backendConn := net.Pipe()
+			actors.Add(1)
+			go serveSlowHeader(backendConn)
 			return clientConn, nil
 		}
 		doubled.Transport = transport
@@ -5835,6 +5838,9 @@ func admissionTurn(messages ...string) string {
 // admissionAsk reports a request's last message, which names the request for a
 // doubled target: a session's second turn stays distinguishable from its
 // first.
+//
+// TODO(TODO.d/simplify-the-send-loop.md): "ask" here and across the admission
+// tests names the inbound message; rename it inboundMessage throughout.
 func admissionAsk(t *testing.T, r *http.Request) string {
 	t.Helper()
 	body, err := io.ReadAll(r.Body)
@@ -6358,73 +6364,213 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 	})
 }
 
-func TestShouldAnswerWithTheResentAttemptWhenADisplacedTargetRespondsAnyway(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+// sseAnswer is a fake backend's whole answer as a stream of one event whose
+// data is {"id": id}.
+func sseAnswer(id string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("data: {\"id\":%q}\n\n", id))),
+	}
+}
+
+// TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent verifies
+// when Understudy sends a request to its target again. An attempt that ends
+// before any content without failing — displaced by an older session's
+// arrival, or cut by the first-content timeout — is sent again, and its
+// client receives the second send's answer. An attempt whose content has
+// begun is relayed to its end and never sent again.
+func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T) {
+	// arrival is one request reaching Understudy.
+	type arrival struct {
+		// inboundMessage is the last user message the client sends; it
+		// names the request.
+		inboundMessage string
+		body           string
+		// after is how long the client waits after the previous arrival
+		// before sending it.
+		after time.Duration
+	}
+	type test struct {
+		backend  *http.Client
+		received *receivedAsks
+		arrivals []arrival
+		// wait is how long the test waits after the last arrival before
+		// looking at the answer.
+		wait time.Duration
+		// followed is the inbound message of the request the test follows;
+		// events is the data of the events its client should receive, and
+		// sends how many times the backend should receive it.
+		followed string
+		events   []string
+		sends    int
+	}
+
+	tests := testy.NewTable[test]()
+	tests.AddFunc("should answer with the re-sent attempt when a displaced attempt's target responds anyway", func(t *testing.T) test {
 		const (
-			// askOlder is reused later as the arrival that displaces the
-			// younger session's headerless attempt.
-			askOlder     = "the older session asks"
-			askOlder2    = "the older session asks again"
-			askDisplaced = "the displaced session asks"
-			raced        = "displaced raced answer"
-			resent       = "displaced resent answer"
+			olderMessage     = "the older session asks"
+			olderMessage2    = "the older session asks again"
+			displacedMessage = "the displaced session asks"
+			raced            = "displaced raced answer"
+			resent           = "displaced resent answer"
 		)
-		var mu sync.Mutex
-		attempts := 0
-
-		client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-			if ask != askDisplaced {
-				return admissionJSON(ask), nil
+		received := &receivedAsks{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage != displacedMessage {
+				return sseAnswer(inboundMessage), nil
 			}
-			mu.Lock()
-			attempts++
-			attempt := attempts
-			mu.Unlock()
-			if attempt == 1 {
-				// The displaced attempt answers anyway: its cancel lands as the
-				// target is already returning a response.
+			if received.count(inboundMessage) == 1 {
+				// The displaced attempt answers anyway: its cancel lands as
+				// the target is already returning a response.
 				<-r.Context().Done()
-				return admissionJSON(raced), nil
+				return sseAnswer(raced), nil
 			}
-			return admissionJSON(resent), nil
+			return sseAnswer(resent), nil
 		})
-
-		poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-
-		// The older session's first turn fixes its rank ahead of the
-		// displaced session, which has not arrived yet.
-		go poster.post(t.Context(), "older-first", admissionTurn(admissionMsg("user", askOlder)))
-		synctest.Wait()
-		time.Sleep(time.Second)
-
-		// The displaced session's turn reaches the target directly — nothing
-		// else is outstanding — and waits there headerless past its grace
-		// period.
-		go poster.post(t.Context(), "displaced", admissionTurn(admissionMsg("user", askDisplaced)))
-		synctest.Wait()
-		time.Sleep(admissionGracePeriod + time.Second)
-
-		// The older session's second turn outranks it, displacing the
-		// headerless attempt.
-		go poster.post(t.Context(), "older-second", admissionTurn(
-			admissionMsg("user", askOlder),
-			admissionMsg("assistant", "answered"),
-			admissionMsg("user", askOlder2),
-		))
-		synctest.Wait()
-		time.Sleep(time.Second)
-		synctest.Wait()
-
-		rec, ok := poster.answered("displaced")
-		if !ok {
-			t.Fatal("the displaced session never received an answer")
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				// The older session's first turn fixes its rank ahead of the
+				// displaced session, which has not arrived yet.
+				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
+				// The displaced session's turn reaches the target directly
+				// and waits there headerless past its grace period.
+				{inboundMessage: displacedMessage, body: admissionTurn(admissionMsg("user", displacedMessage)), after: time.Second},
+				// The older session's second turn outranks it, displacing the
+				// headerless attempt.
+				{inboundMessage: olderMessage2, body: admissionTurn(
+					admissionMsg("user", olderMessage),
+					admissionMsg("assistant", "answered"),
+					admissionMsg("user", olderMessage2),
+				), after: admissionGracePeriod + time.Second},
+			},
+			wait:     time.Second,
+			followed: displacedMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, resent)},
+			sends:    2,
 		}
-		if rec.Code != http.StatusOK {
-			t.Errorf("the displaced session's client got status %d, want %d", rec.Code, http.StatusOK)
+	})
+	tests.AddFunc("should answer with the second send when the target stays silent past the first-content timeout, which doubles for that send", func(t *testing.T) test {
+		const message = "the lone session asks a target that stays silent"
+		received := &receivedAsks{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			if received.count(sentMessage) == 1 {
+				// The target answers the first send with a header at once and
+				// then sends no content, until the attempt is withdrawn.
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			// The target answers the next send 90 seconds after receiving
+			// it: past the first timeout, within a doubled one.
+			time.Sleep(90 * time.Second)
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
+			wait:     initialFirstContentTimeout + 90*time.Second + time.Second,
+			followed: message,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
+			sends:    2,
 		}
-		if got := rec.Body.String(); !strings.Contains(got, resent) || strings.Contains(got, raced) {
-			t.Errorf("the displaced session's client received %q; want the re-sent attempt's answer, not the response that raced its displacement", got)
+	})
+	tests.AddFunc("should relay a stream past the first-content timeout once its content has begun, without sending the request again", func(t *testing.T) test {
+		const message = "the streaming session asks"
+		received := &receivedAsks{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			reads := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					reads++
+					switch reads {
+					case 1:
+						return copy(p, "data: {\"n\":1}\n\n"), nil
+					case 2:
+						// The next event comes past the first-content
+						// timeout.
+						time.Sleep(initialFirstContentTimeout + 30*time.Second)
+						if err := context.Cause(r.Context()); err != nil {
+							return 0, err
+						}
+						return copy(p, "data: {\"n\":2}\n\n"), nil
+					}
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
+			wait:     initialFirstContentTimeout + 30*time.Second + time.Second,
+			followed: message,
+			events:   []string{`{"n":1}`, `{"n":2}`},
+			sends:    1,
 		}
+	})
+
+	// TODO(TODO.d/session-ordered-admission.md): only the timeout's own
+	// re-sends to one target should escalate it. A request displaced and
+	// re-sent should have its next attempt cut at the first value, not a
+	// doubled one; after a failover, the new target's first attempt should be
+	// cut at the first value too.
+
+	// TODO(TODO.d/session-ordered-admission.md): a stream whose first content
+	// arrives at the very instant its first-content timeout fires should reach
+	// its client whole and not be sent again. Today the relay sends the
+	// content to the client before recording it, so the timeout can still
+	// cut the stream in between.
+
+	// TODO(TODO.d/session-ordered-admission.md): a re-sent request should get
+	// its full first-content timeout, even when the previous attempt's timeout
+	// fired just as it was being re-sent. Today that late firing can cut the
+	// re-sent attempt at once.
+
+	// TODO(TODO.d/session-ordered-admission.md): a target that stays silent
+	// through many timeouts in a row should keep receiving the request at
+	// ever-longer intervals. Today the doubling overflows after about 28
+	// attempts, and the request is then re-sent in a tight loop.
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+
+			for _, a := range tt.arrivals {
+				time.Sleep(a.after)
+				go poster.post(t.Context(), a.inboundMessage, a.body)
+				synctest.Wait()
+			}
+			time.Sleep(tt.wait)
+			synctest.Wait()
+
+			rec, ok := poster.answered(tt.followed)
+			if !ok {
+				t.Fatalf("%q was never answered", tt.followed)
+			}
+			if rec.Code != http.StatusOK {
+				t.Errorf("%q's client got status %d, want %d", tt.followed, rec.Code, http.StatusOK)
+			}
+			if d := gocmp.Diff(tt.events, sseData(rec.Body.String())); d != "" {
+				t.Errorf("events %q's client received (-want +got):\n%s", tt.followed, d)
+			}
+			if got := tt.received.count(tt.followed); got != tt.sends {
+				t.Errorf("the backend received %q %d times, want %d", tt.followed, got, tt.sends)
+			}
+		})
 	})
 }
 
@@ -6473,6 +6619,18 @@ func (r *receivedAsks) add(ask string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.asks = append(r.asks, ask)
+}
+
+func (r *receivedAsks) count(ask string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, a := range r.asks {
+		if a == ask {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *receivedAsks) all() []string {

@@ -20,6 +20,16 @@ const admissionGracePeriod = 2 * time.Second
 // it is recorded.
 var errPreempted = errors.New("displaced for an older session")
 
+// initialFirstContentTimeout is how long a request's first attempt at a
+// target may produce no content before the attempt is ended and the request
+// sent again. It must clear honest queueing at a slow backend: the longest
+// healthy time to first content measured was 26.2s (lindy repo,
+// notes/2026-09-30-time-to-first-content-measurements.md).
+//
+// TODO(TODO.d/session-ordered-admission.md): take the first value from the
+// consumer's own time limit when one is supplied, instead of this default.
+const initialFirstContentTimeout = 60 * time.Second
+
 // sessionForgetAfter is how long a conversation may go with no request before
 // its age is forgotten and it ranks as new again, so a session that keeps
 // taking turns — however old — is never outranked by one that has been away
@@ -117,14 +127,15 @@ type targetQueue struct {
 // pending is one attempt's standing at a target queue: its rank, when it
 // reached the target, and how far the target's answer has come.
 type pending struct {
-	queue     *targetQueue
-	rank      time.Time
-	arrived   time.Time
-	cancel    context.CancelCauseFunc
-	admitted  chan struct{}
-	headered  bool
-	confirmed bool
-	preempted bool
+	queue             *targetQueue
+	rank              time.Time
+	arrived           time.Time
+	cancel            context.CancelCauseFunc
+	admitted          chan struct{}
+	headered          bool
+	confirmed         bool
+	preempted         bool
+	firstContentTimer *time.Timer
 }
 
 // pastGrace reports whether p's grace period has elapsed as of now.
@@ -243,10 +254,15 @@ func (q *targetQueue) formByWaiting(p *pending) {
 
 // attemptEnded records the attempt's upstream call ending: err is nil when the
 // call returned a response, whose header has now arrived. It reports whether
-// the attempt was preempted — the one ending that is not a failure — so the
-// caller waits for the queue to admit it again instead of recording or relaying
+// the attempt was preempted — by an outranking arrival, or by its own
+// first-content timeout — the one ending that is not a failure, so the caller
+// waits for the queue to admit it again instead of recording or relaying
 // anything. A response that slipped past a preemption decision is discarded:
 // the re-sent attempt is the one the client receives.
+//
+// TODO(TODO.d/simplify-the-send-loop.md): the send loop calls this after a
+// header arrives, after a failed send, and after the relay, asking a
+// different question each time; give each call one place.
 func (q *targetQueue) attemptEnded(p *pending, err error) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -256,7 +272,40 @@ func (q *targetQueue) attemptEnded(p *pending, err error) bool {
 	}
 	q.dropOutstanding(p)
 	q.admitIfAllOutstandingConfirmed()
-	return p.preempted
+	return p.preempted && !p.confirmed
+}
+
+// armFirstContentTimeout arms the first-content timeout for p's current
+// attempt: no content within the timeout — whether the attempt is still
+// waiting for its header or reading a body that has sent none — ends the
+// attempt and the request is sent again. It doubles with each attempt so an
+// honest attempt slower than the first is not canceled and restarted forever.
+// First content disables it: once content has arrived, silence is the stream
+// idle deadline's to bound, not this timeout's.
+func (q *targetQueue) armFirstContentTimeout(p *pending, attempt int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<(attempt-1), func() { q.firstContentTimedOut(p) })
+}
+
+// firstContentTimedOut preempts p's attempt when its first-content timeout
+// expires with no content arrived. Ending it commits nothing to the client —
+// the relay withholds the upstream's status, headers, and pre-content bytes
+// until first content — so the request can be sent again to the same target.
+//
+// TODO(TODO.d/session-ordered-admission.md): when the timeout fires on a
+// backend that gives no work before its header, every headerless request at
+// that target should restart together in send order, so the retry restores
+// ordering rather than scrambling it; this ends only the one attempt.
+func (q *targetQueue) firstContentTimedOut(p *pending) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if p.confirmed || p.preempted || !slices.Contains(q.outstanding, p) {
+		return
+	}
+	p.preempted = true
+	q.insert(p)
+	p.cancel(errors.New("no content within the first-content timeout"))
 }
 
 // await blocks until the queue admits a displaced attempt, honoring ctx: a
@@ -284,6 +333,10 @@ func (q *targetQueue) await(ctx context.Context, p *pending) error {
 func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if p.firstContentTimer != nil {
+		p.firstContentTimer.Stop()
+		p.firstContentTimer = nil
+	}
 	p.preempted = false
 	p.cancel = cancel
 	p.admitted = make(chan struct{})

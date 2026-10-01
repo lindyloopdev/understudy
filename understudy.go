@@ -2144,6 +2144,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	var throttled *failedAttempt
 	var lastFailure *failedAttempt
 	var remaining []Target
+	// sends counts this request's attempts on the walk, so the first-content
+	// timeout can escalate with each.
+	//
+	// TODO(TODO.d/session-ordered-admission.md): only attempts at one target
+	// that the timeout itself ended should escalate it: a failover's new
+	// target starts at the first value, and a displacement leaves it as it was.
+	var sends int
 
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
@@ -2312,10 +2319,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return b, nil
 		}
 
-		// The send, retried wherever the queue displaces it. A displaced
-		// attempt is not a failure — the target is healthy and the client
-		// still waiting — so it records and shrinks nothing; it waits for the
-		// queue to admit it again and sends the same bytes again.
+		// The send, retried wherever the queue displaces an attempt or the
+		// first-content timeout ends one. Neither ending is a failure — the target
+		// is healthy and the client still waiting — so neither records and
+		// shrinks anything; the request waits for the queue to admit it again
+		// and sends the same bytes to the same target.
+		//
+		// TODO(TODO.d/simplify-the-send-loop.md): this loop still sends one
+		// attempt and waits to re-send inline; give those their own places,
+		// as relay has.
 		var resp *http.Response
 		var waited, acquired bool
 		// Per attempt: a re-sent attempt restamps sent, and only the attempt
@@ -2336,9 +2348,33 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					sel.cfg.HTTPClient = s.httpClient
 				}
 				sent = time.Now()
+				sends++
+				queue.armFirstContentTimeout(pend, sends)
 				resp, sendErr = sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 			}
-			if !queue.attemptEnded(pend, sendErr) {
+			if sendErr == nil && !queue.attemptEnded(pend, nil) {
+				// Demand-gated: a success that never waited for a slot is no evidence
+				// about the account's capacity, so it does not raise the cap.
+				if waited {
+					lim.grow()
+				}
+				if chosen.backend != "" {
+					s.clearFailure(r.Context(), chosen, backend.Backends)
+					s.recordServe(convTenant, convKey, chosen)
+				}
+				// Chat returns once the response header arrives, so this measures
+				// from the same sent instant as first content.
+				setLogTimeToResponseHeader(r.Context(), time.Since(sent))
+				setLogUpstreamStatus(r.Context(), resp.StatusCode)
+
+				served := RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}
+				again, relayErr := s.relay(ctx, cancel, w, r, resp, pend, sent, served)
+				if !again {
+					releaseHeld()
+					cancel(nil)
+					return relayErr
+				}
+			} else if sendErr != nil && !queue.attemptEnded(pend, sendErr) {
 				err = sendErr
 				break
 			}
@@ -2393,14 +2429,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen
 		// target to demote.
-		switch {
-		case err == nil:
-			// Demand-gated: a success that never waited for a slot is no evidence
-			// about the account's capacity, so it does not raise the cap.
-			if waited {
-				lim.grow()
-			}
-		case sig.condition == bareRateLimit:
+		if sig.condition == bareRateLimit {
 			lim.throttle()
 		}
 		// A bare 429 measures capacity, not health: the cap above has already
@@ -2409,9 +2438,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		demote := sig.condition == sustainedRate
 		if chosen.backend != "" {
 			switch {
-			case err == nil:
-				s.clearFailure(r.Context(), chosen, backend.Backends)
-				s.recordServe(convTenant, convKey, chosen)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
 			case demote || isAccessRefused(err):
@@ -2458,42 +2484,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			break
 		}
-		// Chat returns once the response header arrives, so this measures
-		// from the same sent instant as first content.
-		setLogTimeToResponseHeader(r.Context(), time.Since(sent))
-		setLogUpstreamStatus(r.Context(), resp.StatusCode)
-
-		for _, h := range sensitiveResponseHeaders {
-			resp.Header.Del(h)
-		}
-
-		if s.interceptor != nil {
-			if err := s.interceptor(r.Context(), RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}, resp); err != nil {
-				_ = resp.Body.Close()
-				queue.finish(pend)
-				releaseHeld()
-				cancel(nil)
-				return err
-			}
-			resp.Header.Del("Content-Length")
-		}
-
-		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
-		held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
-		_, err = io.Copy(held, &confirmingReader{
-			r: relay,
-			content: func() {
-				held.commit()
-				queue.confirm(pend)
-				setLogTimeToFirstContent(r.Context(), time.Since(sent))
-			},
-		})
-		held.commit()
-		_ = resp.Body.Close()
-		queue.finish(pend)
-		releaseHeld()
-		cancel(nil)
-		return err
 	}
 
 	// The walk is over, by either road: it ran out of candidates, or its last failure
@@ -2510,4 +2500,45 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		answer, answering = throttled.answer, throttled.target
 	}
 	return s.terminalFailure(answering, remaining, backend.Backends, s.withSynthesizedBackoff(r.Context(), answering, backend.Backends, answer))
+}
+
+// relay answers the client from an attempt whose header has arrived: it
+// strips sensitive headers, runs the response interceptor, and copies the
+// body, withholding the upstream's status, headers, and pre-content bytes
+// until its first content. ctx and cancel are the attempt's. It reports
+// whether the attempt ended before any content without failing — displaced,
+// or cut by the first-content timeout — in which case nothing reached the
+// client and the request is to be sent again; otherwise the attempt is
+// finished at its target and err is how the relay ended.
+func (s *server) relay(ctx context.Context, cancel context.CancelCauseFunc, w http.ResponseWriter, r *http.Request, resp *http.Response, pend *pending, sent time.Time, served RequestMetadata) (resend bool, err error) {
+	for _, h := range sensitiveResponseHeaders {
+		resp.Header.Del(h)
+	}
+
+	if s.interceptor != nil {
+		if err := s.interceptor(r.Context(), served, resp); err != nil {
+			_ = resp.Body.Close()
+			pend.queue.finish(pend)
+			return false, err
+		}
+		resp.Header.Del("Content-Length")
+	}
+
+	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
+	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
+	_, err = io.Copy(held, &confirmingReader{
+		r: idle,
+		content: func() {
+			held.commit()
+			pend.queue.confirm(pend)
+			setLogTimeToFirstContent(r.Context(), time.Since(sent))
+		},
+	})
+	if err != nil && pend.queue.attemptEnded(pend, err) {
+		return true, nil
+	}
+	held.commit()
+	_ = resp.Body.Close()
+	pend.queue.finish(pend)
+	return false, err
 }
