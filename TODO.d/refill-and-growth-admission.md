@@ -22,20 +22,6 @@ check and no regard for anything else unconfirmed at the target.
   header or confirmation** — the case DeepSeek/wide-backend behavior depends
   on, staged with a doubled target slow enough to answer that gating on header
   latency would visibly serialize the two.
-- **A completion with nothing held admits nothing, and remembers nothing.**
-  If the wait list is empty when a slot frees, there is no counter or belief
-  left behind for a later arrival to consume — that arrival is a fresh
-  arrival, subject to growth's ordinary grace-based check, not an automatic
-  admission just because a slot recently opened. This is a deliberate choice:
-  the alternative (remembering that a slot is "owed" until something claims
-  it) was considered and rejected, because a target can already burst-admit
-  freely while nothing has proven a limit — nothing is lost by not
-  remembering, and remembering would reopen the kind of state the serving
-  window was removed for.
-  - Tests: a request arriving after a slot freed with nobody waiting, at a
-    target where something else is simultaneously unconfirmed past its grace
-    period, is held exactly as if nothing had recently freed — it is not
-    admitted early just because a slot opened moments before it arrived.
 - **Pin the headered case of growth's hold-on-unconfirmed check.** Growth
   holds an arrival while anything at its target is unconfirmed past grace;
   `TestShouldSendOrHoldARequestOnArrival` covers the headerless occupant

@@ -6463,16 +6463,38 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 // independently and immediately admit their own replacement — neither waiting
 // on the other's header or confirmation.
 
-// TODO(TODO.d/refill-and-growth-admission.md): a request arriving after a slot
-// freed with nobody waiting, while something else at the target is
-// simultaneously unconfirmed past its grace period, should be held exactly as
-// if nothing had recently freed — it must not be admitted early just because a
-// slot opened moments before it arrived. Nothing is remembered across that gap
-// by design; this pins the deliberate absence of that memory.
+// receivedAsks records, in order, the asks that reach a fake backend.
+type receivedAsks struct {
+	mu   sync.Mutex
+	asks []string
+}
+
+func (r *receivedAsks) add(ask string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.asks = append(r.asks, ask)
+}
+
+func (r *receivedAsks) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.asks)
+}
+
+// silentBackend is a fake backend that records every ask it receives into
+// received and sends no response until the request's client goes away,
+// failing with the client's cancellation cause.
+func silentBackend(t *testing.T, received *receivedAsks) *http.Client {
+	return admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+		received.add(ask)
+		<-r.Context().Done()
+		return nil, context.Cause(r.Context())
+	})
+}
 
 // TestShouldSendOrHoldARequestOnArrival verifies which arriving requests
-// Understudy sends to the backend. Every request already at the backend stays
-// silent; one silent past the grace period is the sign the backend is full.
+// Understudy sends to the backend. A request at the backend that has been
+// silent past the grace period is the sign the backend is full.
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// arrival is one session's request.
 	type arrival struct {
@@ -6484,6 +6506,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		after time.Duration
 	}
 	type test struct {
+		// backend is the fake backend Understudy sends to.
+		backend  *http.Client
+		received *receivedAsks
 		arrivals []arrival
 		// reached is the asks the backend received by the time the last
 		// arrival was sent, in order.
@@ -6491,42 +6516,59 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	}
 
 	tests := testy.NewTable[test]()
-	tests.Add("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", test{
-		arrivals: []arrival{
-			{ask: "the first session asks"},
-			{ask: "the second session asks", after: admissionGracePeriod / 4},
-			{ask: "the third session asks", after: admissionGracePeriod / 4},
-		},
-		reached: []string{"the first session asks", "the second session asks", "the third session asks"},
+	tests.AddFunc("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", func(t *testing.T) test {
+		received := &receivedAsks{}
+		return test{
+			backend:  silentBackend(t, received),
+			received: received,
+			arrivals: []arrival{
+				{ask: "the first session asks"},
+				{ask: "the second session asks", after: admissionGracePeriod / 4},
+				{ask: "the third session asks", after: admissionGracePeriod / 4},
+			},
+			reached: []string{"the first session asks", "the second session asks", "the third session asks"},
+		}
 	})
-	tests.Add("should hold a newer session's request arriving while another at the backend has been silent past the grace period", test{
-		arrivals: []arrival{
-			{ask: "the older session asks"},
-			{ask: "the newer session asks", after: admissionGracePeriod + time.Second},
-		},
-		reached: []string{"the older session asks"},
+	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period", func(t *testing.T) test {
+		received := &receivedAsks{}
+		return test{
+			backend:  silentBackend(t, received),
+			received: received,
+			arrivals: []arrival{
+				{ask: "the older session asks"},
+				{ask: "the newer session asks", after: admissionGracePeriod + time.Second},
+			},
+			reached: []string{"the older session asks"},
+		}
+	})
+	// Nothing records that a request completed with nobody waiting, so the
+	// place it freed is not owed to a later arrival.
+	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period, though a request there completed with nobody waiting", func(t *testing.T) test {
+		const completes = "the middle session asks"
+		received := &receivedAsks{}
+		backend := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
+			received.add(ask)
+			if ask == completes {
+				return admissionJSON(ask), nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				{ask: "the oldest session asks"},
+				{ask: completes, after: admissionGracePeriod / 2},
+				{ask: "the newest session asks", after: admissionGracePeriod + time.Second},
+			},
+			reached: []string{"the oldest session asks", completes},
+		}
 	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			// answer keeps every request at the backend silent until
-			// cleanup, so none frees a place for another.
-			answer := make(chan struct{})
-			t.Cleanup(func() { close(answer) })
-			var mu sync.Mutex
-			var reached []string
-			client := admissionClient(t, nil, func(r *http.Request, ask string) (*http.Response, error) {
-				mu.Lock()
-				reached = append(reached, ask)
-				mu.Unlock()
-				select {
-				case <-r.Context().Done():
-					return nil, context.Cause(r.Context())
-				case <-answer:
-				}
-				return admissionJSON(ask), nil
-			})
-			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
+			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
 
 			for _, a := range tt.arrivals {
 				time.Sleep(a.after)
@@ -6534,9 +6576,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				synctest.Wait()
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-			if d := gocmp.Diff(tt.reached, reached); d != "" {
+			if d := gocmp.Diff(tt.reached, tt.received.all()); d != "" {
 				t.Errorf("requests the backend received on their arrival (-want +got):\n%s", d)
 			}
 		})
