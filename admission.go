@@ -127,15 +127,19 @@ type targetQueue struct {
 // pending is one attempt's standing at a target queue: its rank, when it
 // reached the target, and how far the target's answer has come.
 type pending struct {
-	queue                *targetQueue
-	rank                 time.Time
-	arrived              time.Time
-	cancel               context.CancelCauseFunc
-	admitted             chan struct{}
-	headered             bool
-	confirmed            bool
-	preempted            bool
-	firstContentTimedOut bool
+	queue     *targetQueue
+	rank      time.Time
+	arrived   time.Time
+	cancel    context.CancelCauseFunc
+	admitted  chan struct{}
+	headered  bool
+	confirmed bool
+	preempted bool
+	// firstContentTimeouts counts the attempts at this target the
+	// first-content timeout has ended; each doubles the next attempt's
+	// timeout. Per target: one target's slowness says nothing about
+	// another's.
+	firstContentTimeouts int
 	firstContentTimer    *time.Timer
 }
 
@@ -279,15 +283,15 @@ func (q *targetQueue) attemptEnded(p *pending, err error) bool {
 // armFirstContentTimeout arms the first-content timeout for p's current
 // attempt: no content within the timeout — whether the attempt is still
 // waiting for its header or reading a body that has sent none — ends the
-// attempt and the request is sent again. escalations is how many of the
-// request's earlier re-sends this timeout itself caused; each doubles this
-// attempt's timeout, so an honest attempt slower than the first is not
-// canceled and restarted forever. First content disables it: once content has
-// arrived, silence is the stream idle deadline's to bound, not this timeout's.
-func (q *targetQueue) armFirstContentTimeout(p *pending, escalations int) {
+// attempt and the request is sent again. Each earlier attempt at this target
+// this timeout ended doubles it, so an honest attempt slower than the first is
+// not canceled and restarted forever; a displacement leaves it where it was.
+// First content disables it: once content has arrived, silence is the stream
+// idle deadline's to bound, not this timeout's.
+func (q *targetQueue) armFirstContentTimeout(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<escalations, func() { q.expireFirstContentTimeout(p) })
+	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p) })
 }
 
 // expireFirstContentTimeout preempts p's attempt when its first-content timeout
@@ -306,19 +310,9 @@ func (q *targetQueue) expireFirstContentTimeout(p *pending) {
 		return
 	}
 	p.preempted = true
-	p.firstContentTimedOut = true
+	p.firstContentTimeouts++
 	q.insert(p)
 	p.cancel(errors.New("no content within the first-content timeout"))
-}
-
-// takeFirstContentTimedOut reports whether p's latest attempt timed out waiting
-// for its first content, and clears the mark so each time-out is counted once.
-func (q *targetQueue) takeFirstContentTimedOut(p *pending) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	timedOut := p.firstContentTimedOut
-	p.firstContentTimedOut = false
-	return timedOut
 }
 
 // await blocks until the queue admits a displaced attempt, honoring ctx: a

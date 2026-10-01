@@ -2148,11 +2148,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	for {
 		requestedModel, upstreamModel, parsedBackendName = "", "", ""
 		chosen, chosenDemoted, logicalTargets = Target{}, false, nil
-		// Counts this target's re-sends the first-content timeout caused;
-		// only those double the next attempt's timeout, since a
-		// displacement says nothing about how slow the target is. A
-		// failover's new target starts at the timeout's first value.
-		var timeoutEscalations int
 
 		cr := &countingReader{ReadCloser: io.NopCloser(bytes.NewReader(bodyBytes))}
 		body, err := rewriteModel(cr, func(model string) (string, error) {
@@ -2346,7 +2341,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					sel.cfg.HTTPClient = s.httpClient
 				}
 				sent = time.Now()
-				queue.armFirstContentTimeout(pend, timeoutEscalations)
+				queue.armFirstContentTimeout(pend)
 				resp, sendErr = sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
 			}
 			if sendErr == nil && !queue.attemptEnded(pend, nil) {
@@ -2379,9 +2374,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// request whose client left goes no further than dropping it from
 			// the line here; the queue does not yet admit around a departed
 			// head.
-			if queue.takeFirstContentTimedOut(pend) {
-				timeoutEscalations++
-			}
 			if resp != nil {
 				_ = resp.Body.Close()
 				resp = nil
