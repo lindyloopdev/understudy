@@ -31,13 +31,6 @@ check and no regard for anything else unconfirmed at the target.
   period (a target admitting to its own internal queue before serving, the
   way Kronk can) — header state must not matter to this check, only
   confirmation state.
-- **Growth bursts freely again once a formed queue has drained.** A burst
-  of arrivals, none yet unconfirmed past its grace period, is pinned to pass
-  straight through; nothing pins that the same holds after a queue has
-  formed and drained.
-  - Tests: once a formed queue has drained — every waiter admitted and
-    resolved, nothing left unconfirmed past its grace period — a later
-    arrival passes straight through again.
 - **A stuck refill answers to the same rules as a stuck growth attempt.**
   Refilling is not an exemption from anything downstream of admission — a
   refilled request that fails to confirm is preemptable by an outranking

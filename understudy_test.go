@@ -6973,6 +6973,30 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: []string{"the oldest session asks", completes},
 		}
 	})
+	tests.AddFunc("should send a request on arrival again once a queue that formed at the backend has drained", func(t *testing.T) test {
+		const slow = "the oldest session asks"
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == slow {
+				// Unanswered past the grace period, so the next
+				// arrival is held behind it; its answer drains the
+				// queue.
+				time.Sleep(10 * time.Second)
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: slow},
+				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
+				{inboundMessage: "the latest session asks", after: 17 * time.Second},
+			},
+			reached: []string{slow, "the newer session asks", "the latest session asks"},
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -6990,10 +7014,6 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		})
 	})
 }
-
-// TODO(TODO.d/refill-and-growth-admission.md): once a formed queue has
-// drained — every waiter sent and answered, nothing silent past its grace
-// period — a later arrival should reach the backend on arrival again.
 
 // TODO(TODO.d/refill-and-growth-admission.md): a refilled request that goes
 // unconfirmed past its grace period should be displaced by an outranking
