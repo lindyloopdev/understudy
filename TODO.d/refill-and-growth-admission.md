@@ -39,11 +39,3 @@ check and no regard for anything else unconfirmed at the target.
   - Tests: a refilled request that goes unconfirmed past its grace period is
     displaced by an outranking arrival the same way a growth attempt would
     be.
-- **Refill correctly skips a departed waiter.** The head of the wait list may
-  already have had its own client disconnect while held
-  ([[session-ordered-admission]]'s existing departed-client handling). Refill
-  pulling from that list must move on to the next entry rather than stalling
-  on one that was already dropped.
-  - Tests: a confirmed request's completion, with the head of the wait list
-    already abandoned by its own client, admits the next request behind it
-    rather than nothing.

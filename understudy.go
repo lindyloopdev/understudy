@@ -2571,9 +2571,6 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 // context, waits for the queue to admit the request again, and takes a fresh
 // context and body for the next send.
 func (a *attempt) waitToResend() error {
-	// TODO(TODO.d/session-ordered-admission.md): removing a held request
-	// whose client left goes no further than dropping it from the line here;
-	// the queue does not yet admit around a departed head.
 	if a.resp != nil {
 		_ = a.resp.Body.Close()
 		a.resp = nil

@@ -6245,6 +6245,9 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		// after is how long the client waits before sending it.
 		after         time.Duration
 		upstreamReply upstreamReply
+		// clientLeavesAfter is how long after sending it the client gives up
+		// waiting; zero, it waits for its answer.
+		clientLeavesAfter time.Duration
 	}
 	type test struct {
 		turns []turn
@@ -6280,6 +6283,18 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleasedThenBreaks},
 			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
 			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
+		},
+		held:    "held",
+		pending: "unconfirmed",
+	})
+	tests.Add("should send the request behind a held one whose client has left, as soon as one of a busy backend's streaming answers completes", test{
+		turns: []turn{
+			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleased},
+			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
+			// Sent before "held", so it sits at the head of the wait list;
+			// its client leaves before the confirmed turn's stream ends.
+			{inboundMessage: "departed", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce, clientLeavesAfter: time.Second / 4},
+			{inboundMessage: "held", after: time.Second / 2, upstreamReply: replyAtOnce},
 		},
 		held:    "held",
 		pending: "unconfirmed",
@@ -6344,7 +6359,9 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 
 			for _, tn := range tt.turns {
 				time.Sleep(tn.after)
-				go poster.post(t.Context(), tn.inboundMessage, admissionTurn(admissionMsg("user", tn.inboundMessage)))
+				ctx, clientLeaves := context.WithTimeout(t.Context(), cmp.Or(tn.clientLeavesAfter, time.Hour))
+				t.Cleanup(clientLeaves)
+				go poster.post(ctx, tn.inboundMessage, admissionTurn(admissionMsg("user", tn.inboundMessage)))
 				synctest.Wait()
 			}
 			if _, ok := poster.answered(tt.held); ok {
@@ -7019,10 +7036,6 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 // unconfirmed past its grace period should be displaced by an outranking
 // arrival the same way a growth attempt would be — refilling earns no
 // exemption from anything downstream of admission.
-
-// TODO(TODO.d/refill-and-growth-admission.md): a confirmed request's completion,
-// with the head of the wait list already abandoned by its own client, should
-// admit the request behind it rather than stalling on the departed one.
 
 // TODO(TODO.d/session-ordered-admission.md): an arrival that outranks only some
 // of several simultaneously outstanding requests should be answered only once
