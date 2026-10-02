@@ -2081,21 +2081,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 	// A panic mid-request (in the response interceptor or the streamed body) would
 	// otherwise unwind past the release and leak the slot, starving the upstream.
-	// One pointer suffices because the retry loop holds at most one slot at a time;
-	// re-panicking leaves rendering to recoverPanic.
-	var heldSlot *upstreamLimiter
-	var heldPlace *pending
-	releaseHeld := func() {
-		if heldSlot != nil {
-			heldSlot.release()
-			heldSlot = nil
-		}
-	}
+	// One pointer suffices because the walk holds at most one attempt, and so one
+	// slot and one place in line, at a time; re-panicking leaves rendering to
+	// recoverPanic.
+	var current *attempt
 	defer func() {
 		if v := recover(); v != nil {
-			releaseHeld()
-			if heldPlace != nil {
-				heldPlace.queue.finish(heldPlace)
+			if current != nil {
+				current.releaseSlot()
+				current.pend.queue.finish(current.pend)
 			}
 			panic(v)
 		}
@@ -2289,7 +2283,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			cancel(nil)
 			return fmt.Errorf("held in the admission queue: %w", err)
 		}
-		heldPlace = pend
 
 		// The resend replays the same bytes to the same target when the queue
 		// displaces an attempt: the pick is settled, so the reader is rebuilt
@@ -2312,42 +2305,37 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			return b, nil
 		}
 
+		// The session header reaches Zen, so the bearer token never appears
+		// in it directly: it HMACs the conversation key instead.
+		mac := hmac.New(sha256.New, []byte(convTenant))
+		_, _ = mac.Write([]byte(convKey))
+		a := &attempt{
+			s:       s,
+			r:       r,
+			sel:     sel,
+			lim:     lim,
+			pend:    pend,
+			session: hex.EncodeToString(mac.Sum(nil)),
+			body:    body,
+			resend:  resend,
+			ctx:     ctx,
+			cancel:  cancel,
+		}
+		current = a
+
 		// The send, retried wherever the queue displaces an attempt or the
 		// first-content timeout ends one. Neither ending is a failure — the target
 		// is healthy and the client still waiting — so neither records and
 		// shrinks anything; the request waits for the queue to admit it again
 		// and sends the same bytes to the same target.
-		//
-		// TODO(TODO.d/simplify-the-send-loop.md): this loop still sends one
-		// attempt and waits to re-send inline; give those their own places,
-		// as relay has.
-		var resp *http.Response
-		var waited, acquired bool
-		// Per attempt: a re-sent attempt restamps sent, and only the attempt
-		// that reaches the relay below reads it, so neither a displaced nor a
-		// failed failover attempt sets the record's timing.
-		var sent time.Time
+		var acquired bool
 		for {
 			var sendErr error
-			waited, sendErr = lim.acquire(ctx)
-			acquired = sendErr == nil
-			if acquired {
-				heldSlot = lim
-				// The session header reaches Zen, so the bearer token never appears
-				// in it directly: it HMACs the conversation key instead.
-				mac := hmac.New(sha256.New, []byte(convTenant))
-				_, _ = mac.Write([]byte(convKey))
-				if s.httpClient != nil {
-					sel.cfg.HTTPClient = s.httpClient
-				}
-				sent = time.Now()
-				queue.armFirstContentTimeout(pend)
-				resp, sendErr = sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
-			}
-			if sendErr == nil && !queue.attemptEnded(pend, nil) {
+			acquired, sendErr = a.send()
+			if sendErr == nil && !pend.queue.attemptEnded(pend, nil) {
 				// Demand-gated: a success that never waited for a slot is no evidence
 				// about the account's capacity, so it does not raise the cap.
-				if waited {
+				if a.waited {
 					lim.grow()
 				}
 				if chosen.backend != "" {
@@ -2356,42 +2344,26 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				}
 				// Chat returns once the response header arrives, so this measures
 				// from the same sent instant as first content.
-				setLogTimeToResponseHeader(r.Context(), time.Since(sent))
-				setLogUpstreamStatus(r.Context(), resp.StatusCode)
+				setLogTimeToResponseHeader(r.Context(), time.Since(a.sent))
+				setLogUpstreamStatus(r.Context(), a.resp.StatusCode)
 
 				served := RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}
-				again, relayErr := s.relay(ctx, cancel, w, r, resp, pend, sent, served)
+				again, relayErr := a.relay(w, served)
 				if !again {
-					releaseHeld()
-					cancel(nil)
+					a.releaseSlot()
+					a.cancel(nil)
 					return relayErr
 				}
-			} else if sendErr != nil && !queue.attemptEnded(pend, sendErr) {
+			} else if sendErr != nil && !pend.queue.attemptEnded(pend, sendErr) {
 				err = sendErr
 				break
 			}
-			// TODO(TODO.d/session-ordered-admission.md): removing a held
-			// request whose client left goes no further than dropping it from
-			// the line here; the queue does not yet admit around a departed
-			// head.
-			if resp != nil {
-				_ = resp.Body.Close()
-				resp = nil
-			}
-			releaseHeld()
-			cancel(nil)
-			if holdErr := queue.await(r.Context(), pend); holdErr != nil {
-				return fmt.Errorf("held in the admission queue: %w", holdErr)
-			}
-			ctx, cancel = context.WithCancelCause(r.Context())
-			queue.rearm(pend, cancel)
-			if body, err = resend(); err != nil {
-				cancel(nil)
-				return badRequest(fmt.Errorf("malformed request body: %w", err))
+			if resendErr := a.waitToResend(); resendErr != nil {
+				return resendErr
 			}
 		}
 		if err != nil && !acquired {
-			cancel(nil)
+			a.cancel(nil)
 			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
 		}
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
@@ -2443,9 +2415,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			// Wrapping here, not at the return, is what puts every candidate on one
 			// scale for the verdict below: a delay either sent or synthesized.
-			err = s.withSynthesizedBackoff(ctx, chosen, backend.Backends, err)
+			err = s.withSynthesizedBackoff(a.ctx, chosen, backend.Backends, err)
 			failed := failedAttempt{
-				answer:        clientFacing(ctx, err),
+				answer:        clientFacing(a.ctx, err),
 				raw:           err,
 				target:        chosen,
 				backend:       parsedBackendName,
@@ -2456,7 +2428,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			// only its turn here. A fatal failure on chosenDemoted is the same story —
 			// already routed around for future requests, so this one needn't wait
 			// either. In every case an untried target beats surfacing the failure.
-			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(ctx)))) {
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(a.ctx)))) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains
@@ -2467,12 +2439,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				lastFailure = &failed
-				releaseHeld()
-				cancel(nil)
+				a.releaseSlot()
+				a.cancel(nil)
 				continue
 			}
-			releaseHeld()
-			cancel(nil)
+			a.releaseSlot()
+			a.cancel(nil)
 			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			break
 		}
@@ -2494,43 +2466,124 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 	return s.terminalFailure(answering, remaining, backend.Backends, s.withSynthesizedBackoff(r.Context(), answering, backend.Backends, answer))
 }
 
-// relay answers the client from an attempt whose header has arrived: it
-// strips sensitive headers, runs the response interceptor, and copies the
-// body, withholding the upstream's status, headers, and pre-content bytes
-// until its first content. ctx and cancel are the attempt's. It reports
-// whether the attempt ended before any content without failing — displaced,
-// or cut by the first-content timeout — in which case nothing reached the
-// client and the request is to be sent again; otherwise the attempt is
-// finished at its target and err is how the relay ended.
-func (s *server) relay(ctx context.Context, cancel context.CancelCauseFunc, w http.ResponseWriter, r *http.Request, resp *http.Response, pend *pending, sent time.Time, served RequestMetadata) (resend bool, err error) {
+// attempt is a request's standing at one target on the walk: what it sends
+// there, the upstream slot and place in line it holds, and the context of the
+// send in flight. A re-send after a displacement or a first-content timeout
+// reuses it, with a fresh context and body.
+type attempt struct {
+	s    *server
+	r    *http.Request
+	sel  selection
+	lim  *upstreamLimiter
+	pend *pending
+	// session is the session header sent upstream.
+	session string
+	body    io.Reader
+	// resend rebuilds body for a re-send.
+	resend func() (io.Reader, error)
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	// slot is the upstream slot held, if any.
+	slot *upstreamLimiter
+
+	// Per send: when it was sent, whether it waited for its slot, and the
+	// response whose header arrived.
+	sent   time.Time
+	waited bool
+	resp   *http.Response
+}
+
+// send waits for an upstream slot, arms the first-content timeout, and sends
+// the request. acquired reports whether a slot was had: an error without one
+// is the wait for a slot failing.
+func (a *attempt) send() (acquired bool, err error) {
+	a.waited, err = a.lim.acquire(a.ctx)
+	if err != nil {
+		return false, err
+	}
+	a.slot = a.lim
+	if a.s.httpClient != nil {
+		a.sel.cfg.HTTPClient = a.s.httpClient
+	}
+	a.sent = time.Now()
+	a.pend.queue.armFirstContentTimeout(a.pend)
+	a.resp, err = a.sel.handler.Chat(a.ctx, a.sel.cfg, a.session, a.body)
+	return true, err
+}
+
+// relay answers the client from a send whose header has arrived: it strips
+// sensitive headers, runs the response interceptor, and copies the body,
+// withholding the upstream's status, headers, and pre-content bytes until its
+// first content. It reports whether the send ended before any content without
+// failing — displaced, or cut by the first-content timeout — in which case
+// nothing reached the client and the request is to be sent again; otherwise
+// the attempt is finished at its target and err is how the relay ended.
+func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend bool, err error) {
+	resp := a.resp
 	for _, h := range sensitiveResponseHeaders {
 		resp.Header.Del(h)
 	}
 
-	if s.interceptor != nil {
-		if err := s.interceptor(r.Context(), served, resp); err != nil {
+	if a.s.interceptor != nil {
+		if err := a.s.interceptor(a.r.Context(), served, resp); err != nil {
 			_ = resp.Body.Close()
-			pend.queue.finish(pend)
+			a.pend.queue.finish(a.pend)
 			return false, err
 		}
 		resp.Header.Del("Content-Length")
 	}
 
-	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
+	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
 		r: idle,
 		content: func() {
 			held.commit()
-			pend.queue.confirm(pend)
-			setLogTimeToFirstContent(r.Context(), time.Since(sent))
+			a.pend.queue.confirm(a.pend)
+			setLogTimeToFirstContent(a.r.Context(), time.Since(a.sent))
 		},
 	})
-	if err != nil && pend.queue.attemptEnded(pend, err) {
+	if err != nil && a.pend.queue.attemptEnded(a.pend, err) {
 		return true, nil
 	}
 	held.commit()
 	_ = resp.Body.Close()
-	pend.queue.finish(pend)
+	a.pend.queue.finish(a.pend)
 	return false, err
+}
+
+// waitToResend readies a re-send after a displacement or a first-content
+// timeout: it closes the response, releases the slot, and cancels the send's
+// context, waits for the queue to admit the request again, and takes a fresh
+// context and body for the next send.
+func (a *attempt) waitToResend() error {
+	// TODO(TODO.d/session-ordered-admission.md): removing a held request
+	// whose client left goes no further than dropping it from the line here;
+	// the queue does not yet admit around a departed head.
+	if a.resp != nil {
+		_ = a.resp.Body.Close()
+		a.resp = nil
+	}
+	a.releaseSlot()
+	a.cancel(nil)
+	if err := a.pend.queue.await(a.r.Context(), a.pend); err != nil {
+		return fmt.Errorf("held in the admission queue: %w", err)
+	}
+	a.ctx, a.cancel = context.WithCancelCause(a.r.Context())
+	a.pend.queue.rearm(a.pend, a.cancel)
+	body, err := a.resend()
+	if err != nil {
+		a.cancel(nil)
+		return badRequest(fmt.Errorf("malformed request body: %w", err))
+	}
+	a.body = body
+	return nil
+}
+
+// releaseSlot releases the upstream slot the attempt holds, if any.
+func (a *attempt) releaseSlot() {
+	if a.slot != nil {
+		a.slot.release()
+		a.slot = nil
+	}
 }
