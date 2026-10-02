@@ -2538,9 +2538,13 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	_, err = io.Copy(held, &confirmingReader{
 		r: idle,
 		content: func() {
-			held.commit()
-			a.pend.queue.confirm(a.pend)
-			setLogTimeToFirstContent(a.r.Context(), time.Since(a.sent))
+			// Confirming before committing: a send the queue has already
+			// ended commits nothing to the client, and the request is sent
+			// again.
+			if a.pend.queue.confirm(a.pend) {
+				held.commit()
+				setLogTimeToFirstContent(a.r.Context(), time.Since(a.sent))
+			}
 		},
 	})
 	if err != nil && a.pend.queue.sendEnded(a.pend) {

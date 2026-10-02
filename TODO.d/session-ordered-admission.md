@@ -40,11 +40,11 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - Record first content before sending it to the client. The relay sends
-    it first, so a timeout firing in between can cut a stream whose content
-    the client already has.
-    - Tests: a stream whose first content arrives at the instant its timeout
-      fires reaches its client whole and is not sent again.
+  - Keep a timed-out send's late content from the client however the send
+    ends. Content that arrives after the timeout fired is dropped, but if the
+    backend then ends the send cleanly, the relay still sends it on.
+    - Tests: late content followed by a clean end of the send still leaves
+      the client with only the second send's answer.
   - Tie each timeout's firing to the attempt it was armed for. A timeout that
     fired just as its attempt was re-sent can cut the re-sent attempt at once.
     - Tests: a re-sent request gets its full timeout even when the previous

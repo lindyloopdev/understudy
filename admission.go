@@ -361,15 +361,21 @@ func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 }
 
 // confirm records p's first content — the moment the target has begun
-// answering — which frees the queue to admit its next waiter.
-func (q *targetQueue) confirm(p *pending) {
+// answering — which frees the queue to admit its next waiter, and reports
+// whether the send still stands. A preempted send — by an outranking arrival,
+// or by its own first-content timeout — does not: its content is discarded,
+// and the caller sends the client nothing.
+func (q *targetQueue) confirm(p *pending) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if p.confirmed {
-		return
+	if p.preempted {
+		return false
 	}
-	p.confirmed = true
-	q.admitIfAllOutstandingConfirmed()
+	if !p.confirmed {
+		p.confirmed = true
+		q.admitIfAllOutstandingConfirmed()
+	}
+	return true
 }
 
 // finish ends p's standing at the target: its attempt is over, so it holds the
