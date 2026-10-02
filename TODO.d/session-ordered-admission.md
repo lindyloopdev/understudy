@@ -40,10 +40,6 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - Keep the doubling from overflowing. Past about 28 attempts the timeout
-    wraps, and the request is re-sent in a tight loop.
-    - Tests: a target silent through many timeouts in a row keeps receiving
-      the request at ever-longer intervals.
   - When it fires on a target that gives no work before its header, every
     headerless request at that target restarts together, in rank order, so
     the retry restores ordering rather than scrambling it.

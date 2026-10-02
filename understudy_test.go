@@ -6776,11 +6776,6 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
-	// TODO(TODO.d/session-ordered-admission.md): a target that stays silent
-	// through many timeouts in a row should keep receiving the request at
-	// ever-longer intervals. Today the doubling overflows after about 28
-	// attempts, and the request is then re-sent in a tight loop.
-
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			backends := make(map[string]Backend, len(tt.backends))
