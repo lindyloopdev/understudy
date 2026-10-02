@@ -2332,7 +2332,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		for {
 			var sendErr error
 			acquired, sendErr = a.send()
-			if sendErr == nil && !pend.queue.attemptEnded(pend, nil) {
+			if sendErr == nil && pend.queue.headerArrived(pend) {
 				// Demand-gated: a success that never waited for a slot is no evidence
 				// about the account's capacity, so it does not raise the cap.
 				if a.waited {
@@ -2354,7 +2354,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					a.cancel(nil)
 					return relayErr
 				}
-			} else if sendErr != nil && !pend.queue.attemptEnded(pend, sendErr) {
+			} else if sendErr != nil && !pend.queue.sendEnded(pend) {
 				err = sendErr
 				break
 			}
@@ -2543,7 +2543,7 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 			setLogTimeToFirstContent(a.r.Context(), time.Since(a.sent))
 		},
 	})
-	if err != nil && a.pend.queue.attemptEnded(a.pend, err) {
+	if err != nil && a.pend.queue.sendEnded(a.pend) {
 		return true, nil
 	}
 	held.commit()

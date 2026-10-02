@@ -257,24 +257,35 @@ func (q *targetQueue) formByWaiting(p *pending) {
 	}
 }
 
-// attemptEnded records the attempt's upstream call ending: err is nil when the
-// call returned a response, whose header has now arrived. It reports whether
-// the attempt was preempted — by an outranking arrival, or by its own
-// first-content timeout — the one ending that is not a failure, so the caller
-// waits for the queue to admit it again instead of recording or relaying
-// anything. A response that slipped past a preemption decision is discarded:
-// the re-sent attempt is the one the client receives.
-//
-// TODO(TODO.d/simplify-the-send-loop.md): the send loop calls this after a
-// header arrives, after a failed send, and after the relay, asking a
-// different question each time; give each call one place.
-func (q *targetQueue) attemptEnded(p *pending, err error) bool {
+// headerArrived records that a send's response header has arrived, and
+// reports whether the send still stands. A send already preempted — by an
+// outranking arrival, or by its own first-content timeout — does not: its
+// response slipped past the preemption decision and is discarded, and the
+// caller sends the request again.
+func (q *targetQueue) headerArrived(p *pending) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if err == nil && !p.preempted {
+	if !p.preempted {
 		p.headered = true
-		return false
+		return true
 	}
+	return !q.endSend(p)
+}
+
+// sendEnded records a send ending without an answer to relay — its call
+// failed, or its relay broke off — and reports whether it was preempted
+// before any content, in which case the caller waits for the queue to
+// admit the request again instead of recording or relaying anything.
+func (q *targetQueue) sendEnded(p *pending) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.endSend(p)
+}
+
+// endSend takes p's send out of the target's outstanding requests, admits
+// whoever that frees a place for, and reports whether the send was
+// preempted before any content. Caller holds q.mu.
+func (q *targetQueue) endSend(p *pending) bool {
 	q.dropOutstanding(p)
 	q.admitIfAllOutstandingConfirmed()
 	return p.preempted && !p.confirmed
