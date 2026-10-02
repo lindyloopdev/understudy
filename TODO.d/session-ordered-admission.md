@@ -40,10 +40,6 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - Tie each timeout's firing to the attempt it was armed for. A timeout that
-    fired just as its attempt was re-sent can cut the re-sent attempt at once.
-    - Tests: a re-sent request gets its full timeout even when the previous
-      attempt's timeout fired as it was re-sent.
   - Keep the doubling from overflowing. Past about 28 attempts the timeout
     wraps, and the request is re-sent in a tight loop.
     - Tests: a target silent through many timeouts in a row keeps receiving

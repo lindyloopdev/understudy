@@ -6406,6 +6406,10 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		followed string
 		events   []string
 		sends    int
+		// handlerDelay is how long a first-content timeout's handler waits
+		// after its timer fires: zero, at once; more, a firing Stop can no
+		// longer prevent.
+		handlerDelay time.Duration
 	}
 
 	tests := testy.NewTable[test]()
@@ -6709,11 +6713,68 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
-
-	// TODO(TODO.d/session-ordered-admission.md): a re-sent request should get
-	// its full first-content timeout, even when the previous attempt's timeout
-	// fired just as it was being re-sent. Today that late firing can cut the
-	// re-sent attempt at once.
+	tests.AddFunc("should let a first-content timeout end only the send it was started for, when its handler runs after the request was sent again", func(t *testing.T) test {
+		const (
+			olderMessage     = "the older session asks"
+			olderMessage2    = "the older session asks again"
+			displacedMessage = "the displaced session asks"
+			resentAnswer     = "the second send's answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch {
+			case inboundMessage == olderMessage2:
+				// Holds the target headerless past the displaced send's timeout
+				// firing at t=61s, so the re-send goes out before the late
+				// handler runs; its answer then triggers the re-send.
+				time.Sleep(58 * time.Second)
+				return sseAnswer(inboundMessage), nil
+			case inboundMessage != displacedMessage:
+				return sseAnswer(inboundMessage), nil
+			case received.count(inboundMessage) == 1:
+				// The first send waits at the target with no header, until
+				// the older session's second turn displaces it.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// The second send is answered 30s in, within its own 60s.
+			select {
+			case <-r.Context().Done():
+				return nil, context.Cause(r.Context())
+			case <-time.After(30 * time.Second):
+				return sseAnswer(resentAnswer), nil
+			}
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				// The older session's first turn fixes its rank ahead of the
+				// displaced session, which has not arrived yet.
+				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
+				// The displaced session's turn reaches the target at t=1s and
+				// waits there with no header; its timeout fires at t=61s.
+				{inboundMessage: displacedMessage, body: admissionTurn(admissionMsg("user", displacedMessage)), after: time.Second},
+				// The older session's second turn outranks it at t=4s,
+				// displacing the headerless send.
+				{inboundMessage: olderMessage2, body: admissionTurn(
+					admissionMsg("user", olderMessage),
+					admissionMsg("assistant", "answered"),
+					admissionMsg("user", olderMessage2),
+				), after: admissionGracePeriod + time.Second},
+			},
+			// The displaced send's timer fires at t=61s, but its handler runs
+			// only at t=71s — after the request was sent again at t=62s.
+			handlerDelay: 10 * time.Second,
+			// Had the late handler cut the second send, a third would still
+			// be unanswered at this check.
+			wait:     90 * time.Second,
+			followed: displacedMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, resentAnswer)},
+			sends:    2,
+		}
+	})
 
 	// TODO(TODO.d/session-ordered-admission.md): a target that stays silent
 	// through many timeouts in a row should keep receiving the request at
@@ -6734,6 +6795,12 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 				return &BackendConfig{Backends: backends, Models: tt.models}, nil
 			}})
 			srv.logger = testLogger(t)
+			srv.firstContentSchedule = func(d time.Duration, fire func()) *time.Timer {
+				return time.AfterFunc(d, func() {
+					time.Sleep(tt.handlerDelay)
+					fire()
+				})
+			}
 			poster := newAdmissionPoster(t, srv)
 
 			for _, a := range tt.arrivals {

@@ -104,7 +104,7 @@ func (s *server) admissionQueue(key string) *targetQueue {
 	defer s.mu.Unlock()
 	q, ok := s.admission[key]
 	if !ok {
-		q = &targetQueue{}
+		q = &targetQueue{firstContentSchedule: s.firstContentSchedule}
 		s.admission[key] = q
 	}
 	return q
@@ -122,6 +122,9 @@ type targetQueue struct {
 	outstanding []*pending
 	// waiting holds queued attempts in rank order, oldest session first.
 	waiting []*pending
+	// firstContentSchedule schedules every first-content timeout the queue
+	// arms; it is taken from the server at the queue's creation.
+	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 }
 
 // pending is one attempt's standing at a target queue: its rank, when it
@@ -140,7 +143,8 @@ type pending struct {
 	// timeout. Per target: one target's slowness says nothing about
 	// another's.
 	firstContentTimeouts int
-	firstContentTimer    *time.Timer
+	// firstContentTimer is the first-content timeout now in force, if any.
+	firstContentTimer *time.Timer
 }
 
 // pastGrace reports whether p's grace period has elapsed as of now.
@@ -303,22 +307,28 @@ func (q *targetQueue) endSend(p *pending) bool {
 func (q *targetQueue) armFirstContentTimeout(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	p.firstContentTimer = time.AfterFunc(initialFirstContentTimeout<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p) })
+	// The handler reads timer only under q.mu, which is held here until it
+	// is set, so even a timer that fires at once finds it.
+	var timer *time.Timer
+	timer = q.firstContentSchedule(initialFirstContentTimeout<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p, &timer) })
+	p.firstContentTimer = timer
 }
 
 // expireFirstContentTimeout preempts p's attempt when its first-content timeout
 // expires with no content arrived. Ending it commits nothing to the client —
 // the relay withholds the upstream's status, headers, and pre-content bytes
 // until first content — so the request can be sent again to the same target.
+// timer is the timer that fired. One that is no longer p's timeout in force
+// was started for a send that has since ended; that firing does nothing.
 //
 // TODO(TODO.d/session-ordered-admission.md): when the timeout fires on a
 // backend that gives no work before its header, every headerless request at
 // that target should restart together in send order, so the retry restores
 // ordering rather than scrambling it; this ends only the one attempt.
-func (q *targetQueue) expireFirstContentTimeout(p *pending) {
+func (q *targetQueue) expireFirstContentTimeout(p *pending, timer **time.Timer) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if p.confirmed || p.preempted || !slices.Contains(q.outstanding, p) {
+	if *timer != p.firstContentTimer || p.confirmed || p.preempted || !slices.Contains(q.outstanding, p) {
 		return
 	}
 	p.preempted = true
@@ -349,6 +359,9 @@ func (q *targetQueue) await(ctx context.Context, p *pending) error {
 // rearm re-arms p for the re-sent attempt: a fresh upstream context to cancel
 // and a fresh admitted channel, so the re-send can itself be displaced.
 // Admission stamped a fresh arrival, so the grace period restarts here.
+// [time.Timer.Stop] cannot stop a timer whose handler has not yet run, so the
+// timer is cleared as well; such a late firing finds firstContentTimer no
+// longer in force.
 func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

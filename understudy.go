@@ -246,6 +246,13 @@ type server struct {
 	// [WithHTTPClient] for why it exists.
 	httpClient *http.Client
 
+	// firstContentSchedule starts a timer that runs fire after d and returns
+	// it. Production uses [time.AfterFunc]; a test may give its own to hold a
+	// firing between the timer's firing and the handler's run — a moment
+	// real and synctest timers cannot produce, since the scheduler picks
+	// whether that handler or the re-send it must not touch runs first.
+	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
+
 	// TODO(TODO.d/collapse-the-server-state-maps.md): the five maps below sit in
 	// three key spaces — health and admission share a target key, affinity and
 	// sessionAges share a tenant-and-conversation key — so two records would say
@@ -543,6 +550,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		recoveryInterval:         defaultRecoveryInterval,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
 		fdLimitReader:            readFDSoftLimit,
+		firstContentSchedule:     time.AfterFunc,
 		health:                   make(map[string]targetHealth),
 		affinity:                 make(map[string]map[string]lastServed),
 		sessionAges:              make(map[string]map[string]sessionRecord),
