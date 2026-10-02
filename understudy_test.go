@@ -6966,6 +6966,37 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: []string{"the older session asks"},
 		}
 	})
+	// A target that admits to its own internal queue sends the header
+	// before serving, so the header alone doesn't show the request is
+	// served.
+	tests.AddFunc("should hold a newer session's request arriving while another at the backend has had its header but no content past the grace period", func(t *testing.T) test {
+		const headered = "the older session asks"
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == headered {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: headered},
+				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
+			},
+			reached: []string{headered},
+		}
+	})
 	// Nothing records that a request completed with nobody waiting, so the
 	// place it freed is not owed to a later arrival.
 	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period, though a request there completed with nobody waiting", func(t *testing.T) test {

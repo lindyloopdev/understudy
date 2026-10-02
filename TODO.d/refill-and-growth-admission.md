@@ -22,15 +22,6 @@ check and no regard for anything else unconfirmed at the target.
   header or confirmation** — the case DeepSeek/wide-backend behavior depends
   on, staged with a doubled target slow enough to answer that gating on header
   latency would visibly serialize the two.
-- **Pin the headered case of growth's hold-on-unconfirmed check.** Growth
-  holds an arrival while anything at its target is unconfirmed past grace;
-  `TestShouldSendOrHoldARequestOnArrival` covers the headerless occupant
-  only. Add the headered counterpart as a row there:
-  a fresh, non-outranking arrival is held without ever reaching the target
-  while a *headered* request at that target is unconfirmed past its grace
-  period (a target admitting to its own internal queue before serving, the
-  way Kronk can) — header state must not matter to this check, only
-  confirmation state.
 - **A stuck refill answers to the same rules as a stuck growth attempt.**
   Refilling is not an exemption from anything downstream of admission — a
   refilled request that fails to confirm is preemptable by an outranking
