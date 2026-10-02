@@ -6525,6 +6525,44 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
+	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout fired and the backend then ends that send cleanly", func(t *testing.T) test {
+		const (
+			message = "the lone session's target answers just after the timeout and ends cleanly"
+			late    = "the timed-out send's late content"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			if received.count(sentMessage) == 1 {
+				// First read blocks until the first-content timeout cancels
+				// the request context, then delivers content; the next read
+				// ends the body cleanly, before the cancellation reaches it.
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							<-r.Context().Done()
+							return copy(p, fmt.Sprintf("data: {\"id\":%q}\n\n", late)), nil
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
+			wait:     initialFirstContentTimeout + time.Second,
+			followed: message,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
+			sends:    2,
+		}
+	})
 	tests.AddFunc("should cut a displaced request's re-sent attempt at the first-content timeout's first value, sending it a third time", func(t *testing.T) test {
 		const (
 			olderMessage     = "the older session butts in"
@@ -6671,14 +6709,6 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
-
-	// TODO(TODO.d/session-ordered-admission.md): when a send's late content
-	// arrives after its first-content timeout fired and the backend then ends
-	// that send cleanly — the rest of the body and its end arriving before the
-	// cancellation reaches it — the client should still get only the answer
-	// to Understudy's second send. Today the relay ends without an error, so
-	// it sends the late content to the client and never sends the request
-	// again.
 
 	// TODO(TODO.d/session-ordered-admission.md): a re-sent request should get
 	// its full first-content timeout, even when the previous attempt's timeout

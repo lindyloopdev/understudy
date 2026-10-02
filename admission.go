@@ -273,9 +273,10 @@ func (q *targetQueue) headerArrived(p *pending) bool {
 }
 
 // sendEnded records a send ending without an answer to relay — its call
-// failed, or its relay broke off — and reports whether it was preempted
-// before any content, in which case the caller waits for the queue to
-// admit the request again instead of recording or relaying anything.
+// failed, or its relay ended before any content, however it ended — and
+// reports whether it was preempted before any content, in which case the
+// caller waits for the queue to admit the request again instead of recording
+// or relaying anything.
 func (q *targetQueue) sendEnded(p *pending) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()

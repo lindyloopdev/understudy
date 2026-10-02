@@ -40,11 +40,6 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - Keep a timed-out send's late content from the client however the send
-    ends. Content that arrives after the timeout fired is dropped, but if the
-    backend then ends the send cleanly, the relay still sends it on.
-    - Tests: late content followed by a clean end of the send still leaves
-      the client with only the second send's answer.
   - Tie each timeout's firing to the attempt it was armed for. A timeout that
     fired just as its attempt was re-sent can cut the re-sent attempt at once.
     - Tests: a re-sent request gets its full timeout even when the previous

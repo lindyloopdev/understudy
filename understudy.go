@@ -2547,7 +2547,9 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 			}
 		},
 	})
-	if err != nil && a.pend.queue.sendEnded(a.pend) {
+	// A send the queue preempted before any content sends the client
+	// nothing and is sent again, however the copy ended.
+	if a.pend.queue.sendEnded(a.pend) {
 		return true, nil
 	}
 	held.commit()
