@@ -5522,18 +5522,6 @@ func TestChatCompletionsConcurrencyLimit(t *testing.T) {
 // business, so the attempts compared are the ones the target keeps, not
 // those Understudy withdraws.
 func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing.T) {
-	// upstreamReply is how the fake backend answers a turn.
-	type upstreamReply int
-	const (
-		// replyAtOnce: answers in full as soon as the turn arrives.
-		replyAtOnce upstreamReply = iota
-		// replyAtRelease: sends nothing until the test releases the backend,
-		// then answers in full.
-		replyAtRelease
-		// replyStreamsFromRelease: sends nothing until the test releases the
-		// backend, then streams its first content and keeps the stream open.
-		replyStreamsFromRelease
-	)
 	type turn struct {
 		// label names the turn in the assertion.
 		label string
@@ -5543,14 +5531,40 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		// userMessages are the turn's user messages, in order; the first
 		// identifies its session, and the last is what the fake backend sees.
 		// Each is unique across the case.
-		userMessages  []string
-		upstreamReply upstreamReply
+		userMessages []string
 	}
 	type test struct {
-		turns []turn
+		backend  *http.Client
+		attempts *targetAttempts
+		turns    []turn
+		// opens is how long after the test starts the target opens.
+		opens time.Duration
 		// first and second label the contending turns in the order
 		// Understudy should send them.
 		first, second string
+	}
+
+	// opensAfter is when the target opens: the turns' total wait plus the
+	// grace period, so every turn waiting at it has waited past its grace
+	// period before it opens.
+	opensAfter := func(turns []turn) time.Duration {
+		var d time.Duration
+		for _, tn := range turns {
+			d += tn.after
+		}
+		return d + admissionGracePeriod + time.Second
+	}
+	busyTargetCase := func(t *testing.T, turns []turn, first, second string, atOnce ...string) test {
+		t.Helper()
+		attempts := &targetAttempts{}
+		return test{
+			backend:  busyTarget(t, attempts, opensAfter(turns), atOnce...),
+			attempts: attempts,
+			turns:    turns,
+			opens:    opensAfter(turns),
+			first:    first,
+			second:   second,
+		}
 	}
 
 	const (
@@ -5561,121 +5575,62 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should send the older session's turn first when Understudy holds both turns behind a higher-ranked occupier, the younger's having arrived first", test{
-		turns: []turn{
+	tests.AddFunc("should send the older session's turn first when Understudy holds both turns behind a higher-ranked occupier, the younger's having arrived first", func(t *testing.T) test {
+		turns := []turn{
 			{label: "occupier-opening", userMessages: []string{occupier}},
 			{label: "older-opening", after: time.Second, userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
-			{label: "occupier", after: time.Second, userMessages: []string{occupier, admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-		},
-		first: "older", second: "younger",
+			{label: "occupier", after: time.Second, userMessages: []string{occupier, admissionLongMessage}},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}},
+		}
+		return busyTargetCase(t, turns, "older", "younger", occupier, older, younger)
 	})
-	tests.Add("should send the older session's turn first when both turns already wait at the target, the younger's having arrived first", test{
-		turns: []turn{
+	tests.AddFunc("should send the older session's turn first when both turns already wait at the target, the younger's having arrived first", func(t *testing.T) test {
+		turns := []turn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
-			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
-			{label: "younger", after: 500 * time.Millisecond, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-		},
-		first: "older", second: "younger",
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
+			{label: "younger", after: 500 * time.Millisecond, userMessages: []string{younger, younger + " again"}},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}},
+		}
+		return busyTargetCase(t, turns, "older", "younger", older, younger)
 	})
 	// The control for the next case: the same arrival, with the older session
 	// still remembered, keeps its turn first.
-	tests.Add("should send the older session's turn first when the younger's arrives behind it", test{
-		turns: []turn{
+	tests.AddFunc("should send the older session's turn first when the younger's arrives behind it", func(t *testing.T) test {
+		turns := []turn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
-			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
-			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-		},
-		first: "older", second: "younger",
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
+			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}},
+		}
+		return busyTargetCase(t, turns, "older", "younger", older, younger)
 	})
 	// The younger session keeps taking turns through the older one's absence,
 	// each quiet stretch well short of a day, so it is still remembered when
 	// the older session returns after more than a day.
-	tests.Add("should send the younger session's turn first when the older session was away too long to remember", test{
-		turns: []turn{
+	tests.AddFunc("should send the younger session's turn first when the older session was away too long to remember", func(t *testing.T) test {
+		turns := []turn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
 			{label: "younger-second", after: 10 * time.Hour, userMessages: []string{younger, younger + " (2)"}},
 			{label: "younger-third", after: 10 * time.Hour, userMessages: []string{younger, younger + " (3)"}},
-			{label: "occupier", after: 10 * time.Hour, userMessages: []string{admissionLongMessage}, upstreamReply: replyStreamsFromRelease},
-			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}, upstreamReply: replyAtRelease},
-			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}, upstreamReply: replyAtRelease},
-		},
-		first: "younger", second: "older",
+			{label: "occupier", after: 10 * time.Hour, userMessages: []string{admissionLongMessage}},
+			{label: "older", after: time.Second, userMessages: []string{older, older + " again"}},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}},
+		}
+		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
 	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			// release opens the backend: every turn waiting on it is answered,
-			// and a streamed answer sends its first content.
-			release := make(chan struct{})
-			// streamEnds keeps every streamed answer open past the assertion,
-			// so each turn Understudy sends is let through by one
-			// confirmation, never two at once.
-			streamEnds := make(chan struct{})
-			t.Cleanup(func() { close(streamEnds) })
-
-			byMessage := map[string]turn{}
+			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+			labels := map[string]string{}
+			start := time.Now()
 			for _, tn := range tt.turns {
-				byMessage[tn.userMessages[len(tn.userMessages)-1]] = tn
-			}
-
-			// received records every attempt the backend receives, in the order
-			// it receives them, and marks those Understudy withdraws before the
-			// backend answers.
-			type attempt struct {
-				label     string
-				withdrawn bool
-			}
-			var mu sync.Mutex
-			var received []*attempt
-			client := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
-				tn := byMessage[inboundMessage]
-				if tn.upstreamReply == replyAtOnce {
-					return admissionJSON(inboundMessage), nil
-				}
-				a := &attempt{label: tn.label}
-				mu.Lock()
-				received = append(received, a)
-				mu.Unlock()
-				select {
-				case <-r.Context().Done():
-					mu.Lock()
-					a.withdrawn = true
-					mu.Unlock()
-					return nil, context.Cause(r.Context())
-				case <-release:
-				}
-				if tn.upstreamReply == replyAtRelease {
-					return admissionJSON(inboundMessage), nil
-				}
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-streamEnds:
-							return 0, io.EOF
-						}
-					})),
-				}, nil
-			})
-			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-
-			for _, tn := range tt.turns {
+				labels[tn.userMessages[len(tn.userMessages)-1]] = tn.label
 				time.Sleep(tn.after)
 				messages := make([]string, 0, 2*len(tn.userMessages))
 				for i, message := range tn.userMessages {
@@ -5688,25 +5643,113 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 				synctest.Wait()
 			}
 
-			// Everything waiting at the backend sits there past its grace
-			// period before the backend opens.
-			time.Sleep(admissionGracePeriod + time.Second)
-			close(release)
+			time.Sleep(time.Until(start.Add(tt.opens)))
 			synctest.Wait()
 
-			mu.Lock()
-			var kept []string
-			for _, a := range received {
-				if !a.withdrawn {
-					kept = append(kept, a.label)
-				}
+			messages := tt.attempts.kept()
+			kept := make([]string, 0, len(messages))
+			for _, message := range messages {
+				kept = append(kept, labels[message])
 			}
-			mu.Unlock()
 			i, j := slices.Index(kept, tt.first), slices.Index(kept, tt.second)
 			if i < 0 || j < 0 || i > j {
 				t.Errorf("the backend kept attempts in order %v; Understudy should send %s before %s", kept, tt.first, tt.second)
 			}
 		})
+	})
+}
+
+// targetAttempts records, in order, the inbound messages of the requests a
+// fake target receives, and which of them Understudy withdrew before the
+// target answered.
+type targetAttempts struct {
+	mu       sync.Mutex
+	start    time.Time
+	received []targetAttempt
+}
+
+// targetAttempt is one request a fake target received.
+type targetAttempt struct {
+	inboundMessage string
+	withdrawn      bool
+}
+
+// add records a request's arrival and returns its index, for use with
+// [targetAttempts.waitUntil], which measures its duration from the first
+// arrival.
+func (a *targetAttempts) add(inboundMessage string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.start.IsZero() {
+		a.start = time.Now()
+	}
+	a.received = append(a.received, targetAttempt{inboundMessage: inboundMessage})
+	return len(a.received) - 1
+}
+
+// waitUntil holds request i until d after the target's first request, and
+// reports whether d passed before the client withdrew the request, marking it
+// withdrawn if so.
+func (a *targetAttempts) waitUntil(r *http.Request, i int, d time.Duration) bool {
+	a.mu.Lock()
+	at := a.start.Add(d)
+	a.mu.Unlock()
+	select {
+	case <-time.After(time.Until(at)):
+		return true
+	case <-r.Context().Done():
+		a.mu.Lock()
+		a.received[i].withdrawn = true
+		a.mu.Unlock()
+		return false
+	}
+}
+
+// kept is the inbound messages of the requests the target kept, in the order
+// it received them.
+func (a *targetAttempts) kept() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var kept []string
+	for _, r := range a.received {
+		if !r.withdrawn {
+			kept = append(kept, r.inboundMessage)
+		}
+	}
+	return kept
+}
+
+// busyTarget is a fake target busy until opens after its first request: it
+// answers the requests named in atOnce as soon as they arrive, and holds every
+// other request until it opens. Then it streams the occupying session's
+// ([admissionLongMessage]) first content and keeps that stream open, so
+// Understudy confirms the turns it sends one at a time, and answers the
+// rest in full.
+func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atOnce ...string) *http.Client {
+	return admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+		i := attempts.add(inboundMessage)
+		if slices.Contains(atOnce, inboundMessage) {
+			return admissionJSON(inboundMessage), nil
+		}
+		if !attempts.waitUntil(r, i, opens) {
+			return nil, context.Cause(r.Context())
+		}
+		if inboundMessage != admissionLongMessage {
+			return admissionJSON(inboundMessage), nil
+		}
+		reads := 0
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+				reads++
+				if reads == 1 {
+					return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+				}
+				<-r.Context().Done()
+				return 0, context.Cause(r.Context())
+			})),
+		}, nil
 	})
 }
 
