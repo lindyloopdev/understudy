@@ -7120,9 +7120,12 @@ func silentBackend(t *testing.T, received *receivedMessages) *http.Client {
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// arrival is one session's request.
 	type arrival struct {
-		// inboundMessage is the user message the client sends; it is also the
-		// session's first message, so every arrival is a session of its own.
+		// inboundMessage is the user message the client sends.
 		inboundMessage string
+		// earlier is the user messages of the session's earlier turns, in
+		// order, sent ahead of inboundMessage; with none, the arrival is
+		// its own session.
+		earlier []string
 		// after is how long the client waits after the previous arrival
 		// before sending it.
 		after time.Duration
@@ -7166,7 +7169,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// A target that admits to its own internal queue sends the header
 	// before serving, so the header alone doesn't show the request is
 	// served.
-	tests.AddFunc("should hold a newer session's request arriving while another at the backend has had its header but no content past the grace period", func(t *testing.T) test {
+	tests.AddFunc("should hold a newer session's request arriving while another has had its header but no content past the grace period", func(t *testing.T) test {
 		const headered = "the older session asks"
 		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
@@ -7192,6 +7195,44 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{headered},
+		}
+	})
+	// The arrival outranks the younger request, but a headered request is
+	// never displaced, so the arrival waits behind it: rank decides who is
+	// displaced, not who waits.
+	tests.AddFunc("should hold an older session's request arriving while a younger one has had its header but no content past the grace period", func(t *testing.T) test {
+		const (
+			older    = "the older session asks"
+			headered = "the younger session asks"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case older:
+				return admissionJSON(inboundMessage), nil
+			case headered:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backend:  backend,
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: older},
+				{inboundMessage: headered, after: time.Second / 2},
+				{inboundMessage: older + " again", earlier: []string{older}, after: admissionGracePeriod + time.Second},
+			},
+			reached: []string{older, headered},
 		}
 	})
 	// Nothing records that a request completed with nobody waiting, so the
@@ -7249,7 +7290,12 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 
 			for _, a := range tt.arrivals {
 				time.Sleep(a.after)
-				go poster.post(t.Context(), a.inboundMessage, admissionTurn(admissionMsg("user", a.inboundMessage)))
+				messages := make([]string, 0, 2*len(a.earlier)+1)
+				for _, m := range a.earlier {
+					messages = append(messages, admissionMsg("user", m), admissionMsg("assistant", "word"))
+				}
+				messages = append(messages, admissionMsg("user", a.inboundMessage))
+				go poster.post(t.Context(), a.inboundMessage, admissionTurn(messages...))
 				synctest.Wait()
 			}
 
@@ -7260,12 +7306,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): an arrival that outranks only some
-// of several simultaneously outstanding requests should be answered only once
-// every one of them — including the ones it did not outrank — has resolved, not
-// only the ones it displaced; and a displaced request's replacement should
-// reach the target no sooner than the cancellation it displaced actually
-// completes, never in the same instant.
+// TODO(TODO.d/session-ordered-admission.md): a displaced request's replacement
+// should reach the target no sooner than the cancellation it displaced
+// actually completes, never in the same instant.
 
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
