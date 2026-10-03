@@ -249,9 +249,6 @@ func (q *targetQueue) formByWaiting(p *pending) {
 		if o.headered || o.preempted || !o.pastGrace(now) {
 			continue
 		}
-		// TODO(TODO.d/session-ordered-admission.md): no case yet stages a
-		// headered unconfirmed request ranked below a headerless one when the
-		// wait forms the queue, so the probe-held arm is unexercised.
 		if o == probe && !probeHeld {
 			continue
 		}

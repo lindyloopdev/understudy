@@ -56,16 +56,6 @@ limiter. The steps below remain, in order.
   - Tests: several headerless requests at one target, all wedged together,
     restart together and are re-admitted per growth's burst rule rather than
     one at a time.
-- **Test the probe-held arm of the waiting trigger.** No case stages a
-  headered unconfirmed request ranked below a headerless one when the wait
-  forms the queue, so the arm that queues the probe because preemption never
-  takes a headered request is unexercised. This is the sweep's own
-  cancellation logic (`formByWaiting`), distinct from growth's admit-check
-  above — the admit-check decides whether a *new* arrival is let in; this
-  decides who the sweep takes once the wait trigger has already fired.
-  - Tests: the highest-ranked unconfirmed request at a target is taken by the
-    sweep, not spared as the probe, when a different, headered request is the
-    one currently unconfirmed at that target.
 - **Who waits, and who fails over.** A later turn, and a first turn with no
   healthy untried alternate, wait in the queue. A first turn with a healthy
   alternate takes the walk and fails over rather than queue.

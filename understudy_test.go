@@ -6956,6 +6956,60 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
+	tests.AddFunc("should withdraw an older session's request silent past its grace period and send it again when a younger session's headered request holds the target", func(t *testing.T) test {
+		const (
+			olderMessage   = "the older session asks a target a younger session holds"
+			youngerMessage = "the younger session's request has its header"
+			resent         = "the older session's second send's answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch {
+			case inboundMessage == youngerMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads > 1 {
+							return 0, io.EOF
+						}
+						// Stays unconfirmed past the older request's grace
+						// period, so it holds the target when that expires.
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(admissionGracePeriod + 3*time.Second):
+						}
+						return copy(p, fmt.Sprintf("data: {\"id\":%q}\n\n", inboundMessage)), nil
+					})),
+				}, nil
+			case received.count(inboundMessage) == 1:
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			return sseAnswer(resent), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
+				// Arrives before the older request's grace period ends, so
+				// its headered send is unconfirmed at the target when the
+				// wait sweep runs.
+				{inboundMessage: youngerMessage, body: admissionTurn(admissionMsg("user", youngerMessage)), after: time.Second},
+			},
+			// Well short of the first-content timeout, so only the wait
+			// sweep can have withdrawn the first send.
+			wait:     admissionGracePeriod + 5*time.Second,
+			followed: olderMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, resent)},
+			sends:    2,
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
