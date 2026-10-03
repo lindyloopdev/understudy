@@ -421,8 +421,8 @@ alternate → ~0 (fail over at once), a pricier one → retry the cheaper target
 longer. A later, larger threshold (≈2m) hard-fails to the terminal reject when no
 alternate remains.
 
-**A success clears the streak, so only a target failing outright is routed
-around.** Any success on an account ends its failure streak, so crossing the
+**A success clears the streak, so the failure streak routes around only a
+target failing outright.** Any success on an account ends its failure streak, so crossing the
 threshold takes a window in which *nothing* succeeded — but it ends the streak
 and nothing more. A bench the upstream asked for survives: a known `readmitAt`
 stands until it elapses, so a target held at the provider's asking stays routed
@@ -711,10 +711,11 @@ The ladder subsumes the reject and backoff paths as its bottom rung; failover an
 wait-in-place are the rungs that keep the client on *a* model — the cheapest
 healthy one, or (with affinity) its own.
 
-A request that waits for its own target — a later turn, or a first turn with no
-healthy alternate — does not fail over on a 429 it can be queued through:
-§Session-Ordered Admission re-queues it at its rank. That is the wait-in-place
-rung, carried out by the queue rather than by a sleep.
+On a 429 that §Session-Ordered Admission's rule can queue through, Understudy
+keeps a later turn — or a first turn whose target is still taking new sessions —
+in that target's queue at its rank and sends it there again when the rule admits
+it. That is the wait-in-place rung, carried out by the queue rather than a
+sleep.
 
 **Affinity and admission (staged).** Holding a throttled request open
 (wait-in-place) turns understudy from a stateless relay into an **admission
@@ -1334,9 +1335,37 @@ restores rank order rather than scrambling it.
 **Who waits, and who fails over.** The wait budget is the one §Understudy's
 *Affinity and admission* derives from coherence. A later turn is bound to its
 target — switching forfeits its prompt cache and coherence — so it waits. A
-first turn has nothing to forfeit: with a healthy untried alternate it takes the
-walk as ordered and fails over rather than queue; with none, it waits like a
-later turn. A consumer that knows more than one request can — how long a whole
+first turn has nothing to lose by moving. So when a target's queue has held new
+arrivals for the failover threshold, the target is **unavailable for new
+sessions**: the walk skips it for first turns, as it skips any target that has
+been failing that long. Failing and busy share the threshold, so when it becomes
+cost-derived, it does for both. Busy is not a failure: Understudy does not
+demote or bench the target or lower its concurrency cap, and later turns keep
+waiting there.
+
+Each target keeps this clock beside its health record, separate from its
+queue's order. The clock starts when the queue starts holding arrivals, and
+stops as soon as the queue would accept an arrival without holding it.
+Understudy checks this whenever it picks a target for a first turn, not when a
+request arrives, because a target that first turns skip may get no arrivals.
+When a target becomes unavailable for new sessions, the first turns already in
+its queue also move to the next target; otherwise a first turn that arrived just
+before that moment would wait longer than one that arrived just after.
+
+This covers a case the failure streak misses: a target that is slow but not
+failing. A remote that sends a header and then no content records no failure,
+but its requests without content make its queue hold arrivals, so new sessions
+go elsewhere while existing sessions stay. A session whose first turn went to
+another target stays there; if that target costs more, the
+cost-weighted wait budget accounts for it.
+
+When every target is unavailable for new sessions, Understudy answers a first
+turn at once with a typed `400` giving the reason and when to retry, as it does
+for the rate-limit reject (§Understudy). On the retry, the walk takes the first
+target in order that is taking new sessions. New sessions that retry at the
+same time may be served in any order.
+
+A consumer that knows more than one request can — how long a whole
 session is likely to run, and whether a slow local target can finish it in time
 — chooses the target per session itself, by naming it; that routing is
 consumer policy, not Understudy's.

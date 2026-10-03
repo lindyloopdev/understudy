@@ -56,13 +56,17 @@ limiter. The steps below remain, in order.
   - Tests: several headerless requests at one target, all wedged together,
     restart together and are re-admitted per growth's burst rule rather than
     one at a time.
-- **Who waits, and who fails over.** A later turn, and a first turn with no
-  healthy untried alternate, wait in the queue. A first turn with a healthy
-  alternate takes the walk and fails over rather than queue.
-  - Tests: a first turn with an alternate is served by the alternate while the
-    preferred target is contended; a later turn waits for its own target; a
-    first turn with no alternate waits.
-- **A 429 on a request that waits re-queues it** at its rank. With
+- **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
+  over*): a target unavailable for new sessions, and the typed `400` when every
+  target is — the row is [[understudy-error-envelope-type]]'s.
+  - Tests: a first turn waits at its contended target until the threshold,
+    then goes to the next target; a first turn already waiting moves when the
+    threshold passes; a later turn keeps waiting past the threshold; a first
+    turn goes to the first target again once its queue would accept an
+    arrival, with no arrival in between; with every target unavailable for new
+    sessions, a first turn gets the typed `400` at once.
+- **A 429 on a request that waits re-queues it** at its rank — a later turn,
+  or a first turn whose target is still taking new sessions. With
   `Retry-After`: bench the target (the existing `recordRateLimited`) and admit
   the highest-ranked request whose target is not benched. Without `Retry-After`,
   while another request on its key is producing content: re-queue, admit it
@@ -115,7 +119,8 @@ limiter. The steps below remain, in order.
 
 ## Outside this repo
 
-- Lindy dispatches the still-queued `400` (resend later, route the beat
-  elsewhere, or abort) and sends the session-end signal.
+- Lindy dispatches the still-queued `400` and the no-target-taking-new-sessions
+  `400` (resend later, route the beat elsewhere, or abort) and sends the
+  session-end signal.
 - Lindy chooses a beat's target from its own history of beat durations — the
   per-session routing the design leaves to the consumer.
