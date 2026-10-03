@@ -7001,11 +7001,76 @@ func TestShouldReturnAHeldRequestWhoseClientGoesAway(t *testing.T) {
 	})
 }
 
-// TODO(TODO.d/refill-and-growth-admission.md): two confirmed completions
-// ending close together, at a target slow enough to answer that gating on
-// header latency would visibly serialize the replacements, should each
-// independently and immediately admit their own replacement — neither waiting
-// on the other's header or confirmation.
+// TestShouldSendTwoHeldRequestsAtOnceWhenTwoStreamingAnswersEndTogether
+// verifies that two held requests are both sent the moment two confirmed
+// streaming answers end, so both are answered within one answer's time, not
+// one after the other.
+func TestShouldSendTwoHeldRequestsAtOnceWhenTwoStreamingAnswersEndTogether(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ends       = 10 * time.Second
+			answerTime = 5 * time.Second
+		)
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			attempts.add(message)
+			switch message {
+			case "first confirmed", "second confirmed":
+				// Sends first content immediately (confirming it) and
+				// ends at ends.
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-attempts.after(ends):
+							return 0, io.EOF
+						}
+					})),
+				}, nil
+			case "unconfirmed":
+				// Never answers, keeping the target unconfirmed.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// A held request's answer is slow, so serialized admission
+			// would show.
+			time.Sleep(answerTime)
+			return admissionJSON(message), nil
+		})
+		poster := newAdmissionPoster(t, newAdmissionServer(t, backend))
+		start := time.Now()
+		post := func(after time.Duration, message string) {
+			time.Sleep(after)
+			go poster.post(t.Context(), message, admissionTurn(admissionMsg("user", message)))
+			synctest.Wait()
+		}
+
+		post(0, "first confirmed")
+		post(time.Second/2, "second confirmed")
+		post(time.Second/2, "unconfirmed")
+		// Held: the unconfirmed request is past its grace period.
+		post(admissionGracePeriod+time.Second, "first held")
+		post(time.Second/2, "second held")
+		if _, ok := poster.answered("first held"); ok {
+			t.Fatal("setup: the first held request was answered on arrival; the case needs it held")
+		}
+
+		time.Sleep(time.Until(start.Add(ends + answerTime + time.Second)))
+		synctest.Wait()
+		if _, ok := poster.answered("unconfirmed"); ok {
+			t.Fatal("setup: the unconfirmed request resolved; the case needs it pending, so only the streams' ends can let the held requests in")
+		}
+		poster.answeredOK("first held", "second held")
+	})
+}
 
 // receivedMessages records, in order, the inbound messages of the requests
 // that reach a fake backend.
