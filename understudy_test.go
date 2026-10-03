@@ -5759,8 +5759,8 @@ type targetAttempt struct {
 }
 
 // add records a request's arrival and returns its index, for use with
-// [targetAttempts.waitUntil], which measures its duration from the first
-// arrival.
+// [targetAttempts.waitUntil] and [targetAttempts.after], which measure their
+// durations from the first arrival.
 func (a *targetAttempts) add(inboundMessage string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -5787,6 +5787,14 @@ func (a *targetAttempts) waitUntil(r *http.Request, i int, d time.Duration) bool
 		a.mu.Unlock()
 		return false
 	}
+}
+
+// after delivers d after the target's first request.
+func (a *targetAttempts) after(d time.Duration) <-chan time.Time {
+	a.mu.Lock()
+	at := a.start.Add(d)
+	a.mu.Unlock()
+	return time.After(time.Until(at))
 }
 
 // kept is the inbound messages of the requests the target kept, in the order
@@ -6337,153 +6345,150 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 }
 
 // TestShouldAdmitAHeldTurn verifies that a turn held behind an unconfirmed
-// request at its target is admitted when the test releases the fake backend,
-// and only then: each case keeps another turn unresolved throughout.
+// request at its target is admitted when the fake target opens, and only
+// then: each case keeps another turn unresolved throughout.
 func TestShouldAdmitAHeldTurn(t *testing.T) {
-	// upstreamReply is how the fake backend answers the request Understudy
-	// forwards to it.
-	type upstreamReply int
-	const (
-		// replyAtOnce: answers in full as soon as the request arrives.
-		replyAtOnce upstreamReply = iota
-		// replyContentWhenReleased: sends headers as soon as the request
-		// arrives, its first content when the test releases the backend, and
-		// keeps the stream open.
-		replyContentWhenReleased
-		// replyStreamsUntilReleased: starts streaming as soon as the request
-		// arrives, and finishes when the test releases the backend.
-		replyStreamsUntilReleased
-		// replyHeadersOnly: sends headers as soon as the request arrives, and
-		// never any content.
-		replyHeadersOnly
-		// replyStreamsUntilReleasedThenBreaks: starts streaming as soon as the
-		// request arrives, and breaks off with an error when the test releases
-		// the backend.
-		replyStreamsUntilReleasedThenBreaks
-	)
 	// turn is one conversation turn: the chat request the test's client sends
-	// to Understudy, and how the fake backend answers when Understudy forwards
-	// it.
+	// to Understudy.
 	type turn struct {
 		// inboundMessage is the user message the client sends. It identifies
-		// the turn: the fake backend reads it from the forwarded request, and
+		// the turn: the fake target reads it from the forwarded request, and
 		// the test uses it to check the client's response.
 		inboundMessage string
 		// after is how long the client waits before sending it.
-		after         time.Duration
-		upstreamReply upstreamReply
+		after time.Duration
 		// clientLeavesAfter is how long after sending it the client gives up
 		// waiting; zero, it waits for its answer.
 		clientLeavesAfter time.Duration
 	}
 	type test struct {
-		turns []turn
+		backend  *http.Client
+		attempts *targetAttempts
+		turns    []turn
+		// opens is how long after the first turn the target opens.
+		opens time.Duration
 		// held is the turn Understudy holds back, not forwarding it to the
-		// backend until the test releases the backend.
+		// target until the target opens.
 		held string
 		// pending is a turn that stays unresolved throughout the test, so
-		// the release alone can have admitted held.
+		// the opening alone can have admitted held.
 		pending string
+	}
+
+	// opensAfter is when a target opens on turns: a second after the last
+	// turn is sent.
+	opensAfter := func(turns []turn) time.Duration {
+		var d time.Duration
+		for _, tn := range turns {
+			d += tn.after
+		}
+		return d + time.Second
+	}
+	// stream is a target's streamed answer: headers at once, its first
+	// content when contentAt delivers, and its end, with endErr, when endsAt
+	// delivers. A nil channel never delivers.
+	stream := func(r *http.Request, contentAt, endsAt <-chan time.Time, endErr error) *http.Response {
+		reads := 0
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+				reads++
+				if reads == 1 {
+					select {
+					case <-r.Context().Done():
+						return 0, context.Cause(r.Context())
+					case <-contentAt:
+					}
+					return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+				}
+				select {
+				case <-r.Context().Done():
+					return 0, context.Cause(r.Context())
+				case <-endsAt:
+					return 0, endErr
+				}
+			})),
+		}
+	}
+	// confirmedThenEnds is a target whose "confirmed" turn streams at once
+	// and ends, with endErr, when the target opens, whose "unconfirmed" turn
+	// sends headers and never any content, and which answers every other
+	// turn at once.
+	confirmedThenEnds := func(t *testing.T, attempts *targetAttempts, opens time.Duration, endErr error) *http.Client {
+		return admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			attempts.add(message)
+			switch message {
+			case "confirmed":
+				return stream(r, time.After(0), attempts.after(opens), endErr), nil
+			case "unconfirmed":
+				return stream(r, nil, nil, nil), nil
+			}
+			return admissionJSON(message), nil
+		})
 	}
 
 	tests := testy.NewTable[test]()
 
-	tests.Add("should admit the held turn at the occupying turn's first content, while its stream stays open", test{
-		turns: []turn{
-			{inboundMessage: "occupier", upstreamReply: replyContentWhenReleased},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
-		},
-		held:    "held",
-		pending: "occupier",
+	tests.AddFunc("should admit the held turn at the occupying turn's first content, while its stream stays open", func(t *testing.T) test {
+		turns := []turn{
+			{inboundMessage: "occupier"},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		}
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			attempts.add(message)
+			if message == "occupier" {
+				return stream(r, attempts.after(opensAfter(turns)), nil, nil), nil
+			}
+			return admissionJSON(message), nil
+		})
+		return test{backend: backend, attempts: attempts, turns: turns, opens: opensAfter(turns), held: "held", pending: "occupier"}
 	})
-	tests.Add("should admit the held turn when a confirmed turn completes while another turn at the target is unconfirmed", test{
-		turns: []turn{
-			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleased},
-			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
-		},
-		held:    "held",
-		pending: "unconfirmed",
+	tests.AddFunc("should admit the held turn when a confirmed turn completes while another turn at the target is unconfirmed", func(t *testing.T) test {
+		turns := []turn{
+			{inboundMessage: "confirmed"},
+			{inboundMessage: "unconfirmed", after: time.Second},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		}
+		attempts := &targetAttempts{}
+		return test{
+			backend: confirmedThenEnds(t, attempts, opensAfter(turns), io.EOF), attempts: attempts,
+			turns: turns, opens: opensAfter(turns), held: "held", pending: "unconfirmed",
+		}
 	})
-	tests.Add("should send a request held back from a busy backend as soon as one of the backend's streaming answers breaks off with an error", test{
-		turns: []turn{
-			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleasedThenBreaks},
-			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce},
-		},
-		held:    "held",
-		pending: "unconfirmed",
+	tests.AddFunc("should send a request held back from a busy backend as soon as one of the backend's streaming answers breaks off with an error", func(t *testing.T) test {
+		turns := []turn{
+			{inboundMessage: "confirmed"},
+			{inboundMessage: "unconfirmed", after: time.Second},
+			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		}
+		attempts := &targetAttempts{}
+		return test{
+			backend: confirmedThenEnds(t, attempts, opensAfter(turns), io.ErrUnexpectedEOF), attempts: attempts,
+			turns: turns, opens: opensAfter(turns), held: "held", pending: "unconfirmed",
+		}
 	})
-	tests.Add("should send the request behind a held one whose client has left, as soon as one of a busy backend's streaming answers completes", test{
-		turns: []turn{
-			{inboundMessage: "confirmed", upstreamReply: replyStreamsUntilReleased},
-			{inboundMessage: "unconfirmed", after: time.Second, upstreamReply: replyHeadersOnly},
+	tests.AddFunc("should send the request behind a held one whose client has left, as soon as one of a busy backend's streaming answers completes", func(t *testing.T) test {
+		turns := []turn{
+			{inboundMessage: "confirmed"},
+			{inboundMessage: "unconfirmed", after: time.Second},
 			// Sent before "held", so it sits at the head of the wait list;
 			// its client leaves before the confirmed turn's stream ends.
-			{inboundMessage: "departed", after: admissionGracePeriod + time.Second, upstreamReply: replyAtOnce, clientLeavesAfter: time.Second / 4},
-			{inboundMessage: "held", after: time.Second / 2, upstreamReply: replyAtOnce},
-		},
-		held:    "held",
-		pending: "unconfirmed",
+			{inboundMessage: "departed", after: admissionGracePeriod + time.Second, clientLeavesAfter: time.Second / 4},
+			{inboundMessage: "held", after: time.Second / 2},
+		}
+		attempts := &targetAttempts{}
+		return test{
+			backend: confirmedThenEnds(t, attempts, opensAfter(turns), io.EOF), attempts: attempts,
+			turns: turns, opens: opensAfter(turns), held: "held", pending: "unconfirmed",
+		}
 	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			release := make(chan struct{})
-			// streamEnds, at test cleanup, ends every stream the release
-			// doesn't.
-			streamEnds := make(chan struct{})
-			t.Cleanup(func() { close(streamEnds) })
-
-			replies := map[string]upstreamReply{}
-			for _, tn := range tt.turns {
-				replies[tn.inboundMessage] = tn.upstreamReply
-			}
-			// now is closed, so its first content goes out at once.
-			now := make(chan struct{})
-			close(now)
-			// stream sends headers at once, its first content when contentAt
-			// closes (never, if contentAt is nil), and finishes with endErr
-			// when ends closes.
-			stream := func(r *http.Request, contentAt, ends <-chan struct{}, endErr error) *http.Response {
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if contentAt != nil && reads == 1 {
-							select {
-							case <-r.Context().Done():
-								return 0, context.Cause(r.Context())
-							case <-contentAt:
-							}
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-ends:
-							return 0, endErr
-						}
-					})),
-				}
-			}
-			client := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
-				switch replies[message] {
-				case replyContentWhenReleased:
-					return stream(r, release, streamEnds, io.EOF), nil
-				case replyStreamsUntilReleased:
-					return stream(r, now, release, io.EOF), nil
-				case replyHeadersOnly:
-					return stream(r, nil, streamEnds, io.EOF), nil
-				case replyStreamsUntilReleasedThenBreaks:
-					return stream(r, now, release, io.ErrUnexpectedEOF), nil
-				}
-				return admissionJSON(message), nil
-			})
-			poster := newAdmissionPoster(t, newAdmissionServer(t, client))
-
+			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+			start := time.Now()
 			for _, tn := range tt.turns {
 				time.Sleep(tn.after)
 				ctx, clientLeaves := context.WithTimeout(t.Context(), cmp.Or(tn.clientLeavesAfter, time.Hour))
@@ -6495,10 +6500,10 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 				t.Fatalf("setup: %q was answered on arrival; the case needs it held", tt.held)
 			}
 
-			close(release)
+			time.Sleep(time.Until(start.Add(tt.opens)))
 			synctest.Wait()
 			if _, ok := poster.answered(tt.pending); ok {
-				t.Fatalf("setup: %q resolved; the case needs it pending, so that only the release can admit %q", tt.pending, tt.held)
+				t.Fatalf("setup: %q resolved; the case needs it pending, so that only the opening can admit %q", tt.pending, tt.held)
 			}
 			poster.answeredOK(tt.held)
 		})
