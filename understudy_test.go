@@ -5522,21 +5522,10 @@ func TestChatCompletionsConcurrencyLimit(t *testing.T) {
 // business, so the attempts compared are the ones the target keeps, not
 // those Understudy withdraws.
 func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing.T) {
-	type turn struct {
-		// label names the turn in the assertion.
-		label string
-		// after is how long the client waits, after the previous turn, before
-		// sending this one.
-		after time.Duration
-		// userMessages are the turn's user messages, in order; the first
-		// identifies its session, and the last is what the fake backend sees.
-		// Each is unique across the case.
-		userMessages []string
-	}
 	type test struct {
 		backend  *http.Client
 		attempts *targetAttempts
-		turns    []turn
+		turns    []clientTurn
 		// opens is how long after the test starts the target opens.
 		opens time.Duration
 		// first and second label the contending turns in the order
@@ -5547,14 +5536,14 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	// opensAfter is when the target opens: the turns' total wait plus the
 	// grace period, so every turn waiting at it has waited past its grace
 	// period before it opens.
-	opensAfter := func(turns []turn) time.Duration {
+	opensAfter := func(turns []clientTurn) time.Duration {
 		var d time.Duration
 		for _, tn := range turns {
 			d += tn.after
 		}
 		return d + admissionGracePeriod + time.Second
 	}
-	busyTargetCase := func(t *testing.T, turns []turn, first, second string, atOnce ...string) test {
+	busyTargetCase := func(t *testing.T, turns []clientTurn, first, second string, atOnce ...string) test {
 		t.Helper()
 		attempts := &targetAttempts{}
 		return test{
@@ -5576,7 +5565,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	tests := testy.NewTable[test]()
 
 	tests.AddFunc("should send the older session's turn first when Understudy holds both turns behind a higher-ranked occupier, the younger's having arrived first", func(t *testing.T) test {
-		turns := []turn{
+		turns := []clientTurn{
 			{label: "occupier-opening", userMessages: []string{occupier}},
 			{label: "older-opening", after: time.Second, userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
@@ -5587,7 +5576,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		return busyTargetCase(t, turns, "older", "younger", occupier, older, younger)
 	})
 	tests.AddFunc("should send the older session's turn first when both turns already wait at the target, the younger's having arrived first", func(t *testing.T) test {
-		turns := []turn{
+		turns := []clientTurn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
 			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
@@ -5599,7 +5588,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	// The control for the next case: the same arrival, with the older session
 	// still remembered, keeps its turn first.
 	tests.AddFunc("should send the older session's turn first when the younger's arrives behind it", func(t *testing.T) test {
-		turns := []turn{
+		turns := []clientTurn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
 			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
@@ -5612,7 +5601,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 	// each quiet stretch well short of a day, so it is still remembered when
 	// the older session returns after more than a day.
 	tests.AddFunc("should send the younger session's turn first when the older session was away too long to remember", func(t *testing.T) test {
-		turns := []turn{
+		turns := []clientTurn{
 			{label: "older-opening", userMessages: []string{older}},
 			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
 			{label: "younger-second", after: 10 * time.Hour, userMessages: []string{younger, younger + " (2)"}},
@@ -5685,7 +5674,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			}
 			return admissionJSON(inboundMessage), nil
 		})
-		turns := []turn{
+		turns := []clientTurn{
 			{label: "streaming-occupier", userMessages: []string{streamingOccupier}},
 			{label: "silent-occupier", after: time.Second, userMessages: []string{silentOccupier}},
 			{label: "older-opening", after: time.Second, userMessages: []string{older}},
@@ -5712,20 +5701,11 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		synctest.Test(t, func(t *testing.T) {
 			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
 			labels := map[string]string{}
-			start := time.Now()
 			for _, tn := range tt.turns {
-				labels[tn.userMessages[len(tn.userMessages)-1]] = tn.label
-				time.Sleep(tn.after)
-				messages := make([]string, 0, 2*len(tn.userMessages))
-				for i, message := range tn.userMessages {
-					if i > 0 {
-						messages = append(messages, admissionMsg("assistant", "word"))
-					}
-					messages = append(messages, admissionMsg("user", message))
-				}
-				go poster.post(t.Context(), tn.label, admissionTurn(messages...))
-				synctest.Wait()
+				labels[tn.userMessages[len(tn.userMessages)-1]] = tn.name()
 			}
+			start := time.Now()
+			postTurns(t, poster, tt.turns)
 
 			time.Sleep(time.Until(start.Add(tt.opens)))
 			synctest.Wait()
@@ -5741,6 +5721,49 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			}
 		})
 	})
+}
+
+// clientTurn is one turn of one session's conversation: the chat request a
+// test's client sends to Understudy.
+type clientTurn struct {
+	// label names the turn to the test; with none, it is the turn's last
+	// user message.
+	label string
+	// after is how long the client waits, after the previous turn, before
+	// sending this one.
+	after time.Duration
+	// userMessages are the user messages of the turn's conversation, in
+	// order: the first names its session, and the last is the one the
+	// target sees. Each is unique across the case.
+	userMessages []string
+	// clientLeavesAfter is how long after sending the turn the client gives
+	// up waiting; zero, it waits for its answer.
+	clientLeavesAfter time.Duration
+}
+
+// name is the turn's label, or its last user message when it has none.
+func (tn clientTurn) name() string {
+	return cmp.Or(tn.label, tn.userMessages[len(tn.userMessages)-1])
+}
+
+// postTurns sends turns through poster, each after its delay and labeled by
+// its name, letting each settle before the next.
+func postTurns(t *testing.T, poster *admissionPoster, turns []clientTurn) {
+	t.Helper()
+	for _, tn := range turns {
+		time.Sleep(tn.after)
+		ctx, clientLeaves := context.WithTimeout(t.Context(), cmp.Or(tn.clientLeavesAfter, time.Hour))
+		t.Cleanup(clientLeaves)
+		messages := make([]string, 0, 2*len(tn.userMessages))
+		for i, message := range tn.userMessages {
+			if i > 0 {
+				messages = append(messages, admissionMsg("assistant", "word"))
+			}
+			messages = append(messages, admissionMsg("user", message))
+		}
+		go poster.post(ctx, tn.name(), admissionTurn(messages...))
+		synctest.Wait()
+	}
 }
 
 // targetAttempts records, in order, the inbound messages of the requests a
@@ -6348,23 +6371,10 @@ func TestShouldReceiveTheUpstreamsStatusHeadersAndBytesOnlyAtItsFirstContentOrIt
 // request at its target is admitted when the fake target opens, and only
 // then: each case keeps another turn unresolved throughout.
 func TestShouldAdmitAHeldTurn(t *testing.T) {
-	// turn is one conversation turn: the chat request the test's client sends
-	// to Understudy.
-	type turn struct {
-		// inboundMessage is the user message the client sends. It identifies
-		// the turn: the fake target reads it from the forwarded request, and
-		// the test uses it to check the client's response.
-		inboundMessage string
-		// after is how long the client waits before sending it.
-		after time.Duration
-		// clientLeavesAfter is how long after sending it the client gives up
-		// waiting; zero, it waits for its answer.
-		clientLeavesAfter time.Duration
-	}
 	type test struct {
 		backend  *http.Client
 		attempts *targetAttempts
-		turns    []turn
+		turns    []clientTurn
 		// opens is how long after the first turn the target opens.
 		opens time.Duration
 		// held is the turn Understudy holds back, not forwarding it to the
@@ -6377,7 +6387,7 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 
 	// opensAfter is when a target opens on turns: a second after the last
 	// turn is sent.
-	opensAfter := func(turns []turn) time.Duration {
+	opensAfter := func(turns []clientTurn) time.Duration {
 		var d time.Duration
 		for _, tn := range turns {
 			d += tn.after
@@ -6431,9 +6441,9 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 	tests := testy.NewTable[test]()
 
 	tests.AddFunc("should admit the held turn at the occupying turn's first content, while its stream stays open", func(t *testing.T) test {
-		turns := []turn{
-			{inboundMessage: "occupier"},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		turns := []clientTurn{
+			{userMessages: []string{"occupier"}},
+			{userMessages: []string{"held"}, after: admissionGracePeriod + time.Second},
 		}
 		attempts := &targetAttempts{}
 		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
@@ -6446,10 +6456,10 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		return test{backend: backend, attempts: attempts, turns: turns, opens: opensAfter(turns), held: "held", pending: "occupier"}
 	})
 	tests.AddFunc("should admit the held turn when a confirmed turn completes while another turn at the target is unconfirmed", func(t *testing.T) test {
-		turns := []turn{
-			{inboundMessage: "confirmed"},
-			{inboundMessage: "unconfirmed", after: time.Second},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		turns := []clientTurn{
+			{userMessages: []string{"confirmed"}},
+			{userMessages: []string{"unconfirmed"}, after: time.Second},
+			{userMessages: []string{"held"}, after: admissionGracePeriod + time.Second},
 		}
 		attempts := &targetAttempts{}
 		return test{
@@ -6458,10 +6468,10 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should send a request held back from a busy backend as soon as one of the backend's streaming answers breaks off with an error", func(t *testing.T) test {
-		turns := []turn{
-			{inboundMessage: "confirmed"},
-			{inboundMessage: "unconfirmed", after: time.Second},
-			{inboundMessage: "held", after: admissionGracePeriod + time.Second},
+		turns := []clientTurn{
+			{userMessages: []string{"confirmed"}},
+			{userMessages: []string{"unconfirmed"}, after: time.Second},
+			{userMessages: []string{"held"}, after: admissionGracePeriod + time.Second},
 		}
 		attempts := &targetAttempts{}
 		return test{
@@ -6470,13 +6480,13 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should send the request behind a held one whose client has left, as soon as one of a busy backend's streaming answers completes", func(t *testing.T) test {
-		turns := []turn{
-			{inboundMessage: "confirmed"},
-			{inboundMessage: "unconfirmed", after: time.Second},
+		turns := []clientTurn{
+			{userMessages: []string{"confirmed"}},
+			{userMessages: []string{"unconfirmed"}, after: time.Second},
 			// Sent before "held", so it sits at the head of the wait list;
 			// its client leaves before the confirmed turn's stream ends.
-			{inboundMessage: "departed", after: admissionGracePeriod + time.Second, clientLeavesAfter: time.Second / 4},
-			{inboundMessage: "held", after: time.Second / 2},
+			{userMessages: []string{"departed"}, after: admissionGracePeriod + time.Second, clientLeavesAfter: time.Second / 4},
+			{userMessages: []string{"held"}, after: time.Second / 2},
 		}
 		attempts := &targetAttempts{}
 		return test{
@@ -6489,13 +6499,7 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
 			start := time.Now()
-			for _, tn := range tt.turns {
-				time.Sleep(tn.after)
-				ctx, clientLeaves := context.WithTimeout(t.Context(), cmp.Or(tn.clientLeavesAfter, time.Hour))
-				t.Cleanup(clientLeaves)
-				go poster.post(ctx, tn.inboundMessage, admissionTurn(admissionMsg("user", tn.inboundMessage)))
-				synctest.Wait()
-			}
+			postTurns(t, poster, tt.turns)
 			if _, ok := poster.answered(tt.held); ok {
 				t.Fatalf("setup: %q was answered on arrival; the case needs it held", tt.held)
 			}
@@ -7118,23 +7122,11 @@ func silentBackend(t *testing.T, received *receivedMessages) *http.Client {
 // Understudy sends to the backend. A request at the backend that has been
 // silent past the grace period is the sign the backend is full.
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
-	// arrival is one session's request.
-	type arrival struct {
-		// inboundMessage is the user message the client sends.
-		inboundMessage string
-		// earlier is the user messages of the session's earlier turns, in
-		// order, sent ahead of inboundMessage; with none, the arrival is
-		// its own session.
-		earlier []string
-		// after is how long the client waits after the previous arrival
-		// before sending it.
-		after time.Duration
-	}
 	type test struct {
 		// backend is the fake backend Understudy sends to.
 		backend  *http.Client
 		received *receivedMessages
-		arrivals []arrival
+		arrivals []clientTurn
 		// reached is the inbound messages the backend received by the time the
 		// last arrival was sent, in order.
 		reached []string
@@ -7146,10 +7138,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  silentBackend(t, received),
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: "the first session asks"},
-				{inboundMessage: "the second session asks", after: admissionGracePeriod / 4},
-				{inboundMessage: "the third session asks", after: admissionGracePeriod / 4},
+			arrivals: []clientTurn{
+				{userMessages: []string{"the first session asks"}},
+				{userMessages: []string{"the second session asks"}, after: admissionGracePeriod / 4},
+				{userMessages: []string{"the third session asks"}, after: admissionGracePeriod / 4},
 			},
 			reached: []string{"the first session asks", "the second session asks", "the third session asks"},
 		}
@@ -7159,9 +7151,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  silentBackend(t, received),
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: "the older session asks"},
-				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
+			arrivals: []clientTurn{
+				{userMessages: []string{"the older session asks"}},
+				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{"the older session asks"},
 		}
@@ -7190,9 +7182,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  backend,
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: headered},
-				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
+			arrivals: []clientTurn{
+				{userMessages: []string{headered}},
+				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{headered},
 		}
@@ -7227,10 +7219,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  backend,
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: older},
-				{inboundMessage: headered, after: time.Second / 2},
-				{inboundMessage: older + " again", earlier: []string{older}, after: admissionGracePeriod + time.Second},
+			arrivals: []clientTurn{
+				{userMessages: []string{older}},
+				{userMessages: []string{headered}, after: time.Second / 2},
+				{userMessages: []string{older, older + " again"}, after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{older, headered},
 		}
@@ -7251,10 +7243,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  backend,
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: "the oldest session asks"},
-				{inboundMessage: completes, after: admissionGracePeriod / 2},
-				{inboundMessage: "the newest session asks", after: admissionGracePeriod + time.Second},
+			arrivals: []clientTurn{
+				{userMessages: []string{"the oldest session asks"}},
+				{userMessages: []string{completes}, after: admissionGracePeriod / 2},
+				{userMessages: []string{"the newest session asks"}, after: admissionGracePeriod + time.Second},
 			},
 			reached: []string{"the oldest session asks", completes},
 		}
@@ -7275,10 +7267,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backend:  backend,
 			received: received,
-			arrivals: []arrival{
-				{inboundMessage: slow},
-				{inboundMessage: "the newer session asks", after: admissionGracePeriod + time.Second},
-				{inboundMessage: "the latest session asks", after: 17 * time.Second},
+			arrivals: []clientTurn{
+				{userMessages: []string{slow}},
+				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
+				{userMessages: []string{"the latest session asks"}, after: 17 * time.Second},
 			},
 			reached: []string{slow, "the newer session asks", "the latest session asks"},
 		}
@@ -7288,16 +7280,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
 
-			for _, a := range tt.arrivals {
-				time.Sleep(a.after)
-				messages := make([]string, 0, 2*len(a.earlier)+1)
-				for _, m := range a.earlier {
-					messages = append(messages, admissionMsg("user", m), admissionMsg("assistant", "word"))
-				}
-				messages = append(messages, admissionMsg("user", a.inboundMessage))
-				go poster.post(t.Context(), a.inboundMessage, admissionTurn(messages...))
-				synctest.Wait()
-			}
+			postTurns(t, poster, tt.arrivals)
 
 			if d := gocmp.Diff(tt.reached, tt.received.all()); d != "" {
 				t.Errorf("requests the backend received on their arrival (-want +got):\n%s", d)
