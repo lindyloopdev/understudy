@@ -66,13 +66,6 @@ limiter. The steps below remain, in order.
   - Tests: the highest-ranked unconfirmed request at a target is taken by the
     sweep, not spared as the probe, when a different, headered request is the
     one currently unconfirmed at that target.
-- **An untested nuance of preemption, already true of the code.** An
-  outranking arrival is not dispatched the instant it displaces a younger
-  request — it is itself queued alongside the displaced one and admitted only
-  once that cancellation actually completes, not in the same instant.
-  - Tests: a displaced request's replacement reaches the target no sooner
-    than the cancellation it displaced actually completes, never in the same
-    instant.
 - **Who waits, and who fails over.** A later turn, and a first turn with no
   healthy untried alternate, wait in the queue. A first turn with a healthy
   alternate takes the walk and fails over rather than queue.

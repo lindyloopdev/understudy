@@ -6494,6 +6494,34 @@ func TestShouldAdmitAHeldTurn(t *testing.T) {
 			turns: turns, opens: opensAfter(turns), held: "held", pending: "unconfirmed",
 		}
 	})
+	tests.AddFunc("should hold an older session's request that displaces a younger one until the younger one's canceled send has ended", func(t *testing.T) test {
+		turns := []clientTurn{
+			{userMessages: []string{"older"}},
+			{userMessages: []string{"younger"}, after: time.Second / 2},
+			{userMessages: []string{"older", "held"}, after: admissionGracePeriod + time.Second},
+		}
+		attempts := &targetAttempts{}
+		var displacedSendEnded atomic.Bool
+		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			if message == "held" && !displacedSendEnded.Load() {
+				t.Errorf("the target received %q while the send it displaced was still open", message)
+			}
+			if message != "younger" {
+				return admissionJSON(message), nil
+			}
+			if attempts.add(message) == 0 {
+				// Slow to let go once canceled, so a request let in before
+				// this send ends reaches the target while it is still open.
+				<-r.Context().Done()
+				time.Sleep(time.Second / 2)
+				displacedSendEnded.Store(true)
+				return nil, context.Cause(r.Context())
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{backend: backend, attempts: attempts, turns: turns, opens: opensAfter(turns), held: "held", pending: "younger"}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -7288,10 +7316,6 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		})
 	})
 }
-
-// TODO(TODO.d/session-ordered-admission.md): a displaced request's replacement
-// should reach the target no sooner than the cancellation it displaced
-// actually completes, never in the same instant.
 
 func TestChatCompletionsSeedsCapToInFlightOnFirstSignallessRateLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
