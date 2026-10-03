@@ -436,9 +436,12 @@ func (q *targetQueue) admit() {
 	close(p.admitted)
 }
 
-// insert places p in the waiting line by rank, oldest session first. Caller
-// holds q.mu.
+// insert places p in the waiting line by rank, oldest session first. It
+// replaces p.admitted, which the last admission already closed: the closed
+// channel would let a displaced attempt's re-send through without waiting
+// for its next turn. Caller holds q.mu.
 func (q *targetQueue) insert(p *pending) {
+	p.admitted = make(chan struct{})
 	q.waiting = append(q.waiting, p)
 	slices.SortStableFunc(q.waiting, func(a, b *pending) int { return a.rank.Compare(b.rank) })
 }

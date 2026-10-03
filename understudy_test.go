@@ -5623,6 +5623,90 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		}
 		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
 	})
+	// A request admitted by a refill that stays unconfirmed past its grace
+	// period is displaced by an outranking arrival like any other
+	// unconfirmed request, and waits in line for its next turn.
+	tests.AddFunc("should send the older session's turn first when it displaces a younger turn that had already waited in line once", func(t *testing.T) test {
+		const (
+			streamingOccupier = "the streaming occupier asks"
+			silentOccupier    = "the silent occupier asks"
+		)
+		// The target opens at 19s, after the older session's turn has
+		// displaced the younger's at t=16s.
+		const opens = 19 * time.Second
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			i := attempts.add(inboundMessage)
+			switch inboundMessage {
+			case older, younger:
+				// The opening turns answer at once, fixing each session's
+				// rank.
+				return admissionJSON(inboundMessage), nil
+			case streamingOccupier:
+				// Streams first content at once, confirming it, and ends
+				// the stream 10s later, so its completion refills a place
+				// before the target opens.
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						time.Sleep(10 * time.Second)
+						return 0, io.EOF
+					})),
+				}, nil
+			case silentOccupier:
+				// Silent until the target opens, then streams first
+				// content and holds the stream open, so it confirms
+				// without completing and admits only one request.
+				if !attempts.waitUntil(r, i, opens) {
+					return nil, context.Cause(r.Context())
+				}
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			if !attempts.waitUntil(r, i, opens) {
+				return nil, context.Cause(r.Context())
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		turns := []turn{
+			{label: "streaming-occupier", userMessages: []string{streamingOccupier}},
+			{label: "silent-occupier", after: time.Second, userMessages: []string{silentOccupier}},
+			{label: "older-opening", after: time.Second, userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			// The silent occupier is unconfirmed past its grace period, so
+			// the younger's turn waits. The streaming occupier's completion
+			// at t=10s refills a place and admits it headerless.
+			{label: "younger", after: 3 * time.Second, userMessages: []string{younger, younger + " again"}},
+			// At t=16s the younger's turn is still unconfirmed past its
+			// grace period, so this one outranks and displaces it.
+			{label: "older", after: 10 * time.Second, userMessages: []string{older, older + " again"}},
+		}
+		return test{
+			backend:  backend,
+			attempts: attempts,
+			turns:    turns,
+			opens:    opens,
+			first:    "older",
+			second:   "younger",
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -7105,11 +7189,6 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		})
 	})
 }
-
-// TODO(TODO.d/refill-and-growth-admission.md): a refilled request that goes
-// unconfirmed past its grace period should be displaced by an outranking
-// arrival the same way a growth attempt would be — refilling earns no
-// exemption from anything downstream of admission.
 
 // TODO(TODO.d/session-ordered-admission.md): an arrival that outranks only some
 // of several simultaneously outstanding requests should be answered only once
