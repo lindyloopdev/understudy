@@ -7407,7 +7407,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: map[string][]string{"a": {occupier}, "b": {newcomer}},
 		}
 	})
-	tests.AddFunc("should hold a new session's first turn at the first target while it has been busy for less than the failover threshold", func(t *testing.T) test {
+	tests.AddFunc("should hold a new session's first turn arriving at the first target when it has been busy for less than the failover threshold", func(t *testing.T) test {
 		const (
 			occupier = "the other session asks"
 			newcomer = "the new session asks"
@@ -7428,6 +7428,50 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				{model: "m", userMessages: []string{newcomer}, after: admissionGracePeriod + defaultFailoverThreshold/2},
 			},
 			reached: map[string][]string{"a": {occupier}},
+		}
+	})
+	tests.AddFunc("should hold a session's later turn arriving at the first target when it has been busy past the failover threshold", func(t *testing.T) test {
+		const (
+			bound    = "the bound session asks"
+			occupier = "the other session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			switch inboundMessage {
+			case bound:
+				return admissionJSON(inboundMessage), nil
+			case occupier:
+				// A header and then no content, so the request stays
+				// unconfirmed and no arrival can displace it.
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{
+				"a": first,
+				"b": silentBackend(t, receivedB),
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{bound}},
+				{model: "m", userMessages: []string{occupier}, after: time.Second / 2},
+				{model: "m", userMessages: []string{bound, bound + " again"}, after: admissionGracePeriod + defaultFailoverThreshold + time.Second},
+			},
+			reached: map[string][]string{"a": {bound, occupier}},
 		}
 	})
 
