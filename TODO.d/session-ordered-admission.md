@@ -60,8 +60,7 @@ limiter. The steps below remain, in order.
   over*): the rest of a target unavailable for new sessions — first turns
   already waiting move on, and the clock clears — and the typed `400` when
   every target is — the row is [[understudy-error-envelope-type]]'s.
-  - Tests: a first turn waits at its contended target for less than the
-    threshold; a first turn already waiting moves when the threshold passes; a
+  - Tests: a first turn already waiting moves when the threshold passes; a
     later turn keeps waiting past the threshold; a first turn goes to the first
     target again once its queue would accept an arrival, with no arrival in
     between; with every target unavailable for new sessions, a first turn gets
