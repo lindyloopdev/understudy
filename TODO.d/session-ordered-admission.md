@@ -58,13 +58,11 @@ limiter. The steps below remain, in order.
     one at a time.
 - **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
   over*): the rest of a target unavailable for new sessions — first turns
-  already waiting move on, and the clock clears — and the typed `400` when
-  every target is — the row is [[understudy-error-envelope-type]]'s.
-  - Tests: a first turn already waiting moves when the threshold passes; a
-    first turn goes to the first
-    target again once its queue would accept an arrival, with no arrival in
-    between; with every target unavailable for new sessions, a first turn gets
-    the typed `400` at once.
+  already waiting move on — and the typed `400` when every target is — the
+  row is [[understudy-error-envelope-type]]'s.
+  - Tests: a first turn already waiting moves when the threshold passes; with
+    every target unavailable for new sessions, a first turn gets the typed
+    `400` at once.
 - **A 429 on a request that waits re-queues it** at its rank — a later turn,
   or a first turn whose target is still taking new sessions. With
   `Retry-After`: bench the target (the existing `recordRateLimited`) and admit

@@ -7430,6 +7430,41 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: map[string][]string{"a": {occupier}},
 		}
 	})
+	tests.AddFunc("should send a new session's first turn to a target busy past the failover threshold once it is no longer busy", func(t *testing.T) test {
+		const (
+			occupier = "the other session asks"
+			routed   = "the first new session asks"
+			returned = "the second new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == occupier {
+				// Sleeps past the failover threshold so the first new
+				// session fails over, and answers before the second
+				// new session arrives, so the target is no longer busy.
+				time.Sleep(admissionGracePeriod + defaultFailoverThreshold + 3*time.Second)
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{
+				"a": first,
+				"b": silentBackend(t, receivedB),
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{occupier}},
+				{model: "m", userMessages: []string{routed}, after: admissionGracePeriod + defaultFailoverThreshold + time.Second},
+				{model: "m", userMessages: []string{returned}, after: 5 * time.Second},
+			},
+			reached: map[string][]string{"a": {occupier, returned}, "b": {routed}},
+		}
+	})
 	tests.AddFunc("should hold a session's later turn arriving at the first target when it has been busy past the failover threshold", func(t *testing.T) test {
 		const (
 			bound    = "the bound session asks"
