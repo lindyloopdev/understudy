@@ -5729,6 +5729,9 @@ type clientTurn struct {
 	// label names the turn to the test; with none, it is the turn's last
 	// user message.
 	label string
+	// model is the model the turn names; with none, the admission tests'
+	// default model.
+	model string
 	// after is how long the client waits, after the previous turn, before
 	// sending this one.
 	after time.Duration
@@ -5746,6 +5749,11 @@ func (tn clientTurn) name() string {
 	return cmp.Or(tn.label, tn.userMessages[len(tn.userMessages)-1])
 }
 
+// turn is the chat request the turn sends over messages.
+func (tn clientTurn) turn(messages ...string) string {
+	return admissionModelTurn(cmp.Or(tn.model, "openai/gpt-4"), messages...)
+}
+
 // postTurns sends turns through poster, each after its delay and labeled by
 // its name, letting each settle before the next.
 func postTurns(t *testing.T, poster *admissionPoster, turns []clientTurn) {
@@ -5761,7 +5769,7 @@ func postTurns(t *testing.T, poster *admissionPoster, turns []clientTurn) {
 			}
 			messages = append(messages, admissionMsg("user", message))
 		}
-		go poster.post(ctx, tn.name(), admissionTurn(messages...))
+		go poster.post(ctx, tn.name(), tn.turn(messages...))
 		synctest.Wait()
 	}
 }
@@ -5990,7 +5998,12 @@ func admissionMsg(role, content string) string {
 }
 
 func admissionTurn(messages ...string) string {
-	return fmt.Sprintf(`{"model":"openai/gpt-4","messages":[%s]}`, strings.Join(messages, ","))
+	return admissionModelTurn("openai/gpt-4", messages...)
+}
+
+// admissionModelTurn is [admissionTurn] naming model.
+func admissionModelTurn(model string, messages ...string) string {
+	return fmt.Sprintf(`{"model":%q,"messages":[%s]}`, model, strings.Join(messages, ","))
 }
 
 // admissionInboundMessage reports a request's last message, which names the
@@ -6048,6 +6061,26 @@ func newAdmissionServer(t *testing.T, client *http.Client) *server {
 	t.Helper()
 	srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 		return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+	}})
+	srv.logger = testLogger(t)
+	return srv
+}
+
+// newTargetsServer builds a server with a backend per client in clients,
+// each named for its key and reached through that client, and models as its
+// logical models.
+func newTargetsServer(t *testing.T, clients map[string]*http.Client, models map[string]LogicalModel) *server {
+	t.Helper()
+	backends := make(map[string]Backend, len(clients))
+	for name, client := range clients {
+		backends[name] = Backend{ProviderType: "openai", Config: providers.Config{
+			BaseURL:    &url.URL{Scheme: "http", Host: name, Path: "/v1"},
+			APIKey:     "sk-" + name,
+			HTTPClient: client,
+		}}
+	}
+	srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return &BackendConfig{Backends: backends, Models: models}, nil
 	}})
 	srv.logger = testLogger(t)
 	return srv
@@ -7013,18 +7046,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			backends := make(map[string]Backend, len(tt.backends))
-			for name, client := range tt.backends {
-				backends[name] = Backend{ProviderType: "openai", Config: providers.Config{
-					BaseURL:    &url.URL{Scheme: "http", Host: name, Path: "/v1"},
-					APIKey:     "sk-" + name,
-					HTTPClient: client,
-				}}
-			}
-			srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return &BackendConfig{Backends: backends, Models: tt.models}, nil
-			}})
-			srv.logger = testLogger(t)
+			srv := newTargetsServer(t, tt.backends, tt.models)
 			srv.firstContentSchedule = func(d time.Duration, fire func()) *time.Timer {
 				return time.AfterFunc(d, func() {
 					time.Sleep(tt.handlerDelay)
@@ -7205,39 +7227,41 @@ func silentBackend(t *testing.T, received *receivedMessages) *http.Client {
 // silent past the grace period is the sign the backend is full.
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	type test struct {
-		// backend is the fake backend Understudy sends to.
-		backend  *http.Client
-		received *receivedMessages
+		// backends are the fake targets Understudy sends to, and received
+		// records what each receives.
+		backends map[string]*http.Client
+		models   map[string]LogicalModel
+		received map[string]*receivedMessages
 		arrivals []clientTurn
-		// reached is the inbound messages the backend received by the time the
-		// last arrival was sent, in order.
-		reached []string
+		// reached is the inbound messages each backend received by the time
+		// the last arrival was sent, in order.
+		reached map[string][]string
 	}
 
 	tests := testy.NewTable[test]()
 	tests.AddFunc("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", func(t *testing.T) test {
 		received := &receivedMessages{}
 		return test{
-			backend:  silentBackend(t, received),
-			received: received,
+			backends: map[string]*http.Client{"openai": silentBackend(t, received)},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the first session asks"}},
 				{userMessages: []string{"the second session asks"}, after: admissionGracePeriod / 4},
 				{userMessages: []string{"the third session asks"}, after: admissionGracePeriod / 4},
 			},
-			reached: []string{"the first session asks", "the second session asks", "the third session asks"},
+			reached: map[string][]string{"openai": {"the first session asks", "the second session asks", "the third session asks"}},
 		}
 	})
 	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period", func(t *testing.T) test {
 		received := &receivedMessages{}
 		return test{
-			backend:  silentBackend(t, received),
-			received: received,
+			backends: map[string]*http.Client{"openai": silentBackend(t, received)},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the older session asks"}},
 				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
 			},
-			reached: []string{"the older session asks"},
+			reached: map[string][]string{"openai": {"the older session asks"}},
 		}
 	})
 	// A target that admits to its own internal queue sends the header
@@ -7262,13 +7286,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backend:  backend,
-			received: received,
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{headered}},
 				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
 			},
-			reached: []string{headered},
+			reached: map[string][]string{"openai": {headered}},
 		}
 	})
 	// The arrival outranks the younger request, but a headered request is
@@ -7299,14 +7323,14 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backend:  backend,
-			received: received,
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{older}},
 				{userMessages: []string{headered}, after: time.Second / 2},
 				{userMessages: []string{older, older + " again"}, after: admissionGracePeriod + time.Second},
 			},
-			reached: []string{older, headered},
+			reached: map[string][]string{"openai": {older, headered}},
 		}
 	})
 	// Nothing records that a request completed with nobody waiting, so the
@@ -7323,14 +7347,14 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backend:  backend,
-			received: received,
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the oldest session asks"}},
 				{userMessages: []string{completes}, after: admissionGracePeriod / 2},
 				{userMessages: []string{"the newest session asks"}, after: admissionGracePeriod + time.Second},
 			},
-			reached: []string{"the oldest session asks", completes},
+			reached: map[string][]string{"openai": {"the oldest session asks", completes}},
 		}
 	})
 	tests.AddFunc("should send a request on arrival again once a queue that formed at the backend has drained", func(t *testing.T) test {
@@ -7347,25 +7371,57 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backend:  backend,
-			received: received,
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{slow}},
 				{userMessages: []string{"the newer session asks"}, after: admissionGracePeriod + time.Second},
 				{userMessages: []string{"the latest session asks"}, after: 17 * time.Second},
 			},
-			reached: []string{slow, "the newer session asks", "the latest session asks"},
+			reached: map[string][]string{"openai": {slow, "the newer session asks", "the latest session asks"}},
 		}
 	})
 
+	tests.AddFunc("should send a new session's first turn to the second target when the first has been busy for the failover threshold", func(t *testing.T) test {
+		const (
+			occupier = "the other session asks"
+			newcomer = "the new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		return test{
+			backends: map[string]*http.Client{
+				"a": silentBackend(t, receivedA),
+				"b": silentBackend(t, receivedB),
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			// Nothing arrives at the first target between the end of the
+			// other session's grace period and the new session's first turn.
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{occupier}},
+				{model: "m", userMessages: []string{newcomer}, after: admissionGracePeriod + defaultFailoverThreshold + time.Second},
+			},
+			reached: map[string][]string{"a": {occupier}, "b": {newcomer}},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): the next row — a new
+	// session's first turn arriving while the first target has been unable
+	// to take an arrival for less than the failover threshold waits at the
+	// first target.
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+			poster := newAdmissionPoster(t, newTargetsServer(t, tt.backends, tt.models))
 
 			postTurns(t, poster, tt.arrivals)
 
-			if d := gocmp.Diff(tt.reached, tt.received.all()); d != "" {
-				t.Errorf("requests the backend received on their arrival (-want +got):\n%s", d)
+			for name, received := range tt.received {
+				if d := gocmp.Diff(tt.reached[name], received.all()); d != "" {
+					t.Errorf("requests the %q backend received on their arrival (-want +got):\n%s", name, d)
+				}
 			}
 		})
 	})

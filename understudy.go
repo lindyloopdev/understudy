@@ -110,8 +110,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// defaultFailoverThreshold is how long a target may keep failing before
-// pickTarget routes around it to the next target in a logical model.
+// defaultFailoverThreshold is how long a target may keep failing — or its
+// admission queue be unable to take a new session's arrival — before
+// [pickTarget] routes around it to the next target in a logical model.
 const defaultFailoverThreshold = 15 * time.Second
 
 // defaultRecoveryInterval is how long pickTarget waits between half-open
@@ -630,10 +631,15 @@ type pick struct {
 }
 
 // pickTarget returns the first target that is usable at all and whose failure
-// streak is within the failover threshold (or that has none). A target whose
-// backend resolveBackend rejects is skipped before its health is consulted, and
+// streak is within the failover threshold (or that has none). A backend
+// [resolveBackend] rejects is skipped before its health is consulted, and
 // never demoted: only a configuration change can make it usable, so a health
 // entry for it would be one no recovery probe could clear.
+//
+// A first turn (firstTurn) is also routed around a target whose admission
+// queue has been unable to take an arrival for [defaultFailoverThreshold]:
+// busy is not a failure, so nothing is demoted, benched, or logged, and a
+// later turn keeps waiting at the target.
 //
 // Among the targets that remain, a target past the threshold is skipped
 // until a recovery interval has elapsed since its last probe, at which point it
@@ -656,7 +662,7 @@ type pick struct {
 // reached them in. A walk that has already failed somewhere answers with that
 // failure; one that never attempted anything is the model with nothing to serve it,
 // which only the caller can name.
-func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) pick {
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend, firstTurn bool) pick { //nolint:revive // firstTurn names the request's standing, not a mode of this function
 	// Queued under the lock, emitted after it: the logger is the consumer's, and a
 	// handler that blocks on I/O would otherwise hold every other request's walk
 	// behind it. Registered before the unlock below, so LIFO runs it after.
@@ -679,6 +685,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 			continue
 		}
 		id := healthKey(t, backends)
+		if firstTurn && s.unavailableForNewSessions(id, now) {
+			continue
+		}
 		h, failing := s.health[id]
 		// An entry with no streak is a target being tracked for something other than
 		// failure — a busy run — and is still fit to serve.
@@ -701,6 +710,18 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	// Nothing was healthy, but a target health kept back is still worth attempting.
 	last, ok := s.lastCallableTarget(targets, backends)
 	return pick{target: last, ok: ok, skipped: skipped}
+}
+
+// unavailableForNewSessions reports whether the target's admission queue has
+// been unable to take an arrival for longer than [defaultFailoverThreshold].
+// Caller holds s.mu.
+func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
+	q, ok := s.admission[id]
+	if !ok {
+		return false
+	}
+	since, held := q.holdingSince(now)
+	return held && now.Sub(since) > s.failoverThreshold
 }
 
 // lastCallableTarget returns the last target understudy could call at all, and
@@ -2170,11 +2191,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// the targets not yet tried this request.
 				candidates := untriedTargets(lm.Targets, tried, backend.Backends)
 				// A first turn has nothing to stay coherent with, so it takes the
-				// walk as ordered, probes and all.
+				// walk as ordered, probes and all — and moves past a target
+				// unavailable for new sessions.
 				if carriesHistory {
 					candidates = s.preferLastServed(candidates, convTenant, convKey)
 				}
-				p := s.pickTarget(r.Context(), candidates, backend.Backends)
+				p := s.pickTarget(r.Context(), candidates, backend.Backends, !carriesHistory)
 				if p.ok && lastFailure != nil {
 					// Somewhere else to go, so the request did move past the last
 					// candidate — recorded before this pick's skips, which is the

@@ -57,14 +57,15 @@ limiter. The steps below remain, in order.
     restart together and are re-admitted per growth's burst rule rather than
     one at a time.
 - **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
-  over*): a target unavailable for new sessions, and the typed `400` when every
-  target is — the row is [[understudy-error-envelope-type]]'s.
-  - Tests: a first turn waits at its contended target until the threshold,
-    then goes to the next target; a first turn already waiting moves when the
-    threshold passes; a later turn keeps waiting past the threshold; a first
-    turn goes to the first target again once its queue would accept an
-    arrival, with no arrival in between; with every target unavailable for new
-    sessions, a first turn gets the typed `400` at once.
+  over*): the rest of a target unavailable for new sessions — first turns
+  already waiting move on, and the clock clears — and the typed `400` when
+  every target is — the row is [[understudy-error-envelope-type]]'s.
+  - Tests: a first turn waits at its contended target for less than the
+    threshold; a first turn already waiting moves when the threshold passes; a
+    later turn keeps waiting past the threshold; a first turn goes to the first
+    target again once its queue would accept an arrival, with no arrival in
+    between; with every target unavailable for new sessions, a first turn gets
+    the typed `400` at once.
 - **A 429 on a request that waits re-queues it** at its rank — a later turn,
   or a first turn whose target is still taking new sessions. With
   `Retry-After`: bench the target (the existing `recordRateLimited`) and admit

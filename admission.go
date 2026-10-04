@@ -152,6 +152,32 @@ func (p *pending) pastGrace(now time.Time) bool {
 	return !p.arrived.Add(admissionGracePeriod).After(now)
 }
 
+// holdingSince reports whether q would hold an arrival arriving at now, and
+// the earliest moment its state shows that holding beginning: an
+// unconfirmed request past its grace period holds from the moment its grace
+// period ended, and a request waiting in line holds from its arrival. The
+// clock comes from the queue's own state, not from arrivals: a target
+// skipped on a first turn may get none.
+func (q *targetQueue) holdingSince(now time.Time) (time.Time, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var since time.Time
+	for _, p := range q.waiting {
+		if since.IsZero() || p.arrived.Before(since) {
+			since = p.arrived
+		}
+	}
+	for _, o := range q.outstanding {
+		if o.confirmed || !o.pastGrace(now) {
+			continue
+		}
+		if at := o.arrived.Add(admissionGracePeriod); since.IsZero() || at.Before(since) {
+			since = at
+		}
+	}
+	return since, !since.IsZero()
+}
+
 // enter admits an attempt to q's target, blocking while the queue holds it.
 // rank is the attempt's session age; cancel ends its upstream attempt when
 // preemption displaces it. A request the queue admits returns unblocked and
