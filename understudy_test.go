@@ -7561,8 +7561,62 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: map[string][]string{"a": {occupier, returned}, "b": {moved}},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): rows here for a displaced
-	// request's arrival, and the earliest waiter leaving before the crossing.
+	// A request displaced back into the line carries the arrival of its
+	// admission, but the target has held arrivals since that admission's
+	// grace period ended: the busy clock runs from there, and a first turn
+	// arriving before the threshold has passed from that moment waits.
+	tests.AddFunc("should send a new session's first turn to the second target when the first has been busy for the failover threshold since a displaced request's grace period ended", func(t *testing.T) test {
+		const (
+			older    = "the older session asks"
+			younger  = "the younger session asks"
+			newcomer = "the new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == older {
+				// Answered at once, fixing the older session's rank ahead of
+				// the younger one's.
+				return admissionJSON(inboundMessage), nil
+			}
+			// Every later turn waits at the target with no header: the
+			// displacing turn holds the target unconfirmed, so the
+			// displaced younger request stays in the line.
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		// Times are from the first arrival.
+		youngerArrives := time.Second
+		youngerGraceEnds := youngerArrives + admissionGracePeriod
+		displaced := youngerGraceEnds + time.Second
+		// The threshold has passed since the younger request arrived, but
+		// not since its grace period ended.
+		newcomerArrives := youngerArrives + defaultFailoverThreshold + admissionGracePeriod/2
+		return test{
+			backends: map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{older}},
+				// Waits at the target, silent with no header.
+				{model: "m", userMessages: []string{younger}, after: youngerArrives},
+				// Displaces the younger request back into the line, and
+				// holds the target.
+				{model: "m", userMessages: []string{older, older + " again"}, after: displaced - youngerArrives},
+				{model: "m", userMessages: []string{newcomer}, after: newcomerArrives - displaced},
+			},
+			reached: map[string][]string{"a": {older, younger, older + " again"}},
+			// Just past the threshold counted from the end of the younger
+			// request's grace period.
+			secondCheckAt:        youngerGraceEnds + defaultFailoverThreshold + time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {older, younger, older + " again"}, "b": {newcomer}},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here for the earliest
+	// waiter leaving before the crossing.
 
 	// The new session's turn arrives two seconds before the target's busy
 	// clock crosses the failover threshold, so it is waiting there at the

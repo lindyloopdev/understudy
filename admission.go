@@ -169,14 +169,22 @@ func (p *pending) pastGrace(now time.Time) bool {
 // holdingSinceLocked reports whether q would hold an arrival arriving at
 // now, and the earliest moment its state shows that holding beginning: an
 // unconfirmed request past its grace period holds from the moment its grace
-// period ended, and a request waiting in line holds from its arrival. The
-// clock comes from the queue's own state, not from arrivals: a target
-// skipped on a first turn may get none. Caller holds q.mu.
+// period ended — a displaced request no less than one at the target, since
+// displacement moved nothing — and a request that arrived to wait holds from
+// its arrival. The clock comes from the queue's own state,
+// not from arrivals: a target skipped on a first turn may get none. Caller
+// holds q.mu.
 func (q *targetQueue) holdingSinceLocked(now time.Time) (time.Time, bool) {
 	var since time.Time
 	for _, p := range q.waiting {
-		if since.IsZero() || p.arrived.Before(since) {
-			since = p.arrived
+		at := p.arrived
+		if p.preempted {
+			// A displaced request's arrival is its admission's; the
+			// target held that admission from its grace period's end.
+			at = at.Add(admissionGracePeriod)
+		}
+		if since.IsZero() || at.Before(since) {
+			since = at
 		}
 	}
 	for _, o := range q.outstanding {
