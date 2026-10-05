@@ -20,6 +20,12 @@ const admissionGracePeriod = 2 * time.Second
 // it is recorded.
 var errPreempted = errors.New("displaced for an older session")
 
+// errUnavailableForNewSessions is the error a first turn's wait returns when
+// its target has held arrivals past the failover threshold and another
+// target is taking new sessions. Not a target failure: nothing is recorded
+// against the target it left.
+var errUnavailableForNewSessions = errors.New("left a target unavailable for new sessions")
+
 // initialFirstContentTimeout is how long a request's first attempt at a
 // target may produce no content before the attempt is ended and the request
 // sent again. It must clear honest queueing at a slow backend: the longest
@@ -104,7 +110,7 @@ func (s *server) admissionQueue(key string) *targetQueue {
 	defer s.mu.Unlock()
 	q, ok := s.admission[key]
 	if !ok {
-		q = &targetQueue{firstContentSchedule: s.firstContentSchedule}
+		q = &targetQueue{firstContentSchedule: s.firstContentSchedule, failoverThreshold: s.failoverThreshold}
 		s.admission[key] = q
 	}
 	return q
@@ -125,6 +131,11 @@ type targetQueue struct {
 	// firstContentSchedule schedules every first-content timeout the queue
 	// arms; it is taken from the server at the queue's creation.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
+	// failoverThreshold is how long the queue may hold arrivals before it
+	// counts as unavailable for new sessions — the walk routes first turns
+	// around the target, and a waiting first turn leaves for another target;
+	// it is taken from the server at the queue's creation.
+	failoverThreshold time.Duration
 }
 
 // pending is one attempt's standing at a target queue: its rank, when it
@@ -138,6 +149,9 @@ type pending struct {
 	headered  bool
 	confirmed bool
 	preempted bool
+	// left is closed to end the wait of a first turn whose target has held
+	// arrivals past the failover threshold, so the walk routes it elsewhere.
+	left chan struct{}
 	// firstContentTimeouts counts the attempts at this target the
 	// first-content timeout has ended; each doubles the next attempt's
 	// timeout. Per target: one target's slowness says nothing about
@@ -152,15 +166,13 @@ func (p *pending) pastGrace(now time.Time) bool {
 	return !p.arrived.Add(admissionGracePeriod).After(now)
 }
 
-// holdingSince reports whether q would hold an arrival arriving at now, and
-// the earliest moment its state shows that holding beginning: an
+// holdingSinceLocked reports whether q would hold an arrival arriving at
+// now, and the earliest moment its state shows that holding beginning: an
 // unconfirmed request past its grace period holds from the moment its grace
 // period ended, and a request waiting in line holds from its arrival. The
 // clock comes from the queue's own state, not from arrivals: a target
-// skipped on a first turn may get none.
-func (q *targetQueue) holdingSince(now time.Time) (time.Time, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+// skipped on a first turn may get none. Caller holds q.mu.
+func (q *targetQueue) holdingSinceLocked(now time.Time) (time.Time, bool) {
 	var since time.Time
 	for _, p := range q.waiting {
 		if since.IsZero() || p.arrived.Before(since) {
@@ -178,13 +190,30 @@ func (q *targetQueue) holdingSince(now time.Time) (time.Time, bool) {
 	return since, !since.IsZero()
 }
 
+// failoverCrossingLocked reports the moment the queue's holding of arrivals
+// crosses the failover threshold, and whether that moment has come by now.
+// Both the leave of a waiting first turn and the walk's routing read this
+// crossing, so the two cannot disagree about when busy becomes unavailable.
+// at is zero when the queue holds nothing. Caller holds q.mu.
+func (q *targetQueue) failoverCrossingLocked(now time.Time) (at time.Time, crossed bool) {
+	since, held := q.holdingSinceLocked(now)
+	if !held {
+		return time.Time{}, false
+	}
+	at = since.Add(q.failoverThreshold)
+	return at, !at.After(now)
+}
+
 // enter admits an attempt to q's target, blocking while the queue holds it.
 // rank is the attempt's session age; cancel ends its upstream attempt when
 // preemption displaces it. A request the queue admits returns unblocked and
 // counts as outstanding from that moment, so it holds the queue's next
-// admission until its first content confirms it.
-func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time) (*pending, error) {
-	p := &pending{queue: q, rank: rank, cancel: cancel, admitted: make(chan struct{})}
+// admission until its first content confirms it. moveOn, when non-nil, is
+// consulted when the target has held arrivals past the failover threshold;
+// if it reports another target taking new sessions, the wait ends with
+// [errUnavailableForNewSessions]. A nil moveOn waits regardless.
+func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time, moveOn func() bool) (*pending, error) {
+	p := &pending{queue: q, rank: rank, cancel: cancel, admitted: make(chan struct{}), left: make(chan struct{})}
 	q.mu.Lock()
 	now := time.Now()
 	p.arrived = now
@@ -204,19 +233,19 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	}
 	// Growth is speculative: an arrival that displaces nothing still waits
 	// behind any request unconfirmed past its grace period, headered or not.
-	held := len(q.waiting) > 0
-	for _, o := range q.outstanding {
-		if !o.confirmed && o.pastGrace(now) {
-			held = true
-			break
-		}
-	}
+	_, held := q.holdingSinceLocked(now)
 	if held {
 		q.insert(p)
+		if moveOn != nil {
+			at, _ := q.failoverCrossingLocked(now)
+			q.leaveWhenUnavailable(p, at, moveOn)
+		}
 		q.mu.Unlock()
 		select {
 		case <-p.admitted:
 			return p, nil
+		case <-p.left:
+			return nil, errUnavailableForNewSessions
 		case <-ctx.Done():
 			q.mu.Lock()
 			defer q.mu.Unlock()
@@ -240,6 +269,39 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
 	q.mu.Unlock()
 	return p, nil
+}
+
+// leaveWhenUnavailable ends p's wait once the queue has held arrivals past
+// the failover threshold and moveOn reports another target taking new
+// sessions. Holding can begin later than at — the earliest holder may
+// leave — so the check reruns at the crossing the queue's holding start
+// then names.
+func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func() bool) {
+	time.AfterFunc(time.Until(at), func() {
+		now := time.Now()
+		q.mu.Lock()
+		if !slices.Contains(q.waiting, p) {
+			// Admitted, or gone with its client: the wait already ended.
+			q.mu.Unlock()
+			return
+		}
+		next, crossed := q.failoverCrossingLocked(now)
+		q.mu.Unlock()
+		if !crossed && next.After(now) {
+			q.leaveWhenUnavailable(p, next, moveOn)
+			return
+		}
+		// moveOn takes the server's lock, so it is called without q.mu held.
+		if !moveOn() {
+			return
+		}
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if slices.Contains(q.waiting, p) {
+			q.dropWaiting(p)
+			close(p.left)
+		}
+	})
 }
 
 // formByWaiting forms the queue: p has waited past its grace period headerless

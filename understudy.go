@@ -112,7 +112,8 @@ func (c *countingReader) Read(p []byte) (int, error) {
 
 // defaultFailoverThreshold is how long a target may keep failing — or its
 // admission queue be unable to take a new session's arrival — before
-// [pickTarget] routes around it to the next target in a logical model.
+// [pickTarget] routes around it to the next target in a logical model, and a
+// first turn already waiting in the target's queue leaves for one.
 const defaultFailoverThreshold = 15 * time.Second
 
 // defaultRecoveryInterval is how long pickTarget waits between half-open
@@ -712,16 +713,40 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	return pick{target: last, ok: ok, skipped: skipped}
 }
 
-// unavailableForNewSessions reports whether the target's admission queue has
-// been unable to take an arrival for longer than [defaultFailoverThreshold].
-// Caller holds s.mu.
+// unavailableForNewSessions reports whether the target's admission queue
+// has held arrivals for the failover threshold — the crossing
+// [targetQueue.failoverCrossingLocked] defines. Caller holds s.mu.
 func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
 	q, ok := s.admission[id]
 	if !ok {
 		return false
 	}
-	since, held := q.holdingSince(now)
-	return held && now.Sub(since) > s.failoverThreshold
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	_, crossed := q.failoverCrossingLocked(now)
+	return crossed
+}
+
+// anotherTargetTakingNewSessions reports whether one of targets, other than
+// the one keyed waitingAtKey, is usable and taking new sessions.
+//
+// TODO(TODO.d/session-ordered-admission.md): a target failing past the
+// failover threshold counts here as taking new sessions, though
+// [pickTarget] routes around it.
+func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) bool {
+	for _, t := range targets {
+		if healthKey(t, backends) == waitingAtKey {
+			continue
+		}
+		s.mu.Lock()
+		_, unusable := s.resolveBackend(backends, t.backend)
+		taking := unusable == nil && !s.unavailableForNewSessions(healthKey(t, backends), time.Now())
+		s.mu.Unlock()
+		if taking {
+			return true
+		}
+	}
+	return false
 }
 
 // lastCallableTarget returns the last target understudy could call at all, and
@@ -2308,9 +2333,25 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// the queue takes no slot, and only an admitted one competes for one.
 		// Uncontended, nothing queues and a request passes straight through.
 		queue := s.admissionQueue(healthKey(chosen, backend.Backends))
-		pend, err := queue.enter(ctx, cancel, s.sessionAge(convTenant, convKey))
+		// Only a first turn may leave for another target; a later turn is
+		// bound to this one and waits.
+		var moveOn func() bool
+		if !carriesHistory {
+			// The target being left is not in tried yet, so waitingAtKey
+			// excludes it from the check.
+			waitingAtKey := healthKey(chosen, backend.Backends)
+			moveOn = func() bool {
+				return s.anotherTargetTakingNewSessions(untriedTargets(logicalTargets, tried, backend.Backends), waitingAtKey, backend.Backends)
+			}
+		}
+		pend, err := queue.enter(ctx, cancel, s.sessionAge(convTenant, convKey), moveOn)
 		if err != nil {
 			cancel(nil)
+			if errors.Is(err, errUnavailableForNewSessions) {
+				// Busy is not a failure: record nothing against the target.
+				tried = append(tried, healthKey(chosen, backend.Backends))
+				continue
+			}
 			return fmt.Errorf("held in the admission queue: %w", err)
 		}
 

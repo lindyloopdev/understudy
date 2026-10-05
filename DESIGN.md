@@ -1346,8 +1346,9 @@ waiting there.
 Each target keeps this clock beside its health record, separate from its
 queue's order. The clock starts when the queue starts holding arrivals, and
 stops as soon as the queue would accept an arrival without holding it.
-Understudy checks this whenever it picks a target for a first turn, not when a
-request arrives, because a target that first turns skip may get no arrivals.
+Understudy checks this whenever it picks a target for a first turn, and again
+while a first turn waits in its queue, because a target that first turns skip
+may get no arrivals.
 When a target becomes unavailable for new sessions, the first turns already in
 its queue also move to the next target; otherwise a first turn that arrived just
 before that moment would wait longer than one that arrived just after.
