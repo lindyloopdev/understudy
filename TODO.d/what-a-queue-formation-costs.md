@@ -9,18 +9,10 @@ discipline* (one unconfirmed request at the backend).
 Forming a queue cancels outstanding requests and re-sends them when it admits
 them, and the design rests that on a cost claim: "canceling it is free" for a
 headerless request, "because a backend that admits before it answers has given
-it no work". Nothing asserts the claim. The arrival trigger counts what the
-target was sent (the displaced row of
-`TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent`);
-the wait trigger has a test only for the order it produces (the "both turns
-already wait at the target" row of
-`TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst`),
-not for what it re-sends.
-
-Two arms of the sweep already carry inline markers in `understudy_test.go`,
-below `TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst`:
-a headered request must not be taken, and one still inside its grace period
-must not be either. Dropping either check leaves the whole suite green.
+it no work". Two arms of the formation by the wait count what it re-sends —
+a request with its header is sent once, and so is one still inside its grace
+period — but no test counts the turns a formation that does take turns
+re-sends.
 
 ## Can the same turn be cancelled twice?
 
@@ -42,8 +34,7 @@ because each repeat costs a whole generation on a contended backend.
 ## Work
 
 - **Assert what a formation destroys**, not only the order it produces: the
-  headered arm and the grace arm above, and the count of turns a single
-  formation re-sends.
+  count of turns a single formation re-sends.
 - **Settle the repeat question.** Either demonstrate the arrangement that lets a
   turn be cancelled across two formations and bound it, or establish that the
   admission rule prevents it and record why, so the next reader does not have to

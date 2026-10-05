@@ -60,13 +60,14 @@ limiter. The steps below remain, in order.
   over*): the typed `400` when every target is unavailable for new sessions —
   the row is [[understudy-error-envelope-type]]'s.
   - Tests: with every target unavailable for new sessions, a first turn gets
-    the typed `400` at once; once the target a waiting first turn left is no
-    longer busy, a new session's first turn is sent to it.
+    the typed `400` at once.
   - A waiting first turn leaves only for a target the walk would pick: one
     failing past the failover threshold does not count as taking new
     sessions. One per-target check, shared with `pickTarget`.
     - Tests: a first turn waiting at a busy target stays there when the only
-      other target is failing past the failover threshold.
+      other target is failing past the failover threshold; once the target a
+      waiting first turn left is no longer busy, a new session's first turn is
+      sent to it.
   - The target's busy clock starts when the target became unable to take an
     arrival. A displaced request back in line carries its original arrival,
     which can start the clock early; a waiting request's own arrival is the

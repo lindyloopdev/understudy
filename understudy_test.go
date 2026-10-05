@@ -5879,19 +5879,6 @@ func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atO
 // TODO(TODO.d/what-a-queue-formation-costs.md): one formation should re-send
 // only the turns it had to take. Nothing counts what a formation re-sends.
 
-// TODO(TODO.d/what-a-queue-formation-costs.md): the backend should be asked to
-// generate a turn once, even when the queue forms around that turn
-// mid-generation. Cancelling an attempt whose header has arrived throws away
-// prefill the backend has already done and pays for it a second time, which is
-// why the design calls cancelling free only before the header. Dropping the
-// headered check from the formation sweep leaves the whole suite green.
-
-// TODO(TODO.d/what-a-queue-formation-costs.md): a session whose turn had only just
-// reached the target should be answered before one whose turn had been waiting
-// there, since forming the queue takes the waiting turn and leaves the fresh one
-// where it is. Dropping the grace check from the formation sweep leaves the whole
-// suite green.
-
 // TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on
 // the consumer's session-end signal — until it lands, a dropped tenant's
 // conversation state is reclaimed by the forget backstop rather than at
@@ -7044,6 +7031,87 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
+	tests.AddFunc("should send a request once when it has its header and a newer request at the target goes silent past its grace period", func(t *testing.T) test {
+		const (
+			headered = "the older session's request has its header"
+			silent   = "the newer session's request is silent"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage != headered {
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// A header at once, and content only well after the newer
+			// request's grace period has run out.
+			reads := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					reads++
+					if reads > 1 {
+						return 0, io.EOF
+					}
+					select {
+					case <-r.Context().Done():
+						return 0, context.Cause(r.Context())
+					case <-time.After(admissionGracePeriod + 6*time.Second):
+					}
+					return copy(p, fmt.Sprintf("data: {\"id\":%q}\n\n", headered)), nil
+				})),
+			}, nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: headered, body: admissionTurn(admissionMsg("user", headered))},
+				{inboundMessage: silent, body: admissionTurn(admissionMsg("user", silent)), after: time.Second / 2},
+			},
+			wait:     admissionGracePeriod + 8*time.Second,
+			followed: headered,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, headered)},
+			sends:    1,
+		}
+	})
+	tests.AddFunc("should send a request once when it reaches the target shortly before another request there goes silent past its grace period", func(t *testing.T) test {
+		const (
+			oldest = "the oldest session's request is silent"
+			middle = "the middle session's request is silent"
+			fresh  = "the newest session's request has only just arrived"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage != fresh {
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// Answers inside its own grace period, after the middle
+			// request's has run out.
+			time.Sleep(admissionGracePeriod * 3 / 4)
+			return sseAnswer(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: oldest, body: admissionTurn(admissionMsg("user", oldest))},
+				{inboundMessage: middle, body: admissionTurn(admissionMsg("user", middle)), after: time.Second / 2},
+				// Arrives before anything at the target is past its grace
+				// period, and is still inside its own when the middle
+				// request's runs out.
+				{inboundMessage: fresh, body: admissionTurn(admissionMsg("user", fresh)), after: time.Second},
+			},
+			wait:     5 * time.Second,
+			followed: fresh,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, fresh)},
+			sends:    1,
+		}
+	})
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			srv := newTargetsServer(t, tt.backends, tt.models)
@@ -7464,9 +7532,37 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {newcomer}},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): rows here for the target a
-	// waiting first turn left, a displaced request's arrival, and the
-	// earliest waiter leaving before the crossing.
+	tests.AddFunc("should send a new session's first turn to a target a waiting first turn left, once that target is no longer busy", func(t *testing.T) test {
+		const (
+			occupier = "the other session asks"
+			moved    = "the first new session asks"
+			returned = "the second new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		return test{
+			backends: map[string]*http.Client{
+				"a": silentBackend(t, receivedA),
+				"b": silentBackend(t, receivedB),
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				// Its client leaves after the first new session has left for
+				// the second target, so the first target stops being busy
+				// without answering anything; answering would clear the
+				// failure recorded against it.
+				{model: "m", userMessages: []string{occupier}, clientLeavesAfter: admissionGracePeriod + defaultFailoverThreshold + 3*time.Second},
+				{model: "m", userMessages: []string{moved}, after: admissionGracePeriod + defaultFailoverThreshold - 2*time.Second},
+				{model: "m", userMessages: []string{returned}, after: 8 * time.Second},
+			},
+			reached: map[string][]string{"a": {occupier, returned}, "b": {moved}},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): rows here for a displaced
+	// request's arrival, and the earliest waiter leaving before the crossing.
 
 	// The new session's turn arrives two seconds before the target's busy
 	// clock crosses the failover threshold, so it is waiting there at the
