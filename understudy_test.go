@@ -7535,6 +7535,52 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {newcomer}},
 		}
 	})
+	// The second target is demoted by an earlier request naming its backend
+	// and model directly, so it shares the health key of the model's second
+	// target. Its next recovery probe falls after the first target's busy
+	// clock crosses the failover threshold with the new session's first
+	// request waiting in its line; the second check lands between the two.
+	tests.AddFunc("should keep a new session's first request waiting at the first target when the first has been busy for the failover threshold and the second target is failing past the failover threshold and not yet due a recovery probe", func(t *testing.T) test {
+		const (
+			demoter  = "the session naming the second target asks"
+			occupier = "the other session asks"
+			newcomer = "the new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		refusing := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedB.add(inboundMessage)
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)),
+			}, nil
+		})
+		return test{
+			backends: map[string]*http.Client{
+				"a": silentBackend(t, receivedA),
+				"b": refusing,
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				// The refusal the second target answers with demotes it at once.
+				{model: "b/mb", userMessages: []string{demoter}},
+				{model: "m", userMessages: []string{occupier}, after: time.Second},
+				// Arrives while the first target's busy clock is short of the
+				// failover threshold, so it is waiting in its line at the
+				// crossing.
+				{model: "m", userMessages: []string{newcomer}, after: admissionGracePeriod + defaultFailoverThreshold - 2*time.Second},
+			},
+			reached: map[string][]string{"a": {occupier}, "b": {demoter}},
+			// Past the first target's crossing, and short of the demoted
+			// target's next recovery probe.
+			secondCheckAt:        time.Second + admissionGracePeriod + defaultFailoverThreshold + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {demoter}},
+		}
+	})
 	// The new session's first request arrives before the first target's busy
 	// clock crosses the failover threshold, so it is waiting there at the
 	// crossing; the second target refuses every request it receives, and the

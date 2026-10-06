@@ -689,12 +689,10 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 		if firstTurn && s.unavailableForNewSessions(id, now) {
 			continue
 		}
-		h, failing := s.health[id]
-		// An entry with no streak is a target being tracked for something other than
-		// failure — a busy run — and is still fit to serve.
-		if !failing || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold {
+		if s.withinFailoverThreshold(id, now) {
 			return pick{target: t, ok: true, skipped: skipped}
 		}
+		h := s.health[id]
 		if due := s.nextReattempt(h); now.Before(due) {
 			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
 				due.Format(time.RFC3339), h.lastError)
@@ -713,6 +711,15 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	return pick{target: last, ok: ok, skipped: skipped}
 }
 
+// withinFailoverThreshold reports whether the target keyed id has no failure
+// streak, or one the failover threshold has not yet run out on. An entry with
+// no streak is a target tracked for something other than failure — a busy run
+// — and is still fit to serve. Caller holds s.mu.
+func (s *server) withinFailoverThreshold(id string, now time.Time) bool {
+	h, tracked := s.health[id]
+	return !tracked || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold
+}
+
 // unavailableForNewSessions reports whether the target's admission queue
 // has held arrivals for the failover threshold — the crossing
 // [targetQueue.failoverCrossingLocked] defines. Caller holds s.mu.
@@ -728,19 +735,18 @@ func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
 }
 
 // anotherTargetTakingNewSessions reports whether one of targets, other than
-// the one keyed waitingAtKey, is usable and taking new sessions.
-//
-// TODO(TODO.d/session-ordered-admission.md): a target failing past the
-// failover threshold counts here as taking new sessions, though
-// [pickTarget] routes around it.
+// the one keyed waitingAtKey, is usable, taking new sessions, and not
+// failing past the failover threshold.
 func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) bool {
 	for _, t := range targets {
-		if healthKey(t, backends) == waitingAtKey {
+		id := healthKey(t, backends)
+		if id == waitingAtKey {
 			continue
 		}
 		s.mu.Lock()
+		now := s.evictStaleHealth()
 		_, unusable := s.resolveBackend(backends, t.backend)
-		taking := unusable == nil && !s.unavailableForNewSessions(healthKey(t, backends), time.Now())
+		taking := unusable == nil && !s.unavailableForNewSessions(id, now) && s.withinFailoverThreshold(id, now)
 		s.mu.Unlock()
 		if taking {
 			return true
