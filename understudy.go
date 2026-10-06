@@ -747,8 +747,11 @@ func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
 // the one keyed waitingAtKey, would take a first request arriving now:
 // usable, and either within the failover threshold or past it with its
 // recovery probe due. The check claims no probe; only an actual send takes
-// one.
-func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) bool {
+// one. When none would, it also reports the earliest moment one of them
+// becomes due its recovery probe, or the zero time when no target's probe
+// is pending.
+func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) (bool, time.Time) {
+	var earliestProbeDue time.Time
 	for _, t := range targets {
 		id := healthKey(t, backends)
 		if id == waitingAtKey {
@@ -758,12 +761,19 @@ func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey s
 		now := s.evictStaleHealth()
 		_, unusable := s.resolveBackend(backends, t.backend)
 		taking := unusable == nil && !s.unavailableForNewSessions(id, now) && (s.withinFailoverThreshold(id, now) || s.dueRecoveryProbe(id, now))
+		if !taking && unusable == nil && !s.unavailableForNewSessions(id, now) {
+			// Past the threshold with its probe not yet due: ask again
+			// when the probe falls due.
+			if at := s.nextReattempt(s.health[id]); earliestProbeDue.IsZero() || at.Before(earliestProbeDue) {
+				earliestProbeDue = at
+			}
+		}
 		s.mu.Unlock()
 		if taking {
-			return true
+			return true, time.Time{}
 		}
 	}
-	return false
+	return false, earliestProbeDue
 }
 
 // lastCallableTarget returns the last target understudy could call at all, and
@@ -2352,12 +2362,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		queue := s.admissionQueue(healthKey(chosen, backend.Backends))
 		// Only a first turn may leave for another target; a later turn is
 		// bound to this one and waits.
-		var moveOn func() bool
+		var moveOn func() (bool, time.Time)
 		if !carriesHistory {
 			// The target being left is not in tried yet, so waitingAtKey
 			// excludes it from the check.
 			waitingAtKey := healthKey(chosen, backend.Backends)
-			moveOn = func() bool {
+			moveOn = func() (bool, time.Time) {
 				return s.anotherTargetTakingNewSessions(untriedTargets(logicalTargets, tried, backend.Backends), waitingAtKey, backend.Backends)
 			}
 		}

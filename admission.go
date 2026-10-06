@@ -219,8 +219,9 @@ func (q *targetQueue) failoverCrossingLocked(now time.Time) (at time.Time, cross
 // admission until its first content confirms it. moveOn, when non-nil, is
 // consulted when the target has held arrivals past the failover threshold;
 // if it reports another target taking new sessions, the wait ends with
-// [errUnavailableForNewSessions]. A nil moveOn waits regardless.
-func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time, moveOn func() bool) (*pending, error) {
+// [errUnavailableForNewSessions]; otherwise it reports a moment to consult
+// it again, and the check reruns then. A nil moveOn waits regardless.
+func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time, moveOn func() (bool, time.Time)) (*pending, error) {
 	p := &pending{queue: q, rank: rank, cancel: cancel, admitted: make(chan struct{}), left: make(chan struct{})}
 	q.mu.Lock()
 	now := time.Now()
@@ -283,8 +284,9 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 // the failover threshold and moveOn reports another target taking new
 // sessions. Holding can begin later than at — the earliest holder may
 // leave — so the check reruns at the crossing the queue's holding start
-// then names.
-func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func() bool) {
+// then names, and at the moment moveOn names when it reports none taking
+// new sessions.
+func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func() (bool, time.Time)) {
 	time.AfterFunc(time.Until(at), func() {
 		now := time.Now()
 		q.mu.Lock()
@@ -300,8 +302,11 @@ func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func
 			return
 		}
 		// moveOn takes the server's lock, so it is called without q.mu held.
-		if !moveOn() {
-			// TODO(TODO.d/session-ordered-admission.md): check again when another target becomes due its probe.
+		taking, askAgain := moveOn()
+		if !taking {
+			if askAgain.After(now) {
+				q.leaveWhenUnavailable(p, askAgain, moveOn)
+			}
 			return
 		}
 		q.mu.Lock()

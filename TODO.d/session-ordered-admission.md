@@ -61,13 +61,18 @@ limiter. The steps below remain, in order.
   the row is [[understudy-error-envelope-type]]'s.
   - Tests: with every target unavailable for new sessions, a first turn gets
     the typed `400` at once.
-  - Check a waiting first request again when the other target becomes due
-    its probe after the busy target has crossed the threshold — today a
-    waiter past the crossing gets no further check and stays in the busy
-    target's line. Leave the check to the other target's recovery clock;
-    the crossing check already moves a waiter whose probe is due by then.
-    - Tests: a first request waiting at a busy target past the crossing
-      moves to the other target once that target becomes due its probe.
+  - Tests: a first request waiting at a busy target, with two other targets
+    failing, moves when the first of them becomes due its probe.
+  - Check a waiting first request again when another target stops being busy.
+    A target unavailable for new sessions at the crossing gets no further
+    look when it frees up, so the request stays in the busy target's line
+    while a first request arriving after is sent to the freed target. There
+    is no known moment to check at, so the freed target's queue has to say
+    when it stops holding arrivals. (open) How many waiting first requests
+    move to it at once — all of them could make it busy again straight away;
+    growth's one-at-a-time rule is the likely answer.
+    - Tests: a first request waiting at a busy target moves to the other
+      target, busy at the crossing, once it stops being busy.
   - The target's busy clock starts when the target became unable to take an
     arrival. A request that arrived to wait counts from its own arrival — the
     request's clock, not the target's — which sets the crossing once the
