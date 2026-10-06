@@ -5876,9 +5876,6 @@ func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atO
 	})
 }
 
-// TODO(TODO.d/what-a-queue-formation-costs.md): one formation should re-send
-// only the turns it had to take. Nothing counts what a formation re-sends.
-
 // TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on
 // the consumer's session-end signal — until it lands, a dropped tenant's
 // conversation state is reclaimed by the forget backstop rather than at
@@ -7674,6 +7671,47 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			secondCheckAt:        defaultRecoveryInterval + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {demoter, newcomer}},
 			answered:             []string{newcomer},
+		}
+	})
+	tests.AddFunc("should cancel a newer session's request at the target and hold it in line until the oldest session's request there is answered, when both have been silent at the target past their grace period", func(t *testing.T) test {
+		const (
+			oldest = "the oldest session asks"
+			newer  = "the newer session asks"
+		)
+		received := &receivedMessages{}
+		var oldestAnswered atomic.Bool
+		oldestAnswers := 2 * (admissionGracePeriod + time.Second)
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == oldest {
+				select {
+				case <-r.Context().Done():
+					t.Errorf("the target saw %q cancelled", oldest)
+					return nil, context.Cause(r.Context())
+				case <-time.After(oldestAnswers):
+				}
+				oldestAnswered.Store(true)
+				return admissionJSON(inboundMessage), nil
+			}
+			if received.count(newer) > 1 && !oldestAnswered.Load() {
+				t.Errorf("the target received %q again before %q was answered", newer, oldest)
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{oldest}},
+				{userMessages: []string{newer}, after: time.Second / 2},
+			},
+			reached: map[string][]string{"openai": {oldest, newer}},
+			// The newer turn appears twice: its first send ends only in
+			// cancellation, and the queue re-sends it when it admits it.
+			secondCheckAt:        oldestAnswers + time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {oldest, newer, newer}},
+			answered:             []string{oldest},
 		}
 	})
 	tests.AddFunc("should send a new session's first request waiting at a busy first target to the failing target whose recovery probe falls due first", func(t *testing.T) test {
