@@ -110,12 +110,6 @@ limiter. The steps below remain, in order.
     once no request for the loaded model is running; a request waiting for the
     loaded model itself is not refilled while a higher-ranked waiter for the
     other model is pending.
-- **Test that a departed waiter gives up its place at the concurrency cap.** A
-  request waiting for an upstream slot whose client leaves must not go on
-  outranking younger sessions' requests waiting for the same slot.
-  - Tests: with the target's only slot held, a request whose client leaves
-    while waiting for it no longer holds back a younger session's request,
-    which is sent once the slot frees.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

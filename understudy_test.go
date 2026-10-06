@@ -5744,9 +5744,52 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			maxConcurrentPerUpstream: 1,
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
-	// waiting for the target's only slot whose client leaves: a younger
-	// session's request waiting behind it is sent once the slot frees.
+	tests.AddFunc("should give the target's freed slot to a waiting request when the client of an older session's request waiting for the slot has disconnected", func(t *testing.T) test {
+		const (
+			streaming = "the streaming session asks"
+			departing = "the departing session asks"
+		)
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			attempts.add(inboundMessage)
+			if inboundMessage != streaming {
+				return admissionJSON(inboundMessage), nil
+			}
+			reads := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					reads++
+					if reads == 1 {
+						// First content at once, so the waiters queue
+						// behind a submitted stream, not a held one.
+						return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+					}
+					// Ends within the waiters' grace period, so rank
+					// alone decides who goes next.
+					time.Sleep(admissionGracePeriod)
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+		turns := []clientTurn{
+			{label: "streamer", userMessages: []string{streaming}},
+			// The departing session is seen before the younger one, so
+			// its request outranks the younger's until its client leaves.
+			{label: "departing", after: admissionGracePeriod / 8, userMessages: []string{departing}, clientLeavesAfter: admissionGracePeriod / 4},
+			{label: "younger", after: admissionGracePeriod / 8, userMessages: []string{younger}},
+		}
+		return test{
+			backend:                  backend,
+			attempts:                 attempts,
+			turns:                    turns,
+			opens:                    admissionGracePeriod + time.Second,
+			first:                    "streamer",
+			second:                   "younger",
+			maxConcurrentPerUpstream: 1,
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
