@@ -5516,11 +5516,12 @@ func TestChatCompletionsConcurrencyLimit(t *testing.T) {
 // that, given two sessions' turns contending for a busy target, Understudy
 // sends the higher-ranked session's turn to the target before the
 // lower-ranked one's, however the queue comes to order them: held at
-// Understudy, already waiting at the target, or ranked by a forgotten
-// session's return. Only the order it sends in is Understudy's: once turns
-// are at the target, which the target serves first is the target's own
-// business, so the attempts compared are the ones the target keeps, not
-// those Understudy withdraws.
+// Understudy, already waiting at the target, both admitted and waiting for
+// the upstream account's one slot, or ranked by a forgotten session's
+// return. Only the order it sends in is Understudy's: once turns are at the
+// target, which the target serves first is the target's own business, so the
+// attempts compared are the ones the target keeps, not those Understudy
+// withdraws.
 func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing.T) {
 	type test struct {
 		backend  *http.Client
@@ -5531,6 +5532,9 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		// first and second label the contending turns in the order
 		// Understudy should send them.
 		first, second string
+		// maxConcurrentPerUpstream is how many requests the target's upstream
+		// account may hold at a time; zero leaves the server's default.
+		maxConcurrentPerUpstream int
 	}
 
 	// opensAfter is when the target opens: the turns' total wait plus the
@@ -5697,9 +5701,58 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		}
 	})
 
+	tests.AddFunc("should give the target's freed slot to the waiting request from the oldest session", func(t *testing.T) test {
+		const streaming = "the streaming session asks"
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			attempts.add(inboundMessage)
+			if inboundMessage != streaming {
+				return admissionJSON(inboundMessage), nil
+			}
+			reads := 0
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+					reads++
+					if reads == 1 {
+						// First content at once, so the queue holds no
+						// later arrival behind the stream.
+						return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+					}
+					// The stream ends before either waiting request's grace
+					// period runs out, so the queue is not what orders them.
+					time.Sleep(admissionGracePeriod)
+					return 0, io.EOF
+				})),
+			}, nil
+		})
+		turns := []clientTurn{
+			{label: "older-opening", userMessages: []string{older}},
+			{label: "streamer", after: time.Second, userMessages: []string{streaming}},
+			{label: "younger", after: time.Second, userMessages: []string{younger}},
+			{label: "older", after: admissionGracePeriod / 4, userMessages: []string{older, older + " again"}},
+		}
+		return test{
+			backend:  backend,
+			attempts: attempts,
+			turns:    turns,
+			// Past the stream's end, with both waiting requests answered.
+			opens:                    time.Second + admissionGracePeriod + time.Second,
+			first:                    "older",
+			second:                   "younger",
+			maxConcurrentPerUpstream: 1,
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
+	// waiting for the target's only slot whose client leaves: a younger
+	// session's request waiting behind it is sent once the slot frees.
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			poster := newAdmissionPoster(t, newAdmissionServer(t, tt.backend))
+			srv := newAdmissionServer(t, tt.backend)
+			srv.maxConcurrentPerUpstream = cmp.Or(tt.maxConcurrentPerUpstream, defaultMaxConcurrentPerUpstream)
+			poster := newAdmissionPoster(t, srv)
 			labels := map[string]string{}
 			for _, tn := range tt.turns {
 				labels[tn.userMessages[len(tn.userMessages)-1]] = tn.name()
@@ -8605,7 +8658,7 @@ func TestUpstreamLimiterAcquire(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if _, err := l.acquire(ctx); err != nil {
+	if _, err := l.acquire(ctx, time.Time{}); err != nil {
 		t.Errorf("acquire with a free slot and a cancelled context: got err %v, want nil", err)
 	}
 	if got := l.inFlight(); got != 1 {

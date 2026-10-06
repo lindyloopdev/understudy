@@ -110,12 +110,12 @@ limiter. The steps below remain, in order.
     once no request for the loaded model is running; a request waiting for the
     loaded model itself is not refilled while a higher-ranked waiter for the
     other model is pending.
-- **The concurrency limiter follows the queue.** Keep a held request taking no
-  slot, and route a freed slot to the waiter from the oldest session rather
-  than whichever wakes first — `upstreamLimiter.acquire` wakes its waiters in
-  release order.
-  - Tests: with the cap full, a freed slot goes to the oldest session's
-    waiting request.
+- **Test that a departed waiter gives up its place at the concurrency cap.** A
+  request waiting for an upstream slot whose client leaves must not go on
+  outranking younger sessions' requests waiting for the same slot.
+  - Tests: with the target's only slot held, a request whose client leaves
+    while waiting for it no longer holds back a younger session's request,
+    which is sent once the slot frees.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

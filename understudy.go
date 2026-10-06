@@ -303,6 +303,16 @@ type upstreamLimiter struct {
 	// handing one out first.
 	saturatedSince time.Time
 	ready          chan struct{}
+	// waiters holds the requests blocked waiting for a slot, each carrying
+	// its session's rank; a freed slot goes to the waiter from the oldest
+	// session.
+	waiters []*limiterWaiter
+}
+
+// limiterWaiter is one request blocked in [upstreamLimiter.acquire], carrying
+// the rank that orders which waiter a freed slot goes to.
+type limiterWaiter struct {
+	rank time.Time
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
@@ -313,27 +323,61 @@ func newUpstreamLimiter(limit int) *upstreamLimiter {
 // whether it had to wait — the demand signal that gates growth of the cap. A
 // free slot is taken immediately without consulting ctx, so a request with an
 // already-cancelled context but an available slot still runs and surfaces the
-// handler's own cause.
-func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
+// handler's own cause. rank is the caller's session age: a free slot is the
+// caller's only once no older session's request waits for one.
+func (l *upstreamLimiter) acquire(ctx context.Context, rank time.Time) (bool, error) {
 	waited := false
+	w := &limiterWaiter{rank: rank}
+	waiting := false
 	for {
 		l.mu.Lock()
-		if l.inflight < l.limit {
+		if l.inflight < l.limit && !l.outrankedLocked(w) {
 			l.inflight++
+			if waiting {
+				l.dropWaiterLocked(w)
+			}
+			l.wakeIdleLocked()
 			l.mu.Unlock()
 			return waited, nil
 		}
+		if !waiting {
+			l.waiters = append(l.waiters, w)
+			waiting = true
+		}
 		ready := l.ready
 		l.mu.Unlock()
-		// TODO(TODO.d/session-ordered-admission.md): waiters here are woken in
-		// release order, not session order, so a freed slot can still go to a
-		// younger session's request.
 		select {
 		case <-ready:
 			waited = true
 		case <-ctx.Done():
+			l.mu.Lock()
+			l.dropWaiterLocked(w)
+			l.wakeIdleLocked()
+			l.mu.Unlock()
 			return waited, context.Cause(ctx)
 		}
+	}
+}
+
+// outrankedLocked reports whether a request from a session older than w's is
+// waiting. Equal ranks do not outrank: sessions first seen at the same moment
+// share a place in line. Caller holds l.mu.
+func (l *upstreamLimiter) outrankedLocked(w *limiterWaiter) bool {
+	return slices.ContainsFunc(l.waiters, func(o *limiterWaiter) bool { return o.rank.Before(w.rank) })
+}
+
+// dropWaiterLocked removes w from the waiting line, if it is there. Caller
+// holds l.mu.
+func (l *upstreamLimiter) dropWaiterLocked(w *limiterWaiter) {
+	l.waiters = slices.DeleteFunc(l.waiters, func(o *limiterWaiter) bool { return o == w })
+}
+
+// wakeIdleLocked wakes the waiters when a slot stands free: a waiter taking a
+// slot or leaving with its context ended may be the one whose rank held the
+// rest back. Caller holds l.mu.
+func (l *upstreamLimiter) wakeIdleLocked() {
+	if l.inflight < l.limit && len(l.waiters) > 0 {
+		l.wake()
 	}
 }
 
@@ -2596,7 +2640,7 @@ type attempt struct {
 // the request. acquired reports whether a slot was had: an error without one
 // is the wait for a slot failing.
 func (a *attempt) send() (acquired bool, err error) {
-	a.waited, err = a.lim.acquire(a.ctx)
+	a.waited, err = a.lim.acquire(a.ctx, a.pend.rank)
 	if err != nil {
 		return false, err
 	}

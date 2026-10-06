@@ -10,8 +10,10 @@
 
 Each behind its own trigger:
 
-- **Fairness in `acquire()`** — `wake()` broadcasts and waiters race. Revisit only if
-  slot-waits persist; FIFO plus a runtime-shrinkable cap needs a real waiter queue.
+- **Fairness in `acquire()`** — `wake()` broadcasts and waiters race, gated by a
+  waiter list that orders them by session rank: a slot goes to a waiter only
+  once no older session's waiter is in line, so only equal ranks race. Revisit
+  only if slot-waits persist.
 - **Live `/proc/self/fd` accounting** — tighter than the static startup budget, but
   Linux-only. Add only if the static budget proves too coarse.
 - **Shared-key cold start** — a modest starting allowance is wrong when many tenants
