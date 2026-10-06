@@ -2348,8 +2348,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			cancel(nil)
 			if errors.Is(err, errUnavailableForNewSessions) {
-				// Busy is not a failure: record nothing against the target.
-				tried = append(tried, healthKey(chosen, backend.Backends))
+				// Busy is not a failure: record nothing against the target, and
+				// leave it out of tried so a failure at the next target can
+				// return the request to this one's line.
 				continue
 			}
 			return fmt.Errorf("held in the admission queue: %w", err)

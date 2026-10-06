@@ -7310,6 +7310,9 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// reachedAtSecondCheck is the inbound messages each backend has
 		// received by secondCheckAt, in order; nil means no second check.
 		reachedAtSecondCheck map[string][]string
+		// answered is the inbound messages whose clients must have received
+		// a 200 answer by the second check; nil means no answer is checked.
+		answered []string
 	}
 
 	tests := testy.NewTable[test]()
@@ -7532,6 +7535,48 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {newcomer}},
 		}
 	})
+	// The new session's first request arrives before the first target's busy
+	// clock crosses the failover threshold, so it is waiting there at the
+	// crossing; the second target refuses every request it receives, and the
+	// request keeping the first target busy is answered past the crossing.
+	tests.AddFunc("should send a new session's first request back to the first target once the first target is no longer busy, when the second target it moved to refuses the request", func(t *testing.T) test {
+		const (
+			occupier = "the other session asks"
+			newcomer = "the new session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == occupier {
+				time.Sleep(admissionGracePeriod + defaultFailoverThreshold + 3*time.Second)
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		refusing := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedB.add(inboundMessage)
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+			}, nil
+		})
+		return test{
+			backends: map[string]*http.Client{"a": first, "b": refusing},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{occupier}},
+				{model: "m", userMessages: []string{newcomer}, after: admissionGracePeriod + defaultFailoverThreshold - 2*time.Second},
+			},
+			reached:              map[string][]string{"a": {occupier}},
+			secondCheckAt:        admissionGracePeriod + defaultFailoverThreshold + 5*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {occupier, newcomer}, "b": {newcomer}},
+			answered:             []string{newcomer},
+		}
+	})
 	tests.AddFunc("should send a new session's first turn to a target a waiting first turn left, once that target is no longer busy", func(t *testing.T) test {
 		const (
 			occupier = "the other session asks"
@@ -7752,6 +7797,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 					t.Errorf("requests the %q backend received %s after the first arrival (-want +got):\n%s", name, tt.secondCheckAt, d)
 				}
 			}
+			poster.answeredOK(tt.answered...)
 		})
 	})
 }

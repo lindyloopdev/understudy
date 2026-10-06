@@ -62,10 +62,12 @@ limiter. The steps below remain, in order.
   - Tests: with every target unavailable for new sessions, a first turn gets
     the typed `400` at once.
   - A waiting first turn leaves only for a target the walk would pick: one
-    failing past the failover threshold does not count as taking new
-    sessions. One per-target check, shared with `pickTarget`.
+    failing past the failover threshold does not count until it is due a
+    recovery probe. One per-target check, shared with `pickTarget`, that
+    claims no probe by asking.
     - Tests: a first turn waiting at a busy target stays there when the only
-      other target is failing past the failover threshold.
+      other target is failing past the failover threshold and not yet due a
+      probe; it moves to that target once a probe is due.
   - The target's busy clock starts when the target became unable to take an
     arrival. A request that arrived to wait counts from its own arrival — the
     request's clock, not the target's — which sets the crossing once the

@@ -1351,7 +1351,13 @@ while a first turn waits in its queue, because a target that first turns skip
 may get no arrivals.
 When a target becomes unavailable for new sessions, the first turns already in
 its queue also move to the next target; otherwise a first turn that arrived just
-before that moment would wait longer than one that arrived just after.
+before that moment would wait longer than one that arrived just after. A waiting
+first turn can move to the targets the walk would pick for a first turn arriving
+then: a target failing past the failover threshold does not count until it is
+due a recovery probe, and then it does. Moving on skips the busy target; it does
+not try it. So if the target the turn moved to fails, the walk returns the turn
+to the busy target's line at its rank, as it would a first turn arriving then,
+and a failed probe does not reach the client.
 
 This covers a case the failure streak misses: a target that is slow but not
 failing. A remote that sends a header and then no content records no failure,
