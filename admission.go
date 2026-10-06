@@ -301,6 +301,7 @@ func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func
 		}
 		// moveOn takes the server's lock, so it is called without q.mu held.
 		if !moveOn() {
+			// TODO(TODO.d/session-ordered-admission.md): check again when another target becomes due its probe.
 			return
 		}
 		q.mu.Lock()

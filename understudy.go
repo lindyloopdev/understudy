@@ -693,9 +693,9 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 			return pick{target: t, ok: true, skipped: skipped}
 		}
 		h := s.health[id]
-		if due := s.nextReattempt(h); now.Before(due) {
+		if !s.dueRecoveryProbe(id, now) {
 			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
-				due.Format(time.RFC3339), h.lastError)
+				s.nextReattempt(h).Format(time.RFC3339), h.lastError)
 			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
 			s.noteBackendDown(logLater, id, t, h)
 			continue
@@ -720,6 +720,15 @@ func (s *server) withinFailoverThreshold(id string, now time.Time) bool {
 	return !tracked || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold
 }
 
+// dueRecoveryProbe reports whether the target keyed id has a health record
+// whose next reattempt has passed, making the target due a recovery probe.
+// It does not claim the probe; only an actual send takes one. Caller holds
+// s.mu.
+func (s *server) dueRecoveryProbe(id string, now time.Time) bool {
+	h, tracked := s.health[id]
+	return tracked && !now.Before(s.nextReattempt(h))
+}
+
 // unavailableForNewSessions reports whether the target's admission queue
 // has held arrivals for the failover threshold — the crossing
 // [targetQueue.failoverCrossingLocked] defines. Caller holds s.mu.
@@ -735,8 +744,10 @@ func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
 }
 
 // anotherTargetTakingNewSessions reports whether one of targets, other than
-// the one keyed waitingAtKey, is usable, taking new sessions, and not
-// failing past the failover threshold.
+// the one keyed waitingAtKey, would take a first request arriving now:
+// usable, and either within the failover threshold or past it with its
+// recovery probe due. The check claims no probe; only an actual send takes
+// one.
 func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) bool {
 	for _, t := range targets {
 		id := healthKey(t, backends)
@@ -746,7 +757,7 @@ func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey s
 		s.mu.Lock()
 		now := s.evictStaleHealth()
 		_, unusable := s.resolveBackend(backends, t.backend)
-		taking := unusable == nil && !s.unavailableForNewSessions(id, now) && s.withinFailoverThreshold(id, now)
+		taking := unusable == nil && !s.unavailableForNewSessions(id, now) && (s.withinFailoverThreshold(id, now) || s.dueRecoveryProbe(id, now))
 		s.mu.Unlock()
 		if taking {
 			return true
