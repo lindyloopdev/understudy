@@ -7584,7 +7584,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			newcomer = "the new session asks"
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
-		refusingOnce := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+		refusingDemoter := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
 			receivedB.add(inboundMessage)
 			if inboundMessage != demoter {
 				return admissionJSON(inboundMessage), nil
@@ -7603,7 +7603,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backends: map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
-				"b": refusingOnce,
+				"b": refusingDemoter,
 			},
 			models: map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
@@ -7634,7 +7634,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			newcomer = "the new session asks"
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
-		refusingOnce := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+		refusingDemoter := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
 			receivedB.add(inboundMessage)
 			if inboundMessage != demoter {
 				return admissionJSON(inboundMessage), nil
@@ -7652,7 +7652,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		return test{
 			backends: map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
-				"b": refusingOnce,
+				"b": refusingDemoter,
 			},
 			models: map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
@@ -7676,9 +7676,60 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{newcomer},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a first
-	// request waiting at a busy target with two failing others: it moves when
-	// the first of them becomes due its probe.
+	tests.AddFunc("should send a new session's first request waiting at a busy first target to the failing target whose recovery probe falls due first", func(t *testing.T) test {
+		const (
+			secondDemoter = "the session naming the second target asks"
+			thirdDemoter  = "the session naming the third target asks"
+			occupier      = "the other session asks"
+			newcomer      = "the new session asks"
+		)
+		refused := `{"error":{"message":"only available hosted in China and requires explicit opt in"}}`
+		refusingDemoter := func(received *receivedMessages, demoter string) *http.Client {
+			return admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+				received.add(inboundMessage)
+				if inboundMessage != demoter {
+					return admissionJSON(inboundMessage), nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusForbidden,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(refused)),
+				}, nil
+			})
+		}
+		receivedA, receivedB, receivedC := &receivedMessages{}, &receivedMessages{}, &receivedMessages{}
+		// Times are from the first arrival. The first target crosses the
+		// failover threshold before either failing target is due its probe.
+		crossing := defaultRecoveryInterval - 2*time.Second
+		occupierArrives := crossing - admissionGracePeriod - defaultFailoverThreshold
+		thirdDemoted := occupierArrives - time.Second
+		return test{
+			backends: map[string]*http.Client{
+				"a": silentBackend(t, receivedA),
+				"b": refusingDemoter(receivedB, secondDemoter),
+				"c": refusingDemoter(receivedC, thirdDemoter),
+			},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+				{backend: "c", model: "mc"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB, "c": receivedC},
+			arrivals: []clientTurn{
+				// Each names a target's backend and model directly; it shares
+				// that target's health key, so its refusal demotes the target.
+				{model: "b/mb", userMessages: []string{secondDemoter}},
+				{model: "c/mc", userMessages: []string{thirdDemoter}, after: thirdDemoted},
+				{model: "m", userMessages: []string{occupier}, after: occupierArrives - thirdDemoted},
+				{model: "m", userMessages: []string{newcomer}, after: crossing - occupierArrives - 2*time.Second},
+			},
+			reached: map[string][]string{"a": {occupier}, "b": {secondDemoter}, "c": {thirdDemoter}},
+			// After the second target's probe falls due, before the third's.
+			secondCheckAt:        defaultRecoveryInterval + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {secondDemoter, newcomer}, "c": {thirdDemoter}},
+			answered:             []string{newcomer},
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here for a first
 	// request waiting at a busy target when the other target, also busy at
 	// the crossing, stops being busy: it moves to that target then.

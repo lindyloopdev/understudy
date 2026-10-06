@@ -61,8 +61,6 @@ limiter. The steps below remain, in order.
   the row is [[understudy-error-envelope-type]]'s.
   - Tests: with every target unavailable for new sessions, a first turn gets
     the typed `400` at once.
-  - Tests: a first request waiting at a busy target, with two other targets
-    failing, moves when the first of them becomes due its probe.
   - Check a waiting first request again when another target stops being busy.
     A target unavailable for new sessions at the crossing gets no further
     look when it frees up, so the request stays in the busy target's line
