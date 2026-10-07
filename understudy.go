@@ -2538,8 +2538,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		// TODO(TODO.d/session-ordered-admission.md): a 429 with Retry-After
-		// takes this ladder still; it should bench the target and admit the
-		// highest-ranked request whose target is not benched. Not built.
+		// takes this ladder still; within the wait budget it should bench the
+		// target and admit the highest-ranked request whose target is not
+		// benched. Blocked on the wait budget.
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen

@@ -81,7 +81,12 @@ limiter. The steps below remain, in order.
       names.
 - **A 429 with `Retry-After` on a request that waits benches the target** —
   the existing `recordRateLimited` — **and admits the highest-ranked request
-  whose target is not benched**, instead of taking the ladder. A bare 429 with
+  whose target is not benched**, instead of taking the ladder. Blocked on the
+  wait budget: holding a request through a `Retry-After` is the Retry-After
+  ladder's wait-in-place rung, which applies only within the budget, and
+  `T_wait` is set from measured held-connection cost
+  ([[understudy-fallback]], [[understudy-adaptive-coordinated-backoff]]);
+  until it exists, such a 429 takes the fail-over rung. A bare 429 with
   nothing running takes the ordinary ladder. Kronk's admission timeout is a
   bare `429` `resource_exhausted`, identical to its model-does-not-fit error
   (`notes/kronk.md` #2), so no rule may key on the code.
