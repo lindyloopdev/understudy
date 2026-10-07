@@ -79,20 +79,19 @@ limiter. The steps below remain, in order.
     - Tests: a first turn waiting when the earliest waiter leaves before the
       crossing moves on at the crossing the target's remaining busy period
       names.
-- **A 429 on a request that waits re-queues it** at its rank — a later turn,
-  or a first turn whose target is still taking new sessions. With
-  `Retry-After`: bench the target (the existing `recordRateLimited`) and admit
-  the highest-ranked request whose target is not benched. Without `Retry-After`,
-  while another request on its key is producing content: re-queue, admit it
-  when a request on its key finishes, and do not `throttle()` the limiter.
-  Without `Retry-After` and nothing producing content: the ordinary ladder.
-  Kronk's admission timeout is a bare `429` `resource_exhausted`, identical to
-  its model-does-not-fit error (`notes/kronk.md` #2), so the rule must not key
-  on the code.
-  - Tests: a bare 429 while its key has a running stream is served once that
-    stream ends, with the cap unchanged and no replay; a 429 with `Retry-After`
-    holds only its own target while others are admitted; a bare 429 with nothing
-    running takes the ladder.
+- **A 429 with `Retry-After` on a request that waits benches the target** —
+  the existing `recordRateLimited` — **and admits the highest-ranked request
+  whose target is not benched**, instead of taking the ladder. A bare 429 with
+  nothing running takes the ordinary ladder. Kronk's admission timeout is a
+  bare `429` `resource_exhausted`, identical to its model-does-not-fit error
+  (`notes/kronk.md` #2), so no rule may key on the code.
+  - Tests: a 429 with `Retry-After` holds only its own target while others are
+    admitted; a bare 429 with nothing running takes the ladder; a bare 429
+    re-queued behind a running stream leaves the concurrency cap where it
+    was, so a later request on the account is sent at that cap; a request
+    carrying an earlier reply, refused with a bare 429 behind a
+    running stream at a target busy past the failover threshold, is sent to
+    that target again once the stream ends.
 - **Linked models.** A busy refusal (`providers.ErrServerBusy`) links the queues
   of every model on that server into one ranking. While linked, the loaded
   model's queue stops admitting when the top-ranked waiter is for another model,

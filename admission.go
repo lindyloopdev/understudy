@@ -386,6 +386,32 @@ func (q *targetQueue) sendEnded(p *pending) bool {
 	return q.endSend(p)
 }
 
+// unavailableForNewSessions reports whether the queue has held arrivals for
+// the failover threshold by now — the crossing
+// [targetQueue.failoverCrossingLocked] defines — so its target is
+// unavailable for new sessions.
+func (q *targetQueue) unavailableForNewSessions(now time.Time) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	_, crossed := q.failoverCrossingLocked(now)
+	return crossed
+}
+
+// requeueBehindContent returns p to the waiting line at its rank, reporting
+// whether it did. It re-queues only when another request at the target is
+// confirmed — its stream still open. The check and the re-queue are one
+// step, so a stream ending in between cannot leave p waiting on nothing
+// outstanding.
+func (q *targetQueue) requeueBehindContent(p *pending) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !slices.ContainsFunc(q.outstanding, func(o *pending) bool { return o.confirmed }) {
+		return false
+	}
+	q.insert(p)
+	return true
+}
+
 // endSend takes p's send out of the target's outstanding requests, admits
 // whoever that frees a place for, and reports whether the send was
 // preempted before any content. Caller holds q.mu.

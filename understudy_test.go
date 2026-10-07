@@ -7810,6 +7810,159 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{oldest},
 		}
 	})
+	tests.AddFunc("should send a request again once the target's streaming answer to another request has ended, when the target answered the request with a rate limit and sent no retry-after", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+		)
+		// The stream ends well after the refusal is answered, so a second
+		// send can only follow the stream's end.
+		streamEndsAfter := admissionGracePeriod + 3*time.Second
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(streamEndsAfter):
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			case refusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					}, nil
+				}
+				return admissionJSON(inboundMessage), nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{streamingMessage}},
+				{userMessages: []string{refusedMessage}, after: time.Second},
+			},
+			// The refusal has been answered and the stream is still open.
+			reached: map[string][]string{"openai": {streamingMessage, refusedMessage}},
+			// The refused request appears twice: its second send follows the
+			// stream's end, and its client receives that send's answer.
+			secondCheckAt:        time.Second + streamEndsAfter + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage}},
+			answered:             []string{refusedMessage},
+		}
+	})
+	tests.AddFunc("should send a session's first request to the second target when the first target has been busy for the failover threshold and answers the request with a rate limit and no retry-after", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			holderOpening    = "the holding session asks"
+			holderLater      = "the holding session asks again"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		// Times are from the first arrival. The holding session is seen after
+		// the refused one, and its later request arrives within the refused
+		// request's grace period, so the queue-forming sweep leaves the
+		// refused request — the older session's — at the target as the one
+		// request it keeps there, and takes the holding one into the line.
+		refusedArrives := time.Second
+		holderArrives := refusedArrives + time.Second/2
+		holderLaterArrives := holderArrives + time.Second/4
+		// The first target answers the refused request past the crossing its
+		// holding of arrivals reaches, counted from the holding request's
+		// grace period — the latest clock the target runs, so the one the
+		// refusal must clear.
+		refuseAt := holderLaterArrives + admissionGracePeriod + defaultFailoverThreshold + time.Second
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			case refusedMessage:
+				if receivedA.count(inboundMessage) == 1 {
+					select {
+					case <-r.Context().Done():
+						return nil, context.Cause(r.Context())
+					case <-time.After(refuseAt - refusedArrives):
+					}
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					}, nil
+				}
+				return admissionJSON(inboundMessage), nil
+			case holderOpening:
+				return admissionJSON(inboundMessage), nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		second := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedB.add(inboundMessage)
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"a": first, "b": second},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{streamingMessage}},
+				{model: "m", userMessages: []string{refusedMessage}, after: refusedArrives},
+				{model: "m", userMessages: []string{holderOpening}, after: holderArrives - refusedArrives},
+				{model: "m", userMessages: []string{holderOpening, holderLater}, after: holderLaterArrives - holderArrives},
+			},
+			reached: map[string][]string{"a": {streamingMessage, refusedMessage, holderOpening, holderLater}},
+			// The holding session's later request is sent again once the
+			// refused request's send ends, freeing the line's head; the
+			// refused request itself lands at the second target, and its
+			// client receives that target's answer.
+			secondCheckAt: refuseAt + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{
+				"a": {streamingMessage, refusedMessage, holderOpening, holderLater, holderLater},
+				"b": {refusedMessage},
+			},
+			answered: []string{refusedMessage},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
+	// carrying an earlier reply, refused the same way at a target busy past
+	// the failover threshold: it is sent to that target again once the
+	// stream ends.
+	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
+	// on the same account arriving after the re-sent one: it is sent at the
+	// concurrency cap held before the bare 429.
 	tests.AddFunc("should send a new session's first request waiting at a busy first target to the failing target whose recovery probe falls due first", func(t *testing.T) test {
 		const (
 			secondDemoter = "the session naming the second target asks"

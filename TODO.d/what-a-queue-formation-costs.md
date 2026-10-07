@@ -16,7 +16,10 @@ it no work".
 Open question, mechanism first. `targetQueue.enter` arms one
 `time.AfterFunc(admissionGracePeriod, …)` per admission, and each firing sweeps
 everything outstanding. A re-sent attempt does not re-enter the queue, so it
-arms no timer of its own — but a later arrival's timer still sweeps it once
+arms no timer of its own — nor does a request re-queued after a bare 429
+while another request at the target is producing content:
+`requeueBehindContent` places it back in the waiting line without arming
+one — but a later arrival's timer still sweeps it once
 the queue has admitted it, and admission stamps a fresh `arrived`, so it is
 exempt only until it ages past the grace period again.
 

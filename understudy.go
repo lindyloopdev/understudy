@@ -773,18 +773,12 @@ func (s *server) dueRecoveryProbe(id string, now time.Time) bool {
 	return tracked && !now.Before(s.nextReattempt(h))
 }
 
-// unavailableForNewSessions reports whether the target's admission queue
-// has held arrivals for the failover threshold — the crossing
-// [targetQueue.failoverCrossingLocked] defines. Caller holds s.mu.
+// unavailableForNewSessions reports whether the target keyed id is
+// unavailable for new sessions, as its admission queue judges it; a target
+// with no queue yet is available. Caller holds s.mu.
 func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
 	q, ok := s.admission[id]
-	if !ok {
-		return false
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	_, crossed := q.failoverCrossingLocked(now)
-	return crossed
+	return ok && q.unavailableForNewSessions(now)
 }
 
 // anotherTargetTakingNewSessions reports whether one of targets, other than
@@ -2466,11 +2460,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		}
 		current = a
 
-		// The send, retried wherever the queue displaces an attempt or the
-		// first-content timeout ends one. Neither ending is a failure — the target
-		// is healthy and the client still waiting — so neither records and
-		// shrinks anything; the request waits for the queue to admit it again
-		// and sends the same bytes to the same target.
+		// The send, retried wherever the queue displaces an attempt, the
+		// first-content timeout ends one, or the target answers a bare rate
+		// limit while another request there is producing content and this
+		// request may keep waiting at the target. None of those endings is
+		// a failure — the target is healthy and the client still waiting —
+		// so none records and shrinks anything; the request waits for the
+		// queue to admit it again and sends the same bytes to the same
+		// target.
 		var acquired bool
 		for {
 			var sendErr error
@@ -2497,9 +2494,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 					a.cancel(nil)
 					return relayErr
 				}
-			} else if sendErr != nil && !pend.queue.sendEnded(pend) {
-				err = sendErr
-				break
+			} else if sendErr != nil {
+				// A bare rate limit keeps a place in this target's line for
+				// a later request, and for a session's first request only
+				// while the target still takes new sessions; past that
+				// crossing the first request takes the walk's ladder
+				// instead. The crossing is read before the send ends, since
+				// the request's own silence at the target is part of what
+				// held arrivals there.
+				waitsAtTarget := carriesHistory || !pend.queue.unavailableForNewSessions(time.Now())
+				if !pend.queue.sendEnded(pend) &&
+					(!waitsAtTarget || classifyLimit(sendErr).condition != bareRateLimit || !pend.queue.requeueBehindContent(pend)) {
+					err = sendErr
+					break
+				}
 			}
 			if resendErr := a.waitToResend(); resendErr != nil {
 				return resendErr
@@ -2529,9 +2537,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				at:    time.Now().Add(jitteredInterval(base, s.jitterFactor)),
 			}
 		}
-		// TODO(TODO.d/session-ordered-admission.md): a 429 on a request the
-		// admission queue holds re-queues it at its rank rather than taking
-		// this ladder; not built.
+		// TODO(TODO.d/session-ordered-admission.md): a 429 with Retry-After
+		// takes this ladder still; it should bench the target and admit the
+		// highest-ranked request whose target is not benched. Not built.
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen

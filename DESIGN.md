@@ -1378,8 +1378,10 @@ session is likely to run, and whether a slow local target can finish it in time
 consumer policy, not Understudy's.
 
 **A 429 on a request that waits re-queues it.** The request returns to the
-queue at its rank. Its scope is its target, or the linked set while models are
-linked.
+queue at its rank. A later turn re-queues; a first turn does only while its
+target is still taking new sessions — past the failover threshold the walk's
+ladder takes it instead. Its scope is its target, or the linked set while
+models are linked.
 
 - **With `Retry-After`:** the target is benched until then (§Understudy,
   health), and the queue admits around it — the highest-ranked request whose
