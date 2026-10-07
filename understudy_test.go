@@ -7956,10 +7956,74 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered: []string{refusedMessage},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
-	// carrying an earlier reply, refused the same way at a target busy past
-	// the failover threshold: it is sent to that target again once the
-	// stream ends.
+	tests.AddFunc("should send a session's later request to its target again once the target's stream ends, when the target has been busy for the failover threshold and answers it with a rate limit and no retry-after", func(t *testing.T) test {
+		const (
+			opening          = "the bound session asks"
+			later            = "the bound session asks again"
+			streamingMessage = "the streaming session asks"
+		)
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		// Times are relative to the first arrival. The first target stays
+		// busy past the failover threshold before refusing the later
+		// request; the stream ends after the refusal.
+		laterArrives := time.Second
+		refuseAt := laterArrives + admissionGracePeriod + defaultFailoverThreshold + time.Second
+		streamEnds := refuseAt + 2*time.Second
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(streamEnds - laterArrives/2):
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			case later:
+				if receivedA.count(inboundMessage) == 1 {
+					select {
+					case <-r.Context().Done():
+						return nil, context.Cause(r.Context())
+					case <-time.After(refuseAt - laterArrives):
+					}
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+					}, nil
+				}
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)},
+			models: map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}},
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{opening}},
+				{model: "m", userMessages: []string{streamingMessage}, after: laterArrives / 2},
+				{model: "m", userMessages: []string{opening, later}, after: laterArrives / 2},
+			},
+			reached:              map[string][]string{"a": {opening, streamingMessage, later}},
+			secondCheckAt:        streamEnds + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {opening, streamingMessage, later, later}},
+			answered:             []string{later},
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
 	// on the same account arriving after the re-sent one: it is sent at the
 	// concurrency cap held before the bare 429.

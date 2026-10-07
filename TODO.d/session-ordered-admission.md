@@ -88,10 +88,7 @@ limiter. The steps below remain, in order.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
     admitted; a bare 429 with nothing running takes the ladder; a bare 429
     re-queued behind a running stream leaves the concurrency cap where it
-    was, so a later request on the account is sent at that cap; a request
-    carrying an earlier reply, refused with a bare 429 behind a
-    running stream at a target busy past the failover threshold, is sent to
-    that target again once the stream ends.
+    was, so a later request on the account is sent at that cap.
 - **Linked models.** A busy refusal (`providers.ErrServerBusy`) links the queues
   of every model on that server into one ranking. While linked, the loaded
   model's queue stops admitting when the top-ranked waiter is for another model,
