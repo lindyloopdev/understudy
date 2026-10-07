@@ -86,9 +86,7 @@ limiter. The steps below remain, in order.
   bare `429` `resource_exhausted`, identical to its model-does-not-fit error
   (`notes/kronk.md` #2), so no rule may key on the code.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
-    admitted; a bare 429 with nothing running takes the ladder; a bare 429
-    re-queued behind a running stream leaves the concurrency cap where it
-    was, so a later request on the account is sent at that cap.
+    admitted; a bare 429 with nothing running takes the ladder.
 - **Linked models.** A busy refusal (`providers.ErrServerBusy`) links the queues
   of every model on that server into one ranking. While linked, the loaded
   model's queue stops admitting when the top-ranked waiter is for another model,

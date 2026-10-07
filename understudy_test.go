@@ -8024,9 +8024,61 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{later},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
-	// on the same account arriving after the re-sent one: it is sent at the
-	// concurrency cap held before the bare 429.
+	tests.AddFunc("should keep sending requests to a target up to its earlier concurrency cap after a bare 429 sent a request there back into line", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			firstNewcomer    = "the first new session asks"
+			secondNewcomer   = "the second new session asks"
+		)
+		streamEndsAfter := admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch {
+			case inboundMessage == streamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(streamEndsAfter):
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			case inboundMessage == refusedMessage && received.count(inboundMessage) == 1:
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+				}, nil
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{streamingMessage}},
+				{userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
+				// Sent while the re-sent refused request's grace period is
+				// still open. The bare 429 left the cap at its earlier value,
+				// so both are admitted.
+				{userMessages: []string{firstNewcomer}, after: streamEndsAfter + admissionGracePeriod/4},
+				{userMessages: []string{secondNewcomer}, after: admissionGracePeriod / 8},
+			},
+			reached: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, firstNewcomer, secondNewcomer}},
+		}
+	})
 	tests.AddFunc("should send a new session's first request waiting at a busy first target to the failing target whose recovery probe falls due first", func(t *testing.T) test {
 		const (
 			secondDemoter = "the session naming the second target asks"
