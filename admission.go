@@ -270,11 +270,11 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	q.outstanding = append(q.outstanding, p)
 	// The wait itself can form the queue: p headerless past its grace period
 	// is itself the evidence of contention, so every admission arms the timer.
-	// TODO(TODO.d/what-a-queue-formation-costs.md): one timer is armed per
-	// admission and each sweeps everything outstanding, so nothing here bounds
-	// how often a turn admitted and re-sent can be taken again by a later
-	// admission's timer. Whether the admission rule already prevents it is
-	// unestablished.
+	// A request the queue sends to the target a second time arms no timer of
+	// its own, so a later arrival from an older session can have it cancelled
+	// and queued again. The target has not begun to answer it by then, so
+	// each repeat costs another send. It loses its place only to an older
+	// session's request, which this queue would send first anyway.
 	time.AfterFunc(admissionGracePeriod, func() { q.formByWaiting(p) })
 	q.mu.Unlock()
 	return p, nil

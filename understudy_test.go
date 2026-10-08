@@ -7810,6 +7810,79 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{oldest},
 		}
 	})
+	tests.AddFunc("should take a request Understudy has already sent to the target again back into its queue, when an older session's request reaches the target during that send's grace period", func(t *testing.T) test {
+		const (
+			oldestOpening = "the oldest session asks"
+			oldestLater   = "the oldest session asks again"
+			middle        = "the middle session asks"
+			youngest      = "the youngest session asks"
+		)
+		// Times are from the first arrival.
+		middleArrives := time.Second / 4
+		youngestArrives := time.Second / 2
+		// When the middle request's content starts, Understudy sends the
+		// youngest request to the target a second time; the oldest session's
+		// later request arrives within that second send's grace period.
+		middleConfirms := youngestArrives + 2*admissionGracePeriod
+		oldestLaterArrives := middleConfirms + admissionGracePeriod/4
+		oldestLaterAnswers := oldestLaterArrives + 2*admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case oldestOpening:
+				return admissionJSON(inboundMessage), nil
+			case middle:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							select {
+							case <-r.Context().Done():
+								return 0, context.Cause(r.Context())
+							case <-time.After(middleConfirms - middleArrives):
+							}
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			case oldestLater:
+				select {
+				case <-r.Context().Done():
+					return nil, context.Cause(r.Context())
+				case <-time.After(oldestLaterAnswers - oldestLaterArrives):
+				}
+				return admissionJSON(inboundMessage), nil
+			case youngest:
+				if received.count(youngest) == 3 {
+					return admissionJSON(inboundMessage), nil
+				}
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{oldestOpening}},
+				{userMessages: []string{middle}, after: middleArrives},
+				{userMessages: []string{youngest}, after: youngestArrives - middleArrives},
+				{userMessages: []string{oldestOpening, oldestLater}, after: oldestLaterArrives - youngestArrives},
+			},
+			reached:       map[string][]string{"openai": {oldestOpening, middle, youngest, youngest, oldestLater}},
+			secondCheckAt: oldestLaterAnswers + time.Second,
+			reachedAtSecondCheck: map[string][]string{
+				"openai": {oldestOpening, middle, youngest, youngest, oldestLater, youngest},
+			},
+			answered: []string{youngest},
+		}
+	})
 	tests.AddFunc("should send a request again once the target's streaming answer to another request has ended, when the target answered the request with a rate limit and sent no retry-after", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"
