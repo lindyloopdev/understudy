@@ -255,12 +255,13 @@ type server struct {
 	// whether that handler or the re-send it must not touch runs first.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 
-	// TODO(TODO.d/collapse-the-server-state-maps.md): the five maps below sit in
-	// three key spaces — health and admission share a target key, affinity and
-	// sessionAges share a tenant-and-conversation key — so two records would say
-	// what four maps now do. The merge waits on per-field expiry: affinity
-	// releases at its idle TTL while a session's rank outlives it, and a swept
-	// health entry must not strand a queue's waiters.
+	// TODO(TODO.d/collapse-the-server-state-maps.md): the six maps below sit
+	// in three key spaces — health and admission share a target key, affinity
+	// and sessionAges share a tenant-and-conversation key, and busyLinks
+	// joins upstreamLimiters on the upstream key — so three records would
+	// say what six maps now do. The merge waits on per-field expiry: affinity
+	// releases at its idle TTL while a session's rank outlives it, and a
+	// swept health entry must not strand a queue's waiters.
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
@@ -278,6 +279,9 @@ type server struct {
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	admission map[string]*targetQueue
+	// busyLinks holds, per canonical upstream account, the targets whose
+	// waiting requests a busy refusal linked to the server's other models.
+	busyLinks map[string]map[*targetQueue]struct{}
 	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
 	// identity, bounding concurrent in-flight requests to each account.
 	upstreamLimiters map[string]*upstreamLimiter
@@ -601,6 +605,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		affinity:                 make(map[string]map[string]lastServed),
 		sessionAges:              make(map[string]map[string]sessionRecord),
 		admission:                make(map[string]*targetQueue),
+		busyLinks:                make(map[string]map[*targetQueue]struct{}),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}
 	for _, opt := range opts {
@@ -2392,12 +2397,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// Hold an upstream slot for the whole request — through the response-body
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
-		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
+		upstream := canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey)
+		lim := s.upstreamLimiter(upstream)
 
 		// Session-ordered admission sits ahead of the slot: a request held by
 		// the queue takes no slot, and only an admitted one competes for one.
 		// Uncontended, nothing queues and a request passes straight through.
-		queue := s.admissionQueue(healthKey(chosen, backend.Backends))
+		queue := s.admissionQueue(healthKey(chosen, backend.Backends), upstream)
 		// Only a first turn may leave for another target; a later turn is
 		// bound to this one and waits.
 		var moveOn func() (bool, time.Time)
@@ -2503,7 +2509,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// the request's own silence at the target is part of what
 				// held arrivals there.
 				waitsAtTarget := carriesHistory || !pend.queue.unavailableForNewSessions(time.Now())
-				if !pend.queue.sendEnded(pend) &&
+				preempted := pend.queue.sendEnded(pend)
+				swapWaits := !preempted && errors.Is(sendErr, providers.ErrServerBusy) && s.queueBehindServerBusy(upstream, pend)
+				if !swapWaits && !preempted &&
 					(!waitsAtTarget || classifyLimit(sendErr).condition != bareRateLimit || !pend.queue.requeueBehindContent(pend)) {
 					err = sendErr
 					break
@@ -2526,10 +2534,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// understudy invents — but the base is scaled so jitter's floor still
 		// clears rateLimitDemotionThreshold, or a scattered draw could flip its
 		// own classification to transientRate and silently stop demoting.
-		// TODO(TODO.d/session-ordered-admission.md): a busy refusal should also
-		// link the server's models into one admission ranking, so a model swap
-		// waits for the loaded model's requests rather than being refused; only
-		// the demotion normalization is built.
+		// TODO(TODO.d/session-ordered-admission.md): end the link a busy
+		// refusal forms when either model's queue drains.
 		if errors.Is(err, providers.ErrServerBusy) {
 			base := time.Duration(float64(rateLimitDemotionThreshold) / (1 - s.jitterFactor))
 			err = retryAfterError{

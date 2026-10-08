@@ -104,16 +104,76 @@ func (s *server) evictForgottenSessions(now time.Time) {
 
 // admissionQueue returns the admission queue for a target's availability key
 // (canonical url + key + model), the scope providers limit and slots are
-// handed out on.
-func (s *server) admissionQueue(key string) *targetQueue {
+// handed out on. upstream is the target's server's canonical url and key,
+// which the queue keeps so a busy refusal can find the server's other models.
+func (s *server) admissionQueue(key, upstream string) *targetQueue {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	q, ok := s.admission[key]
 	if !ok {
-		q = &targetQueue{firstContentSchedule: s.firstContentSchedule, failoverThreshold: s.failoverThreshold}
+		q = &targetQueue{
+			upstream:             upstream,
+			firstContentSchedule: s.firstContentSchedule,
+			failoverThreshold:    s.failoverThreshold,
+			drained:              func() { s.modelsDrained(upstream) },
+		}
 		s.admission[key] = q
 	}
 	return q
+}
+
+// queueBehindServerBusy returns p to its target's waiting line behind a busy
+// refusal, reporting whether it did — but only when another of the server's
+// models has a request running; waiting until no request runs at any of the
+// server's models lands the refused model swap on an idle entry rather than
+// a second refusal.
+//
+// TODO(TODO.d/session-ordered-admission.md): send the request again each
+// time one of the server's running models finishes, not only once all are
+// idle; rank the server's waiting requests together across its models; and
+// stop the running models taking new requests while a refused model's
+// request waits.
+func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range s.admission {
+		if q.upstream != upstream || q.idle() {
+			continue
+		}
+		p.queue.mu.Lock()
+		p.queue.insert(p)
+		p.queue.mu.Unlock()
+		if s.busyLinks[upstream] == nil {
+			s.busyLinks[upstream] = make(map[*targetQueue]struct{})
+		}
+		s.busyLinks[upstream][p.queue] = struct{}{}
+		return true
+	}
+	return false
+}
+
+// modelsDrained admits the waiting requests a busy refusal linked to the
+// server's models, once no request is running at any of them.
+func (s *server) modelsDrained(upstream string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	linked := s.busyLinks[upstream]
+	if len(linked) == 0 {
+		return
+	}
+	for _, q := range s.admission {
+		if q.upstream != upstream || q.idle() {
+			continue
+		}
+		// A model still running; its own drain re-runs this.
+		return
+	}
+	delete(s.busyLinks, upstream)
+	for q := range linked {
+		q.mu.Lock()
+		q.admit()
+		q.mu.Unlock()
+	}
 }
 
 // targetQueue orders admission to one target by session age: the backend
@@ -123,6 +183,9 @@ func (s *server) admissionQueue(key string) *targetQueue {
 // passes straight through.
 type targetQueue struct {
 	mu sync.Mutex
+	// upstream is the target's server, its canonical url and key: the scope
+	// a busy refusal links the server's models across.
+	upstream string
 	// outstanding holds every attempt at the target — sent, or admitted and
 	// on its way — until it ends or its first content confirms it.
 	outstanding []*pending
@@ -136,6 +199,10 @@ type targetQueue struct {
 	// around the target, and a waiting first turn leaves for another target;
 	// it is taken from the server at the queue's creation.
 	failoverThreshold time.Duration
+	// drained runs when the target's outstanding requests reach zero; it is
+	// taken from the server at the queue's creation and runs without q.mu
+	// held.
+	drained func()
 }
 
 // pending is one attempt's standing at a target queue: its rank, when it
@@ -367,12 +434,17 @@ func (q *targetQueue) formByWaiting(p *pending) {
 // caller sends the request again.
 func (q *targetQueue) headerArrived(p *pending) bool {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if !p.preempted {
 		p.headered = true
+		q.mu.Unlock()
 		return true
 	}
-	return !q.endSend(p)
+	stands := !q.endSend(p)
+	q.mu.Unlock()
+	if !stands {
+		q.notifyDrained()
+	}
+	return stands
 }
 
 // sendEnded records a send ending without an answer to relay — its call
@@ -382,8 +454,10 @@ func (q *targetQueue) headerArrived(p *pending) bool {
 // or relaying anything.
 func (q *targetQueue) sendEnded(p *pending) bool {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.endSend(p)
+	preempted := q.endSend(p)
+	q.mu.Unlock()
+	q.notifyDrained()
+	return preempted
 }
 
 // unavailableForNewSessions reports whether the queue has held arrivals for
@@ -410,6 +484,24 @@ func (q *targetQueue) requeueBehindContent(p *pending) bool {
 	}
 	q.insert(p)
 	return true
+}
+
+// idle reports whether no request of the target is outstanding at its
+// backend.
+func (q *targetQueue) idle() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.outstanding) == 0
+}
+
+// notifyDrained runs the queue's drain notification when no request is
+// outstanding. It runs without q.mu held, since the notification takes the
+// server's lock; a request arriving first only defers the notification to
+// its own ending.
+func (q *targetQueue) notifyDrained() {
+	if q.idle() {
+		q.drained()
+	}
 }
 
 // endSend takes p's send out of the target's outstanding requests, admits
@@ -524,14 +616,15 @@ func (q *targetQueue) confirm(p *pending) bool {
 // admits another waiter, so each attempt must be finished once.
 func (q *targetQueue) finish(p *pending) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.dropOutstanding(p)
 	q.dropWaiting(p)
 	if p.confirmed {
 		q.admit()
-		return
+	} else {
+		q.admitIfAllOutstandingConfirmed()
 	}
-	q.admitIfAllOutstandingConfirmed()
+	q.mu.Unlock()
+	q.notifyDrained()
 }
 
 // admitIfAllOutstandingConfirmed admits the queue's head once every request

@@ -7941,6 +7941,73 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{refusedMessage},
 		}
 	})
+	tests.AddFunc("should hold a request that a server refused as busy while streaming a request for another of its models, and send it to the server once that stream ends", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+		)
+		// The stream ends well after the refusal, so a second send can only
+		// follow the stream's end.
+		streamEndsAfter := 3 * admissionGracePeriod
+		received := &receivedMessages{}
+		var streamEnded atomic.Bool
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(streamEndsAfter):
+						}
+						streamEnded.Store(true)
+						return 0, io.EOF
+					})),
+				}, nil
+			case refusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusServiceUnavailable,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
+					}, nil
+				}
+				if !streamEnded.Load() {
+					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, streamingMessage)
+				}
+				return admissionJSON(inboundMessage), nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
+			},
+			// The stream is still open, and each request has been sent once.
+			reached: map[string][]string{"openai": {streamingMessage, refusedMessage}},
+			// The refused request appears twice: its second send follows the
+			// stream's end, and its client receives that send's answer.
+			secondCheckAt:        admissionGracePeriod/4 + streamEndsAfter + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage}},
+			answered:             []string{refusedMessage},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
+	// refused as busy while a backend with the same address but a different
+	// API key streams a request: it is sent again without waiting for that
+	// stream.
 	tests.AddFunc("should send a session's first request to the second target when the first target has been busy for the failover threshold and answers the request with a rate limit and no retry-after", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"

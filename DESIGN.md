@@ -1196,16 +1196,24 @@ key (§Understudy) — because that is the scope a provider limits and the scope
 local server hands out slots on: Kronk's admission permits and Ollama's
 parallel slots are both per loaded model. One server's models contend with each
 other only across a model swap, and that contention is **linked by evidence**:
-a busy refusal (a swap refused because the loaded model is mid-stream) links the
-server's models into one ranking. While linked, the loaded model's queue stops
-admitting whenever the top-ranked waiter is for another model; its running
-requests finish undisturbed, and the waiter is admitted the moment Understudy's
-own count of the loaded model's running requests reaches zero, so the swap
-lands on an idle entry rather than being refused again. The link ends when
-either queue drains. On a server with several slots the swap waits for the
-longest remaining request, which leaves the GPU running near full speed while
-the last slots drain — a small loss next to starving one model, and only paid
-when the top rank changes model. A server that loads models one at a time on
+a busy refusal (a request refused because the models already running leave no
+room for its model) links the server's models into one ranking. Understudy
+cannot tell which running models are in the way — that depends on model sizes
+it does not know — so it finds out by trying. While linked, the server's
+running models stop taking new requests whenever the top-ranked waiter is for
+a model the server refused; their running requests finish undisturbed. Each
+time one of those models has no request left running, the waiter is sent
+again: if the server takes it, it runs alongside the models still running; if
+the server refuses it again, it waits for the next model to finish. A refusal
+costs little — the server answers it at once — so a request that fits once one
+model has finished starts then, and one that needs the server to itself starts
+once every running model has finished. The link ends when either queue drains.
+On a server with several slots the swap waits for the longest remaining
+request, which leaves the GPU running near full speed while the last slots
+drain — a small loss next to starving one model, and only paid when the top
+rank changes model. Only a busy refusal links models: a cloud provider's
+account-wide limits are met by the concurrency cap, which every model on the
+account shares. A server that loads models one at a time on
 its own (Ollama holds other requests while a load is pending) needs no link.
 
 **What forms a queue.** A request that has received no response header after a

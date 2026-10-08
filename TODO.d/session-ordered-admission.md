@@ -92,23 +92,24 @@ limiter. The steps below remain, in order.
   (`notes/kronk.md` #2), so no rule may key on the code.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
     admitted; a bare 429 with nothing running takes the ladder.
-- **Linked models.** A busy refusal (`providers.ErrServerBusy`) links the queues
-  of every model on that server into one ranking. While linked, the loaded
-  model's queue stops admitting when the top-ranked waiter is for another model,
-  and that waiter is admitted when Understudy's count of the loaded model's
-  running requests reaches zero. A request re-queued by the 429 rule counts
-  progress across the linked set. The link ends when either queue drains. This
-  must suspend refill for the loaded model too, not only growth — refill admits
-  unconditionally on a completion (DESIGN.md §Session-Ordered Admission, *How
-  many requests a target holds*), so without this carve-out it would keep
-  feeding the loaded model a replacement every time one finishes and its running
-  count would never reach zero, and the swap would never happen.
-  - Tests: an older session's request for the unloaded model is served before a
-    younger session's request for the loaded one; the loaded model's running
-    requests are never canceled for the swap; the swap request is sent only
-    once no request for the loaded model is running; a request waiting for the
-    loaded model itself is not refilled while a higher-ranked waiter for the
-    other model is pending.
+- **Linked models** (DESIGN.md, *The queue is keyed on the target*). The
+  refused request is sent again each time one of the server's running models
+  has no request left running, not only once every model is idle; refused
+  again, it waits for the next. Rank the waiting requests of every model on
+  the server together, and while the top-ranked waiter is for a model the
+  server refused, stop the server's running models taking new requests —
+  refill included, since refill admits on every completion (*How many requests
+  a target holds*) and would keep a running model from ever finishing. A
+  request re-queued by the 429 rule counts progress across the linked set.
+  - Tests: with two models running, a refused request that fits alongside one
+    of them is sent when either finishes, and one that needs the server to
+    itself is refused again then and sent once both have finished; an older
+    session's request for a refused model is served before a younger
+    session's request for a running one; the running models' requests finish
+    undisturbed; a running model takes no new request while a higher-ranked
+    waiter for a refused model is pending; a request refused as busy is held
+    only for requests on its own account, not one sharing the address under
+    another API key.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with
