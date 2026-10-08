@@ -8089,6 +8089,98 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{refusedMessage},
 		}
 	})
+	tests.AddFunc("should hold a second request for a model when a request for another of the server's models ends, once the server refused the model's first request as busy and then accepted it", func(t *testing.T) test {
+		const (
+			firstStreamingMessage  = "the first streaming session asks"
+			secondStreamingMessage = "the second streaming session asks"
+			refusedMessage         = "the refused session asks"
+			waitingMessage         = "the waiting session asks"
+		)
+		// Times are measured from the first arrival, not from the previous
+		// request.
+		secondArrives := admissionGracePeriod / 2
+		refusedArrives := admissionGracePeriod
+		firstEnds := refusedArrives + admissionGracePeriod + admissionGracePeriod/2
+		// The re-sent request has been at the server with no answer past its
+		// grace period by then, so the model's own admission rule holds the
+		// waiting request.
+		waitingArrives := firstEnds + admissionGracePeriod + admissionGracePeriod/2
+		secondEnds := waitingArrives + admissionGracePeriod/2
+		checkAt := secondEnds + admissionGracePeriod/2
+		received := &receivedMessages{}
+		var firstEnded atomic.Bool
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case firstStreamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(firstEnds):
+						}
+						firstEnded.Store(true)
+						return 0, io.EOF
+					})),
+				}, nil
+			case secondStreamingMessage:
+				reads := 0
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+						reads++
+						if reads == 1 {
+							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+						}
+						select {
+						case <-r.Context().Done():
+							return 0, context.Cause(r.Context())
+						case <-time.After(secondEnds - secondArrives):
+						}
+						return 0, io.EOF
+					})),
+				}, nil
+			case refusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusServiceUnavailable,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
+					}, nil
+				}
+				if !firstEnded.Load() {
+					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, firstStreamingMessage)
+				}
+			case waitingMessage:
+			}
+			// Both the accepted re-send and the waiting request stay unanswered
+			// through the check.
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{firstStreamingMessage}},
+				{model: "openai/c", userMessages: []string{secondStreamingMessage}, after: secondArrives},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: refusedArrives - secondArrives},
+				{model: "openai/b", userMessages: []string{waitingMessage}, after: waitingArrives - refusedArrives},
+			},
+			reached:              map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage}},
+			secondCheckAt:        checkAt,
+			reachedAtSecondCheck: map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage}},
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
 	// refused as busy while a backend with the same address but a different
 	// API key streams a request: it is sent again without waiting for that

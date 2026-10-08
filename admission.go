@@ -149,28 +149,18 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	return false
 }
 
-// modelsDrained admits the waiting requests a busy refusal linked to the
-// server's models after each model drains, not once all are idle: a request
-// the server refuses again is linked back to wait for the next model to
-// finish. Once no request is running at any of the server's models, the
-// link ends.
+// modelsDrained admits each queue linked to the server's models by a busy
+// refusal, once one of the linked queues drains. Each queue's own admission
+// rule re-runs, so a request refused again forms a new link.
 func (s *server) modelsDrained(upstream string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	linked := s.busyLinks[upstream]
 	if len(linked) == 0 {
+		s.mu.Unlock()
 		return
 	}
-	idle := true
-	for _, q := range s.admission {
-		if q.upstream != upstream || q.idle() {
-			continue
-		}
-		idle = false
-	}
-	if idle {
-		delete(s.busyLinks, upstream)
-	}
+	delete(s.busyLinks, upstream)
+	s.mu.Unlock()
 	for q := range linked {
 		q.mu.Lock()
 		q.admit()

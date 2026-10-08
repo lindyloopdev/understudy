@@ -2534,8 +2534,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// understudy invents — but the base is scaled so jitter's floor still
 		// clears rateLimitDemotionThreshold, or a scattered draw could flip its
 		// own classification to transientRate and silently stop demoting.
-		// TODO(TODO.d/session-ordered-admission.md): end the link a busy
-		// refusal forms when either model's queue drains.
 		if errors.Is(err, providers.ErrServerBusy) {
 			base := time.Duration(float64(rateLimitDemotionThreshold) / (1 - s.jitterFactor))
 			err = retryAfterError{
