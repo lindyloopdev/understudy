@@ -92,19 +92,18 @@ limiter. The steps below remain, in order.
   (`notes/kronk.md` #2), so no rule may key on the code.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
     admitted; a bare 429 with nothing running takes the ladder.
-- **Linked models** (DESIGN.md, *The queue is keyed on the target*). The
-  refused request is sent again each time one of the server's running models
-  has no request left running, not only once every model is idle; refused
-  again, it waits for the next. Rank the waiting requests of every model on
-  the server together, and while the top-ranked waiter is for a model the
-  server refused, stop the server's running models taking new requests —
-  refill included, since refill admits on every completion (*How many requests
-  a target holds*) and would keep a running model from ever finishing. A
-  request re-queued by the 429 rule counts progress across the linked set.
-  - Tests: with two models running, a refused request that fits alongside one
-    of them is sent when either finishes, and one that needs the server to
-    itself is refused again then and sent once both have finished; an older
-    session's request for a refused model is served before a younger
+- **Linked models** (DESIGN.md, *The queue is keyed on the target*). Refused
+  again, the request waits for the next of the server's running models to
+  finish. Rank the waiting requests of every model on the server together,
+  and while the top-ranked waiter is for a model the server refused, stop the
+  server's running models taking new requests — refill included, since refill
+  admits on every completion (*How many requests a target holds*) and would
+  keep a running model from ever finishing. A request re-queued by the 429
+  rule counts progress across the linked set.
+  - Tests: with two models running, a refused request that needs the server
+    to itself is refused again when the first finishes and sent once both
+    have finished; an
+    older session's request for a refused model is served before a younger
     session's request for a running one; the running models' requests finish
     undisturbed; a running model takes no new request while a higher-ranked
     waiter for a refused model is pending; a request refused as busy is held

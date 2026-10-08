@@ -124,15 +124,12 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 
 // queueBehindServerBusy returns p to its target's waiting line behind a busy
 // refusal, reporting whether it did — but only when another of the server's
-// models has a request running; waiting until no request runs at any of the
-// server's models lands the refused model swap on an idle entry rather than
-// a second refusal.
+// models has a request running: a busy refusal with nothing running on the
+// server is the server's answer about the model itself.
 //
-// TODO(TODO.d/session-ordered-admission.md): send the request again each
-// time one of the server's running models finishes, not only once all are
-// idle; rank the server's waiting requests together across its models; and
-// stop the running models taking new requests while a refused model's
-// request waits.
+// TODO(TODO.d/session-ordered-admission.md): rank the server's waiting
+// requests together across its models; and stop the running models taking
+// new requests while a refused model's request waits.
 func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -153,7 +150,10 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 }
 
 // modelsDrained admits the waiting requests a busy refusal linked to the
-// server's models, once no request is running at any of them.
+// server's models after each model drains, not once all are idle: a request
+// the server refuses again is linked back to wait for the next model to
+// finish. Once no request is running at any of the server's models, the
+// link ends.
 func (s *server) modelsDrained(upstream string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,14 +161,16 @@ func (s *server) modelsDrained(upstream string) {
 	if len(linked) == 0 {
 		return
 	}
+	idle := true
 	for _, q := range s.admission {
 		if q.upstream != upstream || q.idle() {
 			continue
 		}
-		// A model still running; its own drain re-runs this.
-		return
+		idle = false
 	}
-	delete(s.busyLinks, upstream)
+	if idle {
+		delete(s.busyLinks, upstream)
+	}
 	for q := range linked {
 		q.mu.Lock()
 		q.admit()
