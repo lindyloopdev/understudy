@@ -102,11 +102,19 @@ limiter. The steps below remain, in order.
     to itself is refused again when the first finishes and sent once both
     have finished; an older session's request for a refused model is served
     before a younger session's request for a running one; the running
-    models' requests finish undisturbed; a new request held while a
-    refused request waited is sent once the refused request has been sent,
-    when nothing is running at its model; a request refused as busy is held
+    models' requests finish undisturbed; a request refused as busy is held
     only for requests on its own account, not one sharing the address under
-    another API key.
+    another API key; the refused request's second send, refused as busy
+    again while nothing is running on the server, still sends the held new
+    request; the refused request's client leaving while it waits still
+    sends the held new request; with two models streaming, the re-sent
+    request refused as busy again is not sent until the second stream ends,
+    and a new request for the first stream's model, held while the refused
+    request waited, is sent only once the server takes the re-sent request;
+    a request for a model of the server that
+    was not running at the refusal getting its response header while the
+    refused request still waits keeps the held new request held until the
+    refused request is no longer waiting.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

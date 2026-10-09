@@ -2513,6 +2513,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				swapWaits := !preempted && errors.Is(sendErr, providers.ErrServerBusy) && s.queueBehindServerBusy(upstream, pend)
 				if !swapWaits && !preempted &&
 					(!waitsAtTarget || classifyLimit(sendErr).condition != bareRateLimit || !pend.queue.requeueBehindContent(pend)) {
+					// This answer goes to the client, ending the
+					// request's wait at the target — and with it any
+					// wait behind a busy refusal.
+					s.serverBusyWaitEnded(upstream, pend)
 					err = sendErr
 					break
 				}

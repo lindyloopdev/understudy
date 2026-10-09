@@ -116,6 +116,7 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 			firstContentSchedule: s.firstContentSchedule,
 			failoverThreshold:    s.failoverThreshold,
 			drained:              func() { s.modelsDrained(upstream) },
+			headered:             func() { s.modelsResumed(upstream) },
 		}
 		s.admission[key] = q
 	}
@@ -144,6 +145,7 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	}
 	p.queue.mu.Lock()
 	p.queue.insert(p)
+	p.serverBusyWait = true
 	p.queue.mu.Unlock()
 	if s.busyLinks[upstream] == nil {
 		s.busyLinks[upstream] = make(map[*targetQueue]struct{})
@@ -158,8 +160,10 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 }
 
 // modelsDrained admits each queue linked to the server's models by a busy
-// refusal, once one of the linked queues drains. Each queue's own admission
-// rule re-runs, so a request refused again forms a new link.
+// refusal, once one of the server's queues has no request outstanding. Each
+// queue's own admission rule re-runs, so a request refused again forms a new
+// link; queues the wait holds stay held — [server.modelsResumed] releases
+// them once the server takes the re-sent request.
 func (s *server) modelsDrained(upstream string) {
 	s.mu.Lock()
 	linked := s.busyLinks[upstream]
@@ -168,20 +172,53 @@ func (s *server) modelsDrained(upstream string) {
 		return
 	}
 	delete(s.busyLinks, upstream)
-	for _, q := range s.admission {
-		if q.upstream != upstream {
-			continue
-		}
-		q.mu.Lock()
-		q.refusedModelWaiting = false
-		q.mu.Unlock()
-	}
 	s.mu.Unlock()
 	for q := range linked {
 		q.mu.Lock()
 		q.admit()
 		q.mu.Unlock()
 	}
+}
+
+// modelsResumed lets the server's models take requests again once the
+// request a busy refusal queued is no longer waiting on the server: its
+// re-send drew a standing response header, or was answered without the
+// server taking it ([server.serverBusyWaitEnded]).
+func (s *server) modelsResumed(upstream string) {
+	s.mu.Lock()
+	var holding []*targetQueue
+	for _, q := range s.admission {
+		if q.upstream != upstream {
+			continue
+		}
+		q.mu.Lock()
+		if q.refusedModelWaiting {
+			holding = append(holding, q)
+			q.refusedModelWaiting = false
+		}
+		q.mu.Unlock()
+	}
+	s.mu.Unlock()
+	for _, q := range holding {
+		q.mu.Lock()
+		q.admitIfAllOutstandingConfirmed()
+		q.mu.Unlock()
+	}
+}
+
+// serverBusyWaitEnded ends the request's wait behind a busy refusal: the
+// re-send was answered without the server taking it — no response header
+// stood, so its error goes to the client. A request not waiting behind a
+// busy refusal changes nothing.
+func (s *server) serverBusyWaitEnded(upstream string, p *pending) {
+	p.queue.mu.Lock()
+	waiting := p.serverBusyWait
+	p.serverBusyWait = false
+	p.queue.mu.Unlock()
+	if !waiting {
+		return
+	}
+	s.modelsResumed(upstream)
 }
 
 // targetQueue orders admission to one target by session age: the backend
@@ -211,11 +248,14 @@ type targetQueue struct {
 	// taken from the server at the queue's creation and runs without q.mu
 	// held.
 	drained func()
+	// headered runs when a send's response header arrives and the send
+	// stands; it is taken from the server at the queue's creation and runs
+	// without q.mu held.
+	headered func()
 	// refusedModelWaiting is set while a request the server refused as busy
-	// waits for one of the server's models to finish: the model's running
-	// requests finish undisturbed, but it takes no new request until a queue
-	// on the server has no request outstanding. The server sets and clears
-	// it under q.mu.
+	// waits on the server, through the re-send that ends the wait: the
+	// model's running requests finish undisturbed, but it takes no new
+	// request until then. The server sets and clears it under q.mu.
 	refusedModelWaiting bool
 }
 
@@ -245,6 +285,12 @@ type pending struct {
 	// waiter, leaving the freed place to the refused model's request, and the
 	// wait owes no refill once it ends.
 	endedWhileRefusedModelWaiting bool
+	// serverBusyWait is set while this attempt waits behind a busy refusal
+	// and its wait holds the server's other models from taking new requests:
+	// from the refusal until the server takes the re-sent request, or the
+	// wait ends in an answer to the client. The server sets and clears it
+	// under q.mu.
+	serverBusyWait bool
 }
 
 // pastGrace reports whether p's grace period has elapsed as of now.
@@ -457,7 +503,11 @@ func (q *targetQueue) headerArrived(p *pending) bool {
 	q.mu.Lock()
 	if !p.preempted {
 		p.headered = true
+		// The server took the re-sent request, ending the hold its
+		// wait had on the server's other models.
+		p.serverBusyWait = false
 		q.mu.Unlock()
+		q.headered()
 		return true
 	}
 	stands := !q.endSend(p)

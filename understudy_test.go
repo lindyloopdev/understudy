@@ -5659,19 +5659,7 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 				if !attempts.waitUntil(r, i, opens) {
 					return nil, context.Cause(r.Context())
 				}
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						<-r.Context().Done()
-						return 0, context.Cause(r.Context())
-					})),
-				}, nil
+				return admissionStream(r, nil, nil), nil
 			}
 			if !attempts.waitUntil(r, i, opens) {
 				return nil, context.Cause(r.Context())
@@ -5956,19 +5944,7 @@ func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atO
 		if inboundMessage != admissionLongMessage {
 			return admissionJSON(inboundMessage), nil
 		}
-		reads := 0
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": {"text/event-stream"}},
-			Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-				reads++
-				if reads == 1 {
-					return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-				}
-				<-r.Context().Done()
-				return 0, context.Cause(r.Context())
-			})),
-		}, nil
+		return admissionStream(r, nil, nil), nil
 	})
 }
 
@@ -6115,6 +6091,42 @@ func admissionJSON(id string) *http.Response {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":%q}`, id))),
+	}
+}
+
+// admissionStream answers with first content at once and keeps the stream
+// open until ends delivers, then runs ended, if given, and ends the stream; a
+// nil ends keeps it open until the request is canceled.
+func admissionStream(r *http.Request, ends <-chan time.Time, ended func()) *http.Response {
+	reads := 0
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+			reads++
+			if reads == 1 {
+				return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+			}
+			select {
+			case <-r.Context().Done():
+				return 0, context.Cause(r.Context())
+			case <-ends:
+			}
+			if ended != nil {
+				ended()
+			}
+			return 0, io.EOF
+		})),
+	}
+}
+
+// admissionServerBusy is a server's refusal of a request because the models
+// it is already running leave no room for the request's model.
+func admissionServerBusy() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
 	}
 }
 
@@ -7287,23 +7299,7 @@ func TestShouldSendTwoHeldRequestsAtOnceWhenTwoStreamingAnswersEndTogether(t *te
 			case "first confirmed", "second confirmed":
 				// Sends first content immediately (confirming it) and
 				// ends at ends.
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-attempts.after(ends):
-							return 0, io.EOF
-						}
-					})),
-				}, nil
+				return admissionStream(r, attempts.after(ends), nil), nil
 			case "unconfirmed":
 				// Never answers, keeping the target unconfirmed.
 				<-r.Context().Done()
@@ -7896,23 +7892,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch inboundMessage {
 			case streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(streamEndsAfter):
-						}
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(streamEndsAfter), nil), nil
 			case refusedMessage:
 				if received.count(inboundMessage) == 1 {
 					return &http.Response{
@@ -7955,31 +7935,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch inboundMessage {
 			case streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(streamEndsAfter):
-						}
-						streamEnded.Store(true)
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(streamEndsAfter), func() { streamEnded.Store(true) }), nil
 			case refusedMessage:
 				if received.count(inboundMessage) == 1 {
-					return &http.Response{
-						StatusCode: http.StatusServiceUnavailable,
-						Header:     http.Header{"Content-Type": {"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
-					}, nil
+					return admissionServerBusy(), nil
 				}
 				if !streamEnded.Load() {
 					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, streamingMessage)
@@ -8006,7 +7965,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	})
 	// The refused request's session is seen before the new request's, so it
 	// is the one waiting that ranks first among the server's.
-	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and send the refused request once the stream ends", func(t *testing.T) test {
+	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"
 			refusedMessage   = "the refused session asks"
@@ -8021,31 +7980,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch inboundMessage {
 			case streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(streamEndsAfter):
-						}
-						streamEnded.Store(true)
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(streamEndsAfter), func() { streamEnded.Store(true) }), nil
 			case refusedMessage:
 				if received.count(inboundMessage) == 1 {
-					return &http.Response{
-						StatusCode: http.StatusServiceUnavailable,
-						Header:     http.Header{"Content-Type": {"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
-					}, nil
+					return admissionServerBusy(), nil
 				}
 				if !streamEnded.Load() {
 					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, streamingMessage)
@@ -8062,18 +8000,83 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				{model: "openai/b", userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
 				{model: "openai/a", userMessages: []string{newMessage}, after: admissionGracePeriod / 4},
 			},
-			// The stream is still open, and each request has been sent once.
+			// The stream is still open, the refused request waits, and the
+			// new request is held.
 			reached: map[string][]string{"openai": {streamingMessage, refusedMessage}},
 			// The refused request appears twice: its second send follows the
-			// stream's end, and its client receives that send's answer.
+			// stream's end, and its client receives that send's answer. The
+			// held new request is sent after that second send, and its
+			// client receives an answer too.
 			secondCheckAt:        streamEndsAfter + 2*time.Second,
-			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage}},
-			answered:             []string{refusedMessage},
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
+			answered:             []string{refusedMessage, newMessage},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for the new
-	// request held while the refused request waited: once the refused request
-	// has been sent, it is sent too, when nothing is running at its model.
+	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server answers the refused request's second send with an error naming the request", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			newMessage       = "the new session asks"
+		)
+		// The stream ends well after the new request arrives, so the new
+		// request's hold, not timing, is what keeps it from the server.
+		streamEndsAfter := 3 * admissionGracePeriod
+		received := &receivedMessages{}
+		var streamEnded atomic.Bool
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStream(r, time.After(streamEndsAfter), func() { streamEnded.Store(true) }), nil
+			case refusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return admissionServerBusy(), nil
+				}
+				if !streamEnded.Load() {
+					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, streamingMessage)
+				}
+				// The error is about the request itself, not the
+				// server's being busy, so it ends the request rather
+				// than re-queueing it behind the busy refusal.
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, inboundMessage+" is not a request the server serves"))),
+				}, nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
+				{model: "openai/a", userMessages: []string{newMessage}, after: admissionGracePeriod / 4},
+			},
+			// The stream is still open, the refused request waits, and the
+			// new request is held.
+			reached: map[string][]string{"openai": {streamingMessage, refusedMessage}},
+			// The refused request appears twice: its second send follows
+			// the stream's end, and its client receives that send's error.
+			// The held new request is sent after that second send, and its
+			// client receives an answer too.
+			secondCheckAt:        streamEndsAfter + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
+			answered:             []string{newMessage},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here where the
+	// refused request's second send is refused as busy again while nothing
+	// is running on the server, and the held new request is still sent.
+	// TODO(TODO.d/session-ordered-admission.md): a row here where the
+	// refused request's client leaves while it waits, and the held new
+	// request is sent.
+	// TODO(TODO.d/session-ordered-admission.md): a row here where a request
+	// for a model of the server that was not running at the refusal gets
+	// its response header while the refused request still waits, and the
+	// held new request stays held until the refused request is no longer
+	// waiting.
 	tests.AddFunc("should send a request that a server refused as busy to the server again once one of two requests streaming there has ended, and answer the request's client while the other still streams", func(t *testing.T) test {
 		const (
 			firstStreamingMessage  = "the first streaming session asks"
@@ -8094,49 +8097,12 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch inboundMessage {
 			case firstStreamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(firstEnds):
-						}
-						firstEnded.Store(true)
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(firstEnds), func() { firstEnded.Store(true) }), nil
 			case secondStreamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(secondEnds - secondArrives):
-						}
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(secondEnds-secondArrives), nil), nil
 			case refusedMessage:
 				if received.count(inboundMessage) == 1 {
-					return &http.Response{
-						StatusCode: http.StatusServiceUnavailable,
-						Header:     http.Header{"Content-Type": {"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
-					}, nil
+					return admissionServerBusy(), nil
 				}
 				if !firstEnded.Load() {
 					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, firstStreamingMessage)
@@ -8159,6 +8125,11 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{refusedMessage},
 		}
 	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here where the server
+	// refuses the re-sent request as busy again while the second stream still
+	// runs, and a new request for the first stream's model, held while the
+	// refused request waited, is still not sent until the server takes the
+	// refused request once the second stream ends.
 	tests.AddFunc("should hold a second request for a model when a request for another of the server's models ends, once the server refused the model's first request as busy and then accepted it", func(t *testing.T) test {
 		const (
 			firstStreamingMessage  = "the first streaming session asks"
@@ -8183,49 +8154,12 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch inboundMessage {
 			case firstStreamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(firstEnds):
-						}
-						firstEnded.Store(true)
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(firstEnds), func() { firstEnded.Store(true) }), nil
 			case secondStreamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(secondEnds - secondArrives):
-						}
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(secondEnds-secondArrives), nil), nil
 			case refusedMessage:
 				if received.count(inboundMessage) == 1 {
-					return &http.Response{
-						StatusCode: http.StatusServiceUnavailable,
-						Header:     http.Header{"Content-Type": {"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"server busy","code":"unavailable"}}`)),
-					}, nil
+					return admissionServerBusy(), nil
 				}
 				if !firstEnded.Load() {
 					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, firstStreamingMessage)
@@ -8280,19 +8214,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			receivedA.add(inboundMessage)
 			switch inboundMessage {
 			case streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						<-r.Context().Done()
-						return 0, context.Cause(r.Context())
-					})),
-				}, nil
+				return admissionStream(r, nil, nil), nil
 			case refusedMessage:
 				if receivedA.count(inboundMessage) == 1 {
 					select {
@@ -8360,23 +8282,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			receivedA.add(inboundMessage)
 			switch inboundMessage {
 			case streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(streamEnds - laterArrives/2):
-						}
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(streamEnds-laterArrives/2), nil), nil
 			case later:
 				if receivedA.count(inboundMessage) == 1 {
 					select {
@@ -8424,23 +8330,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			received.add(inboundMessage)
 			switch {
 			case inboundMessage == streamingMessage:
-				reads := 0
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/event-stream"}},
-					Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
-						reads++
-						if reads == 1 {
-							return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
-						}
-						select {
-						case <-r.Context().Done():
-							return 0, context.Cause(r.Context())
-						case <-time.After(streamEndsAfter):
-						}
-						return 0, io.EOF
-					})),
-				}, nil
+				return admissionStream(r, time.After(streamEndsAfter), nil), nil
 			case inboundMessage == refusedMessage && received.count(inboundMessage) == 1:
 				return &http.Response{
 					StatusCode: http.StatusTooManyRequests,
