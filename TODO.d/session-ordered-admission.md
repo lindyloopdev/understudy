@@ -95,18 +95,16 @@ limiter. The steps below remain, in order.
 - **Linked models** (DESIGN.md, *The queue is keyed on the target*). Refused
   again, the request waits for the next of the server's running models to
   finish. Rank the waiting requests of every model on the server together,
-  and while the top-ranked waiter is for a model the server refused, stop the
-  server's running models taking new requests — refill included, since refill
-  admits on every completion (*How many requests a target holds*) and would
-  keep a running model from ever finishing. A request re-queued by the 429
-  rule counts progress across the linked set.
+  so the top-ranked waiter decides whether the running models keep taking
+  new requests. A request re-queued by the 429 rule counts progress across
+  the linked set.
   - Tests: with two models running, a refused request that needs the server
     to itself is refused again when the first finishes and sent once both
-    have finished; an
-    older session's request for a refused model is served before a younger
-    session's request for a running one; the running models' requests finish
-    undisturbed; a running model takes no new request while a higher-ranked
-    waiter for a refused model is pending; a request refused as busy is held
+    have finished; an older session's request for a refused model is served
+    before a younger session's request for a running one; the running
+    models' requests finish undisturbed; a new request held while a
+    refused request waited is sent once the refused request has been sent,
+    when nothing is running at its model; a request refused as busy is held
     only for requests on its own account, not one sharing the address under
     another API key.
 - **The consumer's time limit.** An optional library setting (Lindy supplies

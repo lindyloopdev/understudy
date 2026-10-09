@@ -128,25 +128,33 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 // server is the server's answer about the model itself.
 //
 // TODO(TODO.d/session-ordered-admission.md): rank the server's waiting
-// requests together across its models; and stop the running models taking
-// new requests while a refused model's request waits.
+// requests together across its models.
 func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var running []*targetQueue
 	for _, q := range s.admission {
 		if q.upstream != upstream || q.idle() {
 			continue
 		}
-		p.queue.mu.Lock()
-		p.queue.insert(p)
-		p.queue.mu.Unlock()
-		if s.busyLinks[upstream] == nil {
-			s.busyLinks[upstream] = make(map[*targetQueue]struct{})
-		}
-		s.busyLinks[upstream][p.queue] = struct{}{}
-		return true
+		running = append(running, q)
 	}
-	return false
+	if len(running) == 0 {
+		return false
+	}
+	p.queue.mu.Lock()
+	p.queue.insert(p)
+	p.queue.mu.Unlock()
+	if s.busyLinks[upstream] == nil {
+		s.busyLinks[upstream] = make(map[*targetQueue]struct{})
+	}
+	s.busyLinks[upstream][p.queue] = struct{}{}
+	for _, q := range running {
+		q.mu.Lock()
+		q.refusedModelWaiting = true
+		q.mu.Unlock()
+	}
+	return true
 }
 
 // modelsDrained admits each queue linked to the server's models by a busy
@@ -160,6 +168,14 @@ func (s *server) modelsDrained(upstream string) {
 		return
 	}
 	delete(s.busyLinks, upstream)
+	for _, q := range s.admission {
+		if q.upstream != upstream {
+			continue
+		}
+		q.mu.Lock()
+		q.refusedModelWaiting = false
+		q.mu.Unlock()
+	}
 	s.mu.Unlock()
 	for q := range linked {
 		q.mu.Lock()
@@ -195,6 +211,12 @@ type targetQueue struct {
 	// taken from the server at the queue's creation and runs without q.mu
 	// held.
 	drained func()
+	// refusedModelWaiting is set while a request the server refused as busy
+	// waits for one of the server's models to finish: the model's running
+	// requests finish undisturbed, but it takes no new request until a queue
+	// on the server has no request outstanding. The server sets and clears
+	// it under q.mu.
+	refusedModelWaiting bool
 }
 
 // pending is one attempt's standing at a target queue: its rank, when it
@@ -218,6 +240,11 @@ type pending struct {
 	firstContentTimeouts int
 	// firstContentTimer is the first-content timeout now in force, if any.
 	firstContentTimer *time.Timer
+	// endedWhileRefusedModelWaiting records that the attempt ended while a
+	// refused model's request waited on the server: the completion admits no
+	// waiter, leaving the freed place to the refused model's request, and the
+	// wait owes no refill once it ends.
+	endedWhileRefusedModelWaiting bool
 }
 
 // pastGrace reports whether p's grace period has elapsed as of now.
@@ -300,9 +327,11 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 		o.cancel(errPreempted)
 	}
 	// Growth is speculative: an arrival that displaces nothing still waits
-	// behind any request unconfirmed past its grace period, headered or not.
+	// behind any request unconfirmed past its grace period, headered or not
+	// — or, while a refused model's request waits on the server, behind that
+	// wait too.
 	_, held := q.holdingSinceLocked(now)
-	if held {
+	if held || q.refusedModelWaiting {
 		q.insert(p)
 		if moveOn != nil {
 			at, _ := q.failoverCrossingLocked(now)
@@ -497,10 +526,12 @@ func (q *targetQueue) notifyDrained() {
 }
 
 // endSend takes p's send out of the target's outstanding requests, admits
-// whoever that frees a place for, and reports whether the send was
+// whoever that frees a place for — no one while a refused model's request
+// waits on the server — and reports whether the send was
 // preempted before any content. Caller holds q.mu.
 func (q *targetQueue) endSend(p *pending) bool {
 	q.dropOutstanding(p)
+	p.endedWhileRefusedModelWaiting = q.refusedModelWaiting
 	q.admitIfAllOutstandingConfirmed()
 	return p.preempted && !p.confirmed
 }
@@ -584,7 +615,8 @@ func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 }
 
 // confirm records p's first content — the moment the target has begun
-// answering — which frees the queue to admit its next waiter, and reports
+// answering — which frees the queue to admit its next waiter unless a
+// refused model's request waits on the server, and reports
 // whether the send still stands. A preempted send — by an outranking arrival,
 // or by its own first-content timeout — does not: its content is discarded,
 // and the caller sends the client nothing.
@@ -604,16 +636,20 @@ func (q *targetQueue) confirm(p *pending) bool {
 // finish ends p's standing at the target: its attempt is over, so it holds the
 // queue's next admission no longer. A confirmed p refills its slot at once,
 // with no grace check; any other ending admits only through growth's
-// grace-gated check. It is not idempotent: finishing a confirmed p again
-// admits another waiter, so each attempt must be finished once.
+// grace-gated check — unless a refused model's request waited on the server
+// when the send ended, in which case the completion admits no one. It is not
+// idempotent: finishing a confirmed p again admits another waiter, so each
+// attempt must be finished once.
 func (q *targetQueue) finish(p *pending) {
 	q.mu.Lock()
 	q.dropOutstanding(p)
 	q.dropWaiting(p)
-	if p.confirmed {
-		q.admit()
-	} else {
-		q.admitIfAllOutstandingConfirmed()
+	if !p.endedWhileRefusedModelWaiting {
+		if p.confirmed {
+			q.admit()
+		} else {
+			q.admitIfAllOutstandingConfirmed()
+		}
 	}
 	q.mu.Unlock()
 	q.notifyDrained()
@@ -621,12 +657,16 @@ func (q *targetQueue) finish(p *pending) {
 
 // admitIfAllOutstandingConfirmed admits the queue's head once every request
 // outstanding at the target has confirmed: once a queue exists, one request at
-// a time sits at the target between confirmations. Caller holds q.mu.
+// a time sits at the target between confirmations. It admits no one while a
+// refused model's request waits on the server. Caller holds q.mu.
 func (q *targetQueue) admitIfAllOutstandingConfirmed() {
 	for _, o := range q.outstanding {
 		if !o.confirmed {
 			return
 		}
+	}
+	if q.refusedModelWaiting {
+		return
 	}
 	q.admit()
 }
