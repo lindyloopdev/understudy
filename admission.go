@@ -164,7 +164,9 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 // running at the refusal — has no request outstanding. Each queue's own
 // admission rule re-runs, so a request refused again forms a new link;
 // queues the wait holds stay held — [server.modelsResumed] releases them
-// once the server takes the re-sent request.
+// once the server takes the re-sent request, and
+// [server.serverBusyWaitEnded] releases the waiting request's own queue
+// when its wait ends.
 func (s *server) modelsDrained(upstream string, drainedQueue *targetQueue) {
 	// s.mu, which every write to refusedModelWaiting also holds, makes this
 	// check atomic with the link's removal below.
@@ -235,7 +237,9 @@ func (s *server) modelsResumed(upstream string) {
 // re-send was answered without the server taking it — no response header
 // stood, so its error goes to the client — or the request's wait to re-send
 // ended in error, its client having left. A request not waiting behind a
-// busy refusal changes nothing.
+// busy refusal changes nothing. The wait held its queue's arrivals too, so
+// that queue admits here as well: it is not necessarily among the queues
+// [server.modelsResumed] resumes.
 func (s *server) serverBusyWaitEnded(upstream string, p *pending) {
 	p.queue.mu.Lock()
 	waiting := p.serverBusyWait
@@ -245,6 +249,9 @@ func (s *server) serverBusyWaitEnded(upstream string, p *pending) {
 		return
 	}
 	s.modelsResumed(upstream)
+	p.queue.mu.Lock()
+	p.queue.admitIfAllOutstandingConfirmed()
+	p.queue.mu.Unlock()
 }
 
 // targetQueue orders admission to one target by session age: the backend
