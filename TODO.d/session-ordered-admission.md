@@ -113,10 +113,7 @@ limiter. The steps below remain, in order.
     once a refused request's client has left while it waited, a later busy
     refusal on the server sends only the newly refused request again when a
     running model finishes, and another request for the first refused model
-    waits for its own model's admission; a request for a model with nothing
-    running, answered while the refused request has been sent again and is
-    not yet answered, leaves the held new request held until the server
-    takes the refused request.
+    waits for its own model's admission.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

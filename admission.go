@@ -193,7 +193,8 @@ func (s *server) modelsDrained(upstream string, drainedQueue *targetQueue) {
 // ([server.serverBusyWaitEnded]). headered runs on any of the server's
 // models' response headers; one from a model that was not running at the
 // refusal is not the server's taking the refused request, so a header while
-// a refused request still waits releases nothing.
+// a refused request still waits releases nothing. A re-sent request the
+// server has not answered still waits.
 func (s *server) modelsResumed(upstream string) {
 	s.mu.Lock()
 	for _, q := range s.admission {
@@ -201,7 +202,9 @@ func (s *server) modelsResumed(upstream string) {
 			continue
 		}
 		q.mu.Lock()
-		refusedWaiting := slices.ContainsFunc(q.waiting, func(p *pending) bool { return p.serverBusyWait })
+		// The re-send sits in outstanding, not waiting, until its response
+		// header stands.
+		refusedWaiting := slices.ContainsFunc(slices.Concat(q.waiting, q.outstanding), func(p *pending) bool { return p.serverBusyWait })
 		q.mu.Unlock()
 		if refusedWaiting {
 			s.mu.Unlock()
