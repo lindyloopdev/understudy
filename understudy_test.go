@@ -8112,11 +8112,65 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{newMessage},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here where a request
-	// for a model of the server that was not running at the refusal gets
-	// its response header while the refused request still waits, and the
-	// held new request stays held until the refused request is no longer
-	// waiting.
+	// TODO(TODO.d/session-ordered-admission.md): a row here where, after a
+	// refused request's client leaves while it waits, a second request for
+	// that model is waiting at its own model when the server refuses another
+	// model's request as busy; once a running model finishes, the server
+	// receives only the newly refused request again, and the second request
+	// for the first refused model is sent when its own model allows it.
+	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/a request for a model with nothing running that the server answers while the refused request waits", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			newMessage       = "the new session asks"
+			answeredMessage  = "the answered session asks"
+		)
+		// The stream ends well after the answered request arrives, so the
+		// new request's hold, not timing, is what keeps it from the server.
+		streamEndsAfter := 3 * admissionGracePeriod
+		received := &receivedMessages{}
+		var streamEnded atomic.Bool
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStream(r, time.After(streamEndsAfter), func() { streamEnded.Store(true) }), nil
+			case refusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return admissionServerBusy(), nil
+				}
+				if !streamEnded.Load() {
+					t.Errorf("the server received %q again before %q's stream ended", refusedMessage, streamingMessage)
+				}
+				return admissionJSON(inboundMessage), nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
+				{model: "openai/a", userMessages: []string{newMessage}, after: admissionGracePeriod / 4},
+				{model: "openai/c", userMessages: []string{answeredMessage}, after: admissionGracePeriod / 4},
+			},
+			// The stream is still open, the refused request waits, the new
+			// request is held, and the server has answered the request for
+			// the model with nothing running.
+			reached: map[string][]string{"openai": {streamingMessage, refusedMessage, answeredMessage}},
+			// The refused request appears twice: its second send follows the
+			// stream's end.
+			secondCheckAt:        streamEndsAfter + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, answeredMessage, refusedMessage, newMessage}},
+			answered:             []string{refusedMessage, newMessage},
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): a row here where the
+	// refused request has been sent again and the server has not yet
+	// answered it when a request for a model with nothing running gets its
+	// answer, and the held new request is sent only once the server takes
+	// the refused request.
 	tests.AddFunc("should send a request that a server refused as busy to the server again once one of two requests streaming there has ended, and answer the request's client while the other still streams", func(t *testing.T) test {
 		const (
 			firstStreamingMessage  = "the first streaming session asks"

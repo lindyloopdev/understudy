@@ -115,9 +115,9 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 			upstream:             upstream,
 			firstContentSchedule: s.firstContentSchedule,
 			failoverThreshold:    s.failoverThreshold,
-			drained:              func() { s.modelsDrained(upstream) },
 			headered:             func() { s.modelsResumed(upstream) },
 		}
+		q.drained = func() { s.modelsDrained(upstream, q) }
 		s.admission[key] = q
 	}
 	return q
@@ -160,14 +160,20 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 }
 
 // modelsDrained admits each queue linked to the server's models by a busy
-// refusal, once one of the server's queues has no request outstanding. Each
-// queue's own admission rule re-runs, so a request refused again forms a new
-// link; queues the wait holds stay held — [server.modelsResumed] releases
-// them once the server takes the re-sent request.
-func (s *server) modelsDrained(upstream string) {
+// refusal, once one of the models the refusal held — one with a request
+// running at the refusal — has no request outstanding. Each queue's own
+// admission rule re-runs, so a request refused again forms a new link;
+// queues the wait holds stay held — [server.modelsResumed] releases them
+// once the server takes the re-sent request.
+func (s *server) modelsDrained(upstream string, drainedQueue *targetQueue) {
+	// s.mu, which every write to refusedModelWaiting also holds, makes this
+	// check atomic with the link's removal below.
 	s.mu.Lock()
+	drainedQueue.mu.Lock()
+	refusedModelWaiting := drainedQueue.refusedModelWaiting
+	drainedQueue.mu.Unlock()
 	linked := s.busyLinks[upstream]
-	if len(linked) == 0 {
+	if !refusedModelWaiting || len(linked) == 0 {
 		s.mu.Unlock()
 		return
 	}
@@ -184,9 +190,24 @@ func (s *server) modelsDrained(upstream string) {
 // request a busy refusal queued is no longer waiting on the server: its
 // re-send drew a standing response header, was answered without the server
 // taking it, or its wait to re-send ended in error
-// ([server.serverBusyWaitEnded]).
+// ([server.serverBusyWaitEnded]). headered runs on any of the server's
+// models' response headers; one from a model that was not running at the
+// refusal is not the server's taking the refused request, so a header while
+// a refused request still waits releases nothing.
 func (s *server) modelsResumed(upstream string) {
 	s.mu.Lock()
+	for _, q := range s.admission {
+		if q.upstream != upstream {
+			continue
+		}
+		q.mu.Lock()
+		refusedWaiting := slices.ContainsFunc(q.waiting, func(p *pending) bool { return p.serverBusyWait })
+		q.mu.Unlock()
+		if refusedWaiting {
+			s.mu.Unlock()
+			return
+		}
+	}
 	var holding []*targetQueue
 	for _, q := range s.admission {
 		if q.upstream != upstream {
