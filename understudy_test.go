@@ -8069,9 +8069,49 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	// TODO(TODO.d/session-ordered-admission.md): a row here where the
 	// refused request's second send is refused as busy again while nothing
 	// is running on the server, and the held new request is still sent.
-	// TODO(TODO.d/session-ordered-admission.md): a row here where the
-	// refused request's client leaves while it waits, and the held new
-	// request is sent.
+	tests.AddFunc("should send the held new request for the model the server is streaming and answer its client before the stream ends/the request the server refused as busy waits, and its client leaves", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			newMessage       = "the new session asks"
+		)
+		// Times are from the first arrival.
+		refusedArrives := admissionGracePeriod / 4
+		newArrives := refusedArrives + admissionGracePeriod/4
+		// The client leaves after the new request is held.
+		clientLeaves := admissionGracePeriod
+		streamEndsAfter := 3 * admissionGracePeriod
+		// Past the departure and short of the stream's end, so the
+		// departure, not the stream's end, is what can have sent the held
+		// request.
+		checkAt := clientLeaves + admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStream(r, time.After(streamEndsAfter), nil), nil
+			case refusedMessage:
+				return admissionServerBusy(), nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: refusedArrives, clientLeavesAfter: clientLeaves - refusedArrives},
+				{model: "openai/a", userMessages: []string{newMessage}, after: newArrives - refusedArrives},
+			},
+			// The stream is still open, the refused request waits, and the
+			// new request is held.
+			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage}},
+			secondCheckAt:        checkAt,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, newMessage}},
+			answered:             []string{newMessage},
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here where a request
 	// for a model of the server that was not running at the refusal gets
 	// its response header while the refused request still waits, and the

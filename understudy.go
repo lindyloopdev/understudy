@@ -2522,6 +2522,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				}
 			}
 			if resendErr := a.waitToResend(); resendErr != nil {
+				// The wait's error is the client's departure, so this
+				// error path ends any wait behind a busy refusal too.
+				s.serverBusyWaitEnded(upstream, pend)
 				return resendErr
 			}
 		}

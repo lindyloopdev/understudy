@@ -182,8 +182,9 @@ func (s *server) modelsDrained(upstream string) {
 
 // modelsResumed lets the server's models take requests again once the
 // request a busy refusal queued is no longer waiting on the server: its
-// re-send drew a standing response header, or was answered without the
-// server taking it ([server.serverBusyWaitEnded]).
+// re-send drew a standing response header, was answered without the server
+// taking it, or its wait to re-send ended in error
+// ([server.serverBusyWaitEnded]).
 func (s *server) modelsResumed(upstream string) {
 	s.mu.Lock()
 	var holding []*targetQueue
@@ -208,7 +209,8 @@ func (s *server) modelsResumed(upstream string) {
 
 // serverBusyWaitEnded ends the request's wait behind a busy refusal: the
 // re-send was answered without the server taking it — no response header
-// stood, so its error goes to the client. A request not waiting behind a
+// stood, so its error goes to the client — or the request's wait to re-send
+// ended in error, its client having left. A request not waiting behind a
 // busy refusal changes nothing.
 func (s *server) serverBusyWaitEnded(upstream string, p *pending) {
 	p.queue.mu.Lock()
