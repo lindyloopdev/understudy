@@ -8066,9 +8066,41 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{newMessage},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here where the
-	// refused request's second send is refused as busy again while nothing
-	// is running on the server, and the held new request is still sent.
+	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server refuses the refused request's second send as busy again with nothing running on it", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			newMessage       = "the new session asks"
+		)
+		// The stream ends well after the new request arrives, so the hold,
+		// not the stream's end, is what keeps the new request from the
+		// server.
+		streamEndsAfter := 3 * admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStream(r, time.After(streamEndsAfter), nil), nil
+			case refusedMessage:
+				return admissionServerBusy(), nil
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{refusedMessage}, after: admissionGracePeriod / 4},
+				{model: "openai/a", userMessages: []string{newMessage}, after: admissionGracePeriod / 4},
+			},
+			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage}},
+			secondCheckAt:        streamEndsAfter + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
+			answered:             []string{newMessage},
+		}
+	})
 	tests.AddFunc("should send the held new request for the model the server is streaming and answer its client before the stream ends/the request the server refused as busy waits, and its client leaves", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"
