@@ -128,8 +128,10 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 // models has a request running: a busy refusal with nothing running on the
 // server is the server's answer about the model itself.
 //
-// TODO(TODO.d/session-ordered-admission.md): rank the server's waiting
-// requests together across its models.
+// TODO(TODO.d/session-ordered-admission.md): a request already waiting at a
+// running model's queue when the refusal comes waits behind the refused
+// request whatever its rank; only a request arriving after the refusal
+// compares ranks with it.
 func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -153,7 +155,9 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	s.busyLinks[upstream][p.queue] = struct{}{}
 	for _, q := range running {
 		q.mu.Lock()
-		q.refusedModelWaiting = true
+		if !q.refusedModelWaiting() || p.rank.Before(q.refusedModelWaitRank) {
+			q.refusedModelWaitRank = p.rank
+		}
 		q.mu.Unlock()
 	}
 	return true
@@ -168,11 +172,11 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 // [server.serverBusyWaitEnded] releases the waiting request's own queue
 // when its wait ends.
 func (s *server) modelsDrained(upstream string, drainedQueue *targetQueue) {
-	// s.mu, which every write to refusedModelWaiting also holds, makes this
+	// s.mu, which every write to refusedModelWaitRank also holds, makes this
 	// check atomic with the link's removal below.
 	s.mu.Lock()
 	drainedQueue.mu.Lock()
-	refusedModelWaiting := drainedQueue.refusedModelWaiting
+	refusedModelWaiting := drainedQueue.refusedModelWaiting()
 	drainedQueue.mu.Unlock()
 	linked := s.busyLinks[upstream]
 	if !refusedModelWaiting || len(linked) == 0 {
@@ -223,9 +227,9 @@ func (s *server) modelsResumed(upstream string) {
 			continue
 		}
 		q.mu.Lock()
-		if q.refusedModelWaiting {
+		if q.refusedModelWaiting() {
 			holding = append(holding, q)
-			q.refusedModelWaiting = false
+			q.refusedModelWaitRank = time.Time{}
 		}
 		q.mu.Unlock()
 	}
@@ -289,11 +293,19 @@ type targetQueue struct {
 	// stands; it is taken from the server at the queue's creation and runs
 	// without q.mu held.
 	headered func()
-	// refusedModelWaiting is set while a request the server refused as busy
+	// refusedModelWaitRank is the rank of the earliest request the server
+	// refused as busy, zero while none waits. It is set while that request
 	// waits on the server, through the re-send that ends the wait: the
-	// model's running requests finish undisturbed, but it takes no new
-	// request until then. The server sets and clears it under q.mu.
-	refusedModelWaiting bool
+	// model's running requests finish undisturbed, and it takes no new
+	// request that waiter outranks. The server sets and clears it under
+	// q.mu.
+	refusedModelWaitRank time.Time
+}
+
+// refusedModelWaiting reports whether a request the server refused as busy
+// waits on the server. Caller holds q.mu.
+func (q *targetQueue) refusedModelWaiting() bool {
+	return !q.refusedModelWaitRank.IsZero()
 }
 
 // pending is one attempt's standing at a target queue: its rank, when it
@@ -411,10 +423,13 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	}
 	// Growth is speculative: an arrival that displaces nothing still waits
 	// behind any request unconfirmed past its grace period, headered or not
-	// — or, while a refused model's request waits on the server, behind that
-	// wait too.
+	// — or, while a refused model's request waits on the server, behind
+	// that wait too, unless the arrival outranks the wait: the server's
+	// top-ranked waiter is then for a running model, so the server takes
+	// the arrival.
 	_, held := q.holdingSinceLocked(now)
-	if held || q.refusedModelWaiting {
+	refusedHolds := q.refusedModelWaiting() && !rank.Before(q.refusedModelWaitRank)
+	if held || refusedHolds {
 		q.insert(p)
 		if moveOn != nil {
 			at, _ := q.failoverCrossingLocked(now)
@@ -618,7 +633,7 @@ func (q *targetQueue) notifyDrained() {
 // preempted before any content. Caller holds q.mu.
 func (q *targetQueue) endSend(p *pending) bool {
 	q.dropOutstanding(p)
-	p.endedWhileRefusedModelWaiting = q.refusedModelWaiting
+	p.endedWhileRefusedModelWaiting = q.refusedModelWaiting()
 	q.admitIfAllOutstandingConfirmed()
 	return p.preempted && !p.confirmed
 }
@@ -752,7 +767,7 @@ func (q *targetQueue) admitIfAllOutstandingConfirmed() {
 			return
 		}
 	}
-	if q.refusedModelWaiting {
+	if q.refusedModelWaiting() {
 		return
 	}
 	q.admit()
