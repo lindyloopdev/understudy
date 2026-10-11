@@ -92,26 +92,18 @@ limiter. The steps below remain, in order.
   (`notes/kronk.md` #2), so no rule may key on the code.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
     admitted; a bare 429 with nothing running takes the ladder.
-- **Linked models** (DESIGN.md, *The queue is keyed on the target*). Refused
-  again, the request waits for the next of the server's running models to
-  finish. Rank the waiting requests of every model on the server together,
-  so the top-ranked waiter decides whether the running models keep taking
-  new requests. A request re-queued by the 429 rule counts progress across
-  the linked set.
-  - Tests: with two models running, a refused request that needs the server
-    to itself is refused again when the first finishes and sent once both
-    have finished; an older session's request for a refused model is served
-    before a younger session's request for a running one; the running
-    models' requests finish undisturbed; a request refused as busy is held
-    only for requests on its own account, not one sharing the address under
-    another API key; with two models streaming, the re-sent request refused
-    as busy again is not sent until the second stream ends,
-    and a new request for the first stream's model, held while the refused
-    request waited, is sent only once the server takes the re-sent request;
-    once a refused request's client has left while it waited, a later busy
-    refusal on the server sends only the newly refused request again when a
-    running model finishes, and another request for the first refused model
-    waits for its own model's admission.
+- **Linked models** (DESIGN.md, *The queue is keyed on the target*). Rank the
+  waiting requests of every model on the server together, so the top-ranked
+  waiter decides whether the running models keep taking new requests. A
+  request re-queued by the 429 rule counts progress across the linked set.
+  - Tests: an older session's request for a refused model is served before a
+    younger session's request for a running one; the running models'
+    requests finish undisturbed; a request refused as busy is held only for
+    requests on its own account, not one sharing the address under another
+    API key; once a refused request's client has left while it waited, a
+    later busy refusal on the server sends only the newly refused request
+    again when a running model finishes, and another request for the first
+    refused model waits for its own model's admission.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with
