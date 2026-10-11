@@ -127,11 +127,6 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 // refusal, reporting whether it did — but only when another of the server's
 // models has a request running: a busy refusal with nothing running on the
 // server is the server's answer about the model itself.
-//
-// TODO(TODO.d/session-ordered-admission.md): a request already waiting at a
-// running model's queue when the refusal comes waits behind the refused
-// request whatever its rank; only a request arriving after the refusal
-// compares ranks with it.
 func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -718,10 +713,10 @@ func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 
 // confirm records p's first content — the moment the target has begun
 // answering — which frees the queue to admit its next waiter unless a
-// refused model's request waits on the server, and reports
-// whether the send still stands. A preempted send — by an outranking arrival,
-// or by its own first-content timeout — does not: its content is discarded,
-// and the caller sends the client nothing.
+// refused model's request waits on the server and outranks that waiter,
+// and reports whether the send still stands. A preempted send — by an
+// outranking arrival, or by its own first-content timeout — does not: its
+// content is discarded, and the caller sends the client nothing.
 func (q *targetQueue) confirm(p *pending) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -759,15 +754,16 @@ func (q *targetQueue) finish(p *pending) {
 
 // admitIfAllOutstandingConfirmed admits the queue's head once every request
 // outstanding at the target has confirmed: once a queue exists, one request at
-// a time sits at the target between confirmations. It admits no one while a
-// refused model's request waits on the server. Caller holds q.mu.
+// a time sits at the target between confirmations. It admits no one while
+// a refused model's request waits on the server and outranks the head.
+// Caller holds q.mu.
 func (q *targetQueue) admitIfAllOutstandingConfirmed() {
 	for _, o := range q.outstanding {
 		if !o.confirmed {
 			return
 		}
 	}
-	if q.refusedModelWaiting() {
+	if q.refusedModelWaiting() && (len(q.waiting) == 0 || !q.waiting[0].rank.Before(q.refusedModelWaitRank)) {
 		return
 	}
 	q.admit()

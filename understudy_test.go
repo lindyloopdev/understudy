@@ -8193,6 +8193,62 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{refusedMessage + " again": http.StatusOK, youngerMessage: http.StatusOK},
 		}
 	})
+	// The older session's first request completes before the refused
+	// session's first arrives, so the older session outranks the refused
+	// one.
+	tests.AddFunc("should send an older session's request for the model the server is streaming once the stream's first content arrives, and answer its client before the stream ends/the request was waiting when the server refused a younger session's request for another model as busy", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			olderMessage     = "the older session asks"
+			refusedMessage   = "the refused session asks"
+		)
+		olderFirstArrives := admissionGracePeriod / 4
+		refusedFirstArrives := olderFirstArrives + admissionGracePeriod/4
+		// Past the stream's grace period, so the older session's later
+		// request waits behind the stream, which has sent no content yet.
+		olderLaterArrives := admissionGracePeriod + admissionGracePeriod/4
+		refusedLaterArrives := olderLaterArrives + admissionGracePeriod/4
+		contentAfter := 2 * admissionGracePeriod
+		streamEndsAfter := 4 * admissionGracePeriod
+		// Past the first content and short of the stream's end, so what the
+		// check sees reached the server, and its answer reached its client,
+		// while the stream was open.
+		checkAt := contentAfter + admissionGracePeriod/4
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStreamContentAt(r, time.After(contentAfter), time.After(streamEndsAfter)), nil
+			case refusedMessage + " again":
+				if received.count(inboundMessage) == 1 {
+					return admissionServerBusy(), nil
+				}
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/a", userMessages: []string{olderMessage}, after: olderFirstArrives},
+				{model: "openai/a", userMessages: []string{refusedMessage}, after: refusedFirstArrives - olderFirstArrives},
+				{model: "openai/a", userMessages: []string{olderMessage, olderMessage + " again"}, after: olderLaterArrives - refusedFirstArrives},
+				{model: "openai/b", userMessages: []string{refusedMessage, refusedMessage + " again"}, after: refusedLaterArrives - olderLaterArrives},
+			},
+			// The stream is still open, the refused request waits, and the
+			// older session's later request has not reached the server.
+			reached: map[string][]string{"openai": {streamingMessage, olderMessage, refusedMessage, refusedMessage + " again"}},
+			// The first content has arrived and the stream is still open:
+			// the server has taken the older session's later request, the
+			// refused request only once, and the older session's client has
+			// its answer.
+			secondCheckAt:        checkAt,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, olderMessage, refusedMessage, refusedMessage + " again", olderMessage + " again"}},
+			answered:             map[string]int{olderMessage + " again": http.StatusOK},
+		}
+	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server answers the refused request's second send with an error naming the request", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"

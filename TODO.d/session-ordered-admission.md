@@ -93,13 +93,7 @@ limiter. The steps below remain, in order.
   - Tests: a 429 with `Retry-After` holds only its own target while others are
     admitted; a bare 429 with nothing running takes the ladder.
 - **Linked models** (DESIGN.md, *The queue is keyed on the target*). A request
-  already waiting at a running model when the server refuses another model's
-  request is ranked against the refused request too, so it is sent first when
-  it outranks it. A request re-queued by the 429 rule counts progress across
-  the linked set.
-  - Tests: an older session's request waiting at a running model when the
-    refusal comes is sent once that model allows it, ahead of the refused
-    request; the running models' requests finish undisturbed.
+  re-queued by the 429 rule counts progress across the linked set.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with
