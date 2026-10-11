@@ -7844,6 +7844,37 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{oldest: http.StatusOK},
 		}
 	})
+	// A session's rank outlives its affinity release.
+	tests.AddFunc("should cancel a younger session's request that has sent nothing past its grace period and send an older session's later request at once/the older session was quiet longer than affinity's idle time", func(t *testing.T) test {
+		const (
+			older   = "the older session asks"
+			younger = "the younger session asks"
+		)
+		youngerArrives := affinityIdleTTL + time.Second
+		olderLaterArrives := admissionGracePeriod + time.Second
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == younger && received.count(younger) == 1 {
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{older}},
+				{userMessages: []string{younger}, after: youngerArrives},
+				{userMessages: []string{older, older + " again"}, after: olderLaterArrives},
+			},
+			reached:              map[string][]string{"openai": {older, younger, older + " again", younger}},
+			secondCheckAt:        youngerArrives + olderLaterArrives + time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {older, younger, older + " again", younger}},
+			answered:             map[string]int{older + " again": http.StatusOK, younger: http.StatusOK},
+		}
+	})
 	tests.AddFunc("should take a request Understudy has already sent to the target again back into its queue, when an older session's request reaches the target during that send's grace period", func(t *testing.T) test {
 		const (
 			oldestOpening = "the oldest session asks"

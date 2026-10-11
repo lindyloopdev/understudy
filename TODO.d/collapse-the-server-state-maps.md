@@ -49,8 +49,7 @@ break one of them:
 ## Work
 
 - Merge each pair into one record, keeping `mu`'s single-lock discipline.
-- Give each field its own expiry rule, per above, and pin both in tests: an
-  idle conversation loses its affinity but keeps its rank; a target with a
-  non-empty queue is not swept.
-- Strict refactor: no behavior change, no test diff beyond the two expiry
-  pins, which are behavior the existing sweeps already own.
+- Give each field its own expiry rule, per above, and pin in a test that a
+  target with a non-empty queue is not swept.
+- Strict refactor: no behavior change, no test diff beyond that expiry pin,
+  which is behavior the existing sweeps already own.
