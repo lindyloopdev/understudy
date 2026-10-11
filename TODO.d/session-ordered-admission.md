@@ -98,9 +98,7 @@ limiter. The steps below remain, in order.
   request re-queued by the 429 rule counts progress across the linked set.
   - Tests: an older session's request for a refused model is served before a
     younger session's request for a running one; the running models'
-    requests finish undisturbed; a request refused as busy is held only for
-    requests on its own account, not one sharing the address under another
-    API key.
+    requests finish undisturbed.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

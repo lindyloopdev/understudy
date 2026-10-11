@@ -6165,12 +6165,21 @@ func newTargetsServer(t *testing.T, clients map[string]*http.Client, models map[
 	t.Helper()
 	backends := make(map[string]Backend, len(clients))
 	for name, client := range clients {
-		backends[name] = Backend{ProviderType: "openai", Config: providers.Config{
-			BaseURL:    &url.URL{Scheme: "http", Host: name, Path: "/v1"},
-			APIKey:     "sk-" + name,
-			HTTPClient: client,
-		}}
+		backends[name] = targetBackend(name, name, client)
 	}
+	return newBackendsServer(t, backends, models)
+}
+
+func targetBackend(name, host string, client *http.Client) Backend {
+	return Backend{ProviderType: "openai", Config: providers.Config{
+		BaseURL:    &url.URL{Scheme: "http", Host: host, Path: "/v1"},
+		APIKey:     "sk-" + name,
+		HTTPClient: client,
+	}}
+}
+
+func newBackendsServer(t *testing.T, backends map[string]Backend, models map[string]LogicalModel) *server {
+	t.Helper()
 	srv := newTestServer(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 		return &BackendConfig{Backends: backends, Models: models}, nil
 	}})
@@ -6219,14 +6228,25 @@ func (p *admissionPoster) answered(label string) (*httptest.ResponseRecorder, bo
 // answeredOK fails the case unless every label named has been answered 200.
 func (p *admissionPoster) answeredOK(labels ...string) {
 	p.t.Helper()
+	statuses := make(map[string]int, len(labels))
 	for _, label := range labels {
+		statuses[label] = http.StatusOK
+	}
+	p.answeredWith(statuses)
+}
+
+// answeredWith fails the case unless every label in statuses has been
+// answered with its status.
+func (p *admissionPoster) answeredWith(statuses map[string]int) {
+	p.t.Helper()
+	for label, status := range statuses {
 		rec, ok := p.answered(label)
 		if !ok {
 			p.t.Errorf("%s never received an answer", label)
 			continue
 		}
-		if rec.Code != http.StatusOK {
-			p.t.Errorf("%s: status %d, want %d", label, rec.Code, http.StatusOK)
+		if rec.Code != status {
+			p.t.Errorf("%s: status %d, want %d", label, rec.Code, status)
 		}
 	}
 }
@@ -7384,10 +7404,7 @@ func silentBackend(t *testing.T, received *receivedMessages) *http.Client {
 // silent past the grace period is the sign the backend is full.
 func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	type test struct {
-		// backends are the fake targets Understudy sends to, and received
-		// records what each receives.
-		backends map[string]*http.Client
-		models   map[string]LogicalModel
+		server   *server
 		received map[string]*receivedMessages
 		arrivals []clientTurn
 		// reached is the inbound messages each backend received by the time
@@ -7399,16 +7416,16 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// reachedAtSecondCheck is the inbound messages each backend has
 		// received by secondCheckAt, in order; nil means no second check.
 		reachedAtSecondCheck map[string][]string
-		// answered is the inbound messages whose clients must have received
-		// a 200 answer by the second check; nil means no answer is checked.
-		answered []string
+		// answered is the status each inbound message's client must have
+		// received by the second check; nil means no answer is checked.
+		answered map[string]int
 	}
 
 	tests := testy.NewTable[test]()
 	tests.AddFunc("should send every request of a burst on arrival, while none has been silent at the backend past the grace period", func(t *testing.T) test {
 		received := &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{"openai": silentBackend(t, received)},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": silentBackend(t, received)}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the first session asks"}},
@@ -7421,7 +7438,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 	tests.AddFunc("should hold a newer session's request arriving while another at the backend has been silent past the grace period", func(t *testing.T) test {
 		received := &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{"openai": silentBackend(t, received)},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": silentBackend(t, received)}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the older session asks"}},
@@ -7452,7 +7469,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{headered}},
@@ -7489,7 +7506,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{older}},
@@ -7513,7 +7530,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{"the oldest session asks"}},
@@ -7537,7 +7554,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{slow}},
@@ -7555,14 +7572,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			// Nothing arrives at the first target between the end of the
 			// other session's grace period and the new session's first turn.
@@ -7580,14 +7596,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{occupier}},
@@ -7606,14 +7621,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{occupier}},
@@ -7640,14 +7654,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": refusing,
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				// Names the second target's backend and model directly; it shares that
@@ -7690,14 +7703,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// that.
 		crossing := defaultRecoveryInterval + time.Second
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": refusingDemoter,
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				// Names the second target's backend and model directly; it shares that
@@ -7713,7 +7725,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"a": {occupier}, "b": {demoter}},
 			secondCheckAt:        crossing + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {demoter, newcomer}},
-			answered:             []string{newcomer},
+			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send a new session's first request waiting at the first target to the second target when the second target becomes due its recovery probe after the first has been busy for the failover threshold", func(t *testing.T) test {
@@ -7739,14 +7751,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// first target's busy clock crosses the failover threshold before
 		// that.
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": refusingDemoter,
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				// Names the second target's backend and model directly; it shares that
@@ -7762,7 +7773,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"a": {occupier}, "b": {demoter}},
 			secondCheckAt:        defaultRecoveryInterval + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {demoter, newcomer}},
-			answered:             []string{newcomer},
+			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should cancel a newer session's request at the target and hold it in line until the oldest session's request there is answered, when both have been silent at the target past their grace period", func(t *testing.T) test {
@@ -7792,7 +7803,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{oldest}},
@@ -7803,7 +7814,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// cancellation, and the queue re-sends it when it admits it.
 			secondCheckAt:        oldestAnswers + time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {oldest, newer, newer}},
-			answered:             []string{oldest},
+			answered:             map[string]int{oldest: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should take a request Understudy has already sent to the target again back into its queue, when an older session's request reaches the target during that send's grace period", func(t *testing.T) test {
@@ -7863,7 +7874,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{oldestOpening}},
@@ -7876,7 +7887,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reachedAtSecondCheck: map[string][]string{
 				"openai": {oldestOpening, middle, youngest, youngest, oldestLater, youngest},
 			},
-			answered: []string{youngest},
+			answered: map[string]int{youngest: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send a request again once the target's streaming answer to another request has ended, when the target answered the request with a rate limit and sent no retry-after", func(t *testing.T) test {
@@ -7906,7 +7917,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{streamingMessage}},
@@ -7918,7 +7929,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// stream's end, and its client receives that send's answer.
 			secondCheckAt:        time.Second + streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage}},
-			answered:             []string{refusedMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a request that a server refused as busy while streaming a request for another of its models, and send it to the server once that stream ends", func(t *testing.T) test {
@@ -7948,7 +7959,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -7960,7 +7971,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// stream's end, and its client receives that send's answer.
 			secondCheckAt:        admissionGracePeriod/4 + streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage}},
-			answered:             []string{refusedMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK},
 		}
 	})
 	// The refused request's session is seen before the new request's, so it
@@ -7993,7 +8004,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8009,7 +8020,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// client receives an answer too.
 			secondCheckAt:        streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
-			answered:             []string{refusedMessage, newMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK, newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server answers the refused request's second send with an error naming the request", func(t *testing.T) test {
@@ -8047,7 +8058,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8063,7 +8074,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// client receives an answer too.
 			secondCheckAt:        streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
-			answered:             []string{newMessage},
+			answered:             map[string]int{newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server refuses the refused request's second send as busy again with nothing running on it", func(t *testing.T) test {
@@ -8088,7 +8099,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8098,7 +8109,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage}},
 			secondCheckAt:        streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, newMessage}},
-			answered:             []string{newMessage},
+			answered:             map[string]int{newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send the held new request for the model the server is streaming and answer its client before the stream ends/the request the server refused as busy waits, and its client leaves", func(t *testing.T) test {
@@ -8129,7 +8140,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8141,7 +8152,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage}},
 			secondCheckAt:        checkAt,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, newMessage}},
-			answered:             []string{newMessage},
+			answered:             map[string]int{newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send the held new request and answer its client before the stream ends/an older session's request for the same model, which the server refused as busy, waits, and its client leaves", func(t *testing.T) test {
@@ -8170,7 +8181,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8180,7 +8191,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage}},
 			secondCheckAt:        checkAt,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, newMessage}},
-			answered:             []string{newMessage},
+			answered:             map[string]int{newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send the newly refused request to the server again once the stream ends, and keep a younger session's request for the first refused model held behind an unanswered request for that model/the first refused request's client left while it waited, and an unanswered request for its model is at the server", func(t *testing.T) test {
@@ -8225,7 +8236,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8239,7 +8250,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// end, and its answer reaches its client.
 			secondCheckAt:        streamEndsAfter + admissionGracePeriod/2,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, firstRefusedMessage, olderMessage, newlyRefusedMessage, newlyRefusedMessage}},
-			answered:             []string{newlyRefusedMessage},
+			answered:             map[string]int{newlyRefusedMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/a request for a model with nothing running that the server answers while the refused request waits", func(t *testing.T) test {
@@ -8271,7 +8282,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8287,7 +8298,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// stream's end.
 			secondCheckAt:        streamEndsAfter + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, answeredMessage, refusedMessage, newMessage}},
-			answered:             []string{refusedMessage, newMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK, newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/a request for a model with nothing running that the server answers while the refused request's second send is unanswered", func(t *testing.T) test {
@@ -8336,7 +8347,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{streamingMessage}},
@@ -8351,7 +8362,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// refused request's second send.
 			secondCheckAt:        answeredArrives + refusedSecondSendAnswerDelay + admissionGracePeriod/2,
 			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage, answeredMessage, newMessage}},
-			answered:             []string{refusedMessage, answeredMessage, newMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK, answeredMessage: http.StatusOK, newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send a request that a server refused as busy to the server again once one of two requests streaming there has ended, and answer the request's client while the other still streams", func(t *testing.T) test {
@@ -8389,7 +8400,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{firstStreamingMessage}},
@@ -8399,7 +8410,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage}},
 			secondCheckAt:        checkAt,
 			reachedAtSecondCheck: map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage}},
-			answered:             []string{refusedMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send the refused request and then the held new request once both of the server's streams have ended/the server refuses the request as busy again when the first stream ends", func(t *testing.T) test {
@@ -8439,7 +8450,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{firstStreamingMessage}},
@@ -8450,7 +8461,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage}},
 			secondCheckAt:        checkAt,
 			reachedAtSecondCheck: map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage, refusedMessage, newMessage}},
-			answered:             []string{refusedMessage, newMessage},
+			answered:             map[string]int{refusedMessage: http.StatusOK, newMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a second request for a model when a request for another of the server's models ends, once the server refused the model's first request as busy and then accepted it", func(t *testing.T) test {
@@ -8495,7 +8506,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{model: "openai/a", userMessages: []string{firstStreamingMessage}},
@@ -8508,10 +8519,43 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reachedAtSecondCheck: map[string][]string{"openai": {firstStreamingMessage, secondStreamingMessage, refusedMessage, refusedMessage}},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a request
-	// refused as busy while a backend with the same address but a different
-	// API key streams a request: it is sent again without waiting for that
-	// stream.
+	tests.AddFunc("should answer a request the server refused as busy with a rate limit, sending it to the server once/the only request running at the server's address streams under another API key", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+		)
+		refusedArrives := admissionGracePeriod / 4
+		streamEndsAfter := 3 * admissionGracePeriod
+		// Past the stream's end, so a request held for that stream would
+		// have reached the server again by then.
+		checkAt := streamEndsAfter + admissionGracePeriod/2
+		receivedFirst, receivedSecond := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedFirst.add(inboundMessage)
+			return admissionStream(r, time.After(streamEndsAfter), nil), nil
+		})
+		second := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedSecond.add(inboundMessage)
+			return admissionServerBusy(), nil
+		})
+		return test{
+			server: newBackendsServer(t, map[string]Backend{
+				"first": targetBackend("first", "first", first),
+				// The second backend shares the first's address under its
+				// own API key.
+				"second": targetBackend("second", "first", second),
+			}, nil),
+			received: map[string]*receivedMessages{"first": receivedFirst, "second": receivedSecond},
+			arrivals: []clientTurn{
+				{model: "first/a", userMessages: []string{streamingMessage}},
+				{model: "second/b", userMessages: []string{refusedMessage}, after: refusedArrives},
+			},
+			reached:              map[string][]string{"first": {streamingMessage}, "second": {refusedMessage}},
+			secondCheckAt:        checkAt,
+			reachedAtSecondCheck: map[string][]string{"first": {streamingMessage}, "second": {refusedMessage}},
+			answered:             map[string]int{refusedMessage: http.StatusTooManyRequests},
+		}
+	})
 	tests.AddFunc("should send a session's first request to the second target when the first target has been busy for the failover threshold and answers the request with a rate limit and no retry-after", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"
@@ -8563,11 +8607,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": first, "b": second},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": second}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{streamingMessage}},
@@ -8585,7 +8628,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				"a": {streamingMessage, refusedMessage, holderOpening, holderLater, holderLater},
 				"b": {refusedMessage},
 			},
-			answered: []string{refusedMessage},
+			answered: map[string]int{refusedMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send a session's later request to its target again once the target's stream ends, when the target has been busy for the failover threshold and answers it with a rate limit and no retry-after", func(t *testing.T) test {
@@ -8623,11 +8666,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{opening}},
@@ -8637,7 +8679,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"a": {opening, streamingMessage, later}},
 			secondCheckAt:        streamEnds + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {opening, streamingMessage, later, later}},
-			answered:             []string{later},
+			answered:             map[string]int{later: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should keep sending requests to a target up to its earlier concurrency cap after a bare 429 sent a request there back into line", func(t *testing.T) test {
@@ -8665,7 +8707,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: map[string]*receivedMessages{"openai": received},
 			arrivals: []clientTurn{
 				{userMessages: []string{streamingMessage}},
@@ -8707,16 +8749,15 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		occupierArrives := crossing - admissionGracePeriod - defaultFailoverThreshold
 		thirdDemoted := occupierArrives - time.Second
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": refusingDemoter(receivedB, secondDemoter),
 				"c": refusingDemoter(receivedC, thirdDemoter),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
 				{backend: "c", model: "mc"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB, "c": receivedC},
 			arrivals: []clientTurn{
 				// Each names a target's backend and model directly; it shares
@@ -8730,7 +8771,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			// After the second target's probe falls due, before the third's.
 			secondCheckAt:        defaultRecoveryInterval + 2*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {secondDemoter, newcomer}, "c": {thirdDemoter}},
-			answered:             []string{newcomer},
+			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here for a first
@@ -8762,11 +8803,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": first, "b": refusing},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": refusing}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{occupier}},
@@ -8775,7 +8815,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached:              map[string][]string{"a": {occupier}},
 			secondCheckAt:        admissionGracePeriod + defaultFailoverThreshold + 5*time.Second,
 			reachedAtSecondCheck: map[string][]string{"a": {occupier, newcomer}, "b": {newcomer}},
-			answered:             []string{newcomer},
+			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should send a new session's first turn to a target a waiting first turn left, once that target is no longer busy", func(t *testing.T) test {
@@ -8786,14 +8826,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		)
 		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": silentBackend(t, receivedA),
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				// Its client leaves after the first new session has left for
@@ -8839,11 +8878,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// not since its grace period ended.
 		newcomerArrives := youngerArrives + defaultFailoverThreshold + admissionGracePeriod/2
 		return test{
-			backends: map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{older}},
@@ -8884,8 +8922,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": only},
-			models:   map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}},
+			server:   newTargetsServer(t, map[string]*http.Client{"a": only}, map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}}),
 			received: map[string]*receivedMessages{"a": received},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{occupier}},
@@ -8914,14 +8951,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return admissionJSON(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": first,
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{occupier}},
@@ -8958,14 +8994,13 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			return nil, context.Cause(r.Context())
 		})
 		return test{
-			backends: map[string]*http.Client{
+			server: newTargetsServer(t, map[string]*http.Client{
 				"a": first,
 				"b": silentBackend(t, receivedB),
-			},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
 			arrivals: []clientTurn{
 				{model: "m", userMessages: []string{bound}},
@@ -8978,7 +9013,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			poster := newAdmissionPoster(t, newTargetsServer(t, tt.backends, tt.models))
+			poster := newAdmissionPoster(t, tt.server)
 
 			start := time.Now()
 			postTurns(t, poster, tt.arrivals)
@@ -8998,7 +9033,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 					t.Errorf("requests the %q backend received %s after the first arrival (-want +got):\n%s", name, tt.secondCheckAt, d)
 				}
 			}
-			poster.answeredOK(tt.answered...)
+			poster.answeredWith(tt.answered)
 		})
 	})
 }
