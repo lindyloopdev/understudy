@@ -100,10 +100,7 @@ limiter. The steps below remain, in order.
     younger session's request for a running one; the running models'
     requests finish undisturbed; a request refused as busy is held only for
     requests on its own account, not one sharing the address under another
-    API key; once a refused request's client has left while it waited, a
-    later busy refusal on the server sends only the newly refused request
-    again when a running model finishes, and another request for the first
-    refused model waits for its own model's admission.
+    API key.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
   content within the limit — held, or submitted — is canceled and answered with

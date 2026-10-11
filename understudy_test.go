@@ -8183,13 +8183,65 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             []string{newMessage},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here where, after a
-	// refused request's client leaves while it waits, the server refuses
-	// another model's request as busy while a request for the first refused
-	// model waits behind another request for that model the server has not
-	// yet answered; once a running model finishes, the server receives only the newly refused request
-	// again, and the waiting request for the first refused model is sent when
-	// its own model allows it.
+	tests.AddFunc("should send the newly refused request to the server again once the stream ends, and keep a younger session's request for the first refused model held behind an unanswered request for that model/the first refused request's client left while it waited, and an unanswered request for its model is at the server", func(t *testing.T) test {
+		const (
+			streamingMessage    = "the streaming session asks"
+			firstRefusedMessage = "the first refused session asks"
+			olderMessage        = "the older session asks"
+			youngerMessage      = "the younger session asks"
+			newlyRefusedMessage = "the newly refused session asks"
+		)
+		// Times are from the first arrival.
+		firstRefusedArrives := admissionGracePeriod / 4
+		firstRefusedLeaves := firstRefusedArrives + admissionGracePeriod/2
+		// The older session's request arrives after the first refused
+		// request's client left and its model's queue has held nothing
+		// since, so it is sent on arrival; the younger session's request
+		// arrives past its grace period without an answer, so their model's
+		// own admission rule holds it.
+		olderArrives := firstRefusedLeaves + admissionGracePeriod/4
+		youngerArrives := olderArrives + admissionGracePeriod + admissionGracePeriod/4
+		newlyRefusedArrives := youngerArrives + admissionGracePeriod/4
+		// The stream outlives every arrival, so only its end can send the
+		// newly refused request again.
+		streamEndsAfter := 3 * admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStream(r, time.After(streamEndsAfter), nil), nil
+			case firstRefusedMessage:
+				return admissionServerBusy(), nil
+			case newlyRefusedMessage:
+				if received.count(inboundMessage) == 1 {
+					return admissionServerBusy(), nil
+				}
+				return admissionJSON(inboundMessage), nil
+			}
+			// The older and younger sessions' requests are never answered
+			// during the test.
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/b", userMessages: []string{firstRefusedMessage}, after: firstRefusedArrives, clientLeavesAfter: firstRefusedLeaves - firstRefusedArrives},
+				{model: "openai/b", userMessages: []string{olderMessage}, after: olderArrives - firstRefusedArrives},
+				{model: "openai/b", userMessages: []string{youngerMessage}, after: youngerArrives - olderArrives},
+				{model: "openai/c", userMessages: []string{newlyRefusedMessage}, after: newlyRefusedArrives - youngerArrives},
+			},
+			reached: map[string][]string{"openai": {streamingMessage, firstRefusedMessage, olderMessage, newlyRefusedMessage}},
+			// The newly refused request's second send follows the stream's
+			// end, and its answer reaches its client.
+			secondCheckAt:        streamEndsAfter + admissionGracePeriod/2,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, firstRefusedMessage, olderMessage, newlyRefusedMessage, newlyRefusedMessage}},
+			answered:             []string{newlyRefusedMessage},
+		}
+	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/a request for a model with nothing running that the server answers while the refused request waits", func(t *testing.T) test {
 		const (
 			streamingMessage = "the streaming session asks"

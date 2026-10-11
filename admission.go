@@ -196,7 +196,8 @@ func (s *server) modelsDrained(upstream string, drainedQueue *targetQueue) {
 // models' response headers; one from a model that was not running at the
 // refusal is not the server's taking the refused request, so a header while
 // a refused request still waits releases nothing. A re-sent request the
-// server has not answered still waits.
+// server has not answered still waits. The release also removes the
+// refusal's link, so a later refusal starts a fresh one.
 func (s *server) modelsResumed(upstream string) {
 	s.mu.Lock()
 	for _, q := range s.admission {
@@ -213,6 +214,9 @@ func (s *server) modelsResumed(upstream string) {
 			return
 		}
 	}
+	// Every queue the link names was linked by a wait that has ended, so
+	// removing the link releases nothing still waiting.
+	delete(s.busyLinks, upstream)
 	var holding []*targetQueue
 	for _, q := range s.admission {
 		if q.upstream != upstream {
