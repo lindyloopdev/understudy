@@ -6120,6 +6120,33 @@ func admissionStream(r *http.Request, ends <-chan time.Time, ended func()) *http
 	}
 }
 
+// admissionStreamContentAt is admissionStream with its first content
+// withheld until contentAt delivers; when ends delivers it ends the stream,
+// and a nil ends keeps it open until the request is canceled.
+func admissionStreamContentAt(r *http.Request, contentAt, ends <-chan time.Time) *http.Response {
+	reads := 0
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(readerFunc(func(p []byte) (int, error) {
+			reads++
+			wait := ends
+			if reads == 1 {
+				wait = contentAt
+			}
+			select {
+			case <-r.Context().Done():
+				return 0, context.Cause(r.Context())
+			case <-wait:
+			}
+			if reads == 1 {
+				return copy(p, "data: {\"id\":\"streamed\"}\n\n"), nil
+			}
+			return 0, io.EOF
+		})),
+	}
+}
+
 // admissionServerBusy is a server's refusal of a request because the models
 // it is already running leave no room for the request's model.
 func admissionServerBusy() *http.Response {
@@ -8121,6 +8148,49 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			secondCheckAt:        8 * gap,
 			reachedAtSecondCheck: map[string][]string{"openai": reached},
 			answered:             map[string]int{oldestMessage + " again": http.StatusOK},
+		}
+	})
+	// The refused session is first seen before the younger session's request
+	// arrives, so it outranks that request.
+	tests.AddFunc("should keep a younger session's request for the model the server is streaming held when the stream's first content arrives, and send it after the request the server refused as busy/the younger request was waiting when the refusal came", func(t *testing.T) test {
+		const (
+			streamingMessage = "the streaming session asks"
+			refusedMessage   = "the refused session asks"
+			youngerMessage   = "the younger session asks"
+		)
+		refusedFirstArrives := admissionGracePeriod / 4
+		// Past the stream's grace period, so the younger request waits
+		// behind the stream, which has sent no content yet.
+		youngerArrives := admissionGracePeriod + admissionGracePeriod/4
+		refusedLaterArrives := youngerArrives + admissionGracePeriod/4
+		contentAfter := 2 * admissionGracePeriod
+		streamEndsAfter := 4 * admissionGracePeriod
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case streamingMessage:
+				return admissionStreamContentAt(r, time.After(contentAfter), time.After(streamEndsAfter)), nil
+			case refusedMessage + " again":
+				if received.count(inboundMessage) == 1 {
+					return admissionServerBusy(), nil
+				}
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "openai/a", userMessages: []string{streamingMessage}},
+				{model: "openai/a", userMessages: []string{refusedMessage}, after: refusedFirstArrives},
+				{model: "openai/a", userMessages: []string{youngerMessage}, after: youngerArrives - refusedFirstArrives},
+				{model: "openai/b", userMessages: []string{refusedMessage, refusedMessage + " again"}, after: refusedLaterArrives - youngerArrives},
+			},
+			reached:              map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage + " again"}},
+			secondCheckAt:        streamEndsAfter + admissionGracePeriod,
+			reachedAtSecondCheck: map[string][]string{"openai": {streamingMessage, refusedMessage, refusedMessage + " again", refusedMessage + " again", youngerMessage}},
+			answered:             map[string]int{refusedMessage + " again": http.StatusOK, youngerMessage: http.StatusOK},
 		}
 	})
 	tests.AddFunc("should hold a new request for the model the server is streaming while an older session's request for another model, which the server refused as busy, waits, and once the stream ends send the refused request and then the held new request/the server answers the refused request's second send with an error naming the request", func(t *testing.T) test {
