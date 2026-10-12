@@ -9031,6 +9031,43 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
+	// The second target's request arrives first, so the second target is
+	// already unavailable for new sessions when the first target crosses the
+	// failover threshold.
+	tests.AddFunc("should send a new session's first request waiting at the first target there once the first target is no longer busy/the second target was busy when the first target crossed the failover threshold, and is still busy", func(t *testing.T) test {
+		const (
+			secondOccupier = "the second target's session asks"
+			firstOccupier  = "the first target's session asks"
+			newcomer       = "the new session asks"
+		)
+		firstOccupierArrives := time.Second / 2
+		newcomerArrives := admissionGracePeriod + defaultFailoverThreshold - 2*time.Second
+		firstFrees := admissionGracePeriod + defaultFailoverThreshold + 3*time.Second
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == firstOccupier {
+				time.Sleep(firstFrees - firstOccupierArrives)
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": silentBackend(t, receivedB)}, map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}}),
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				{model: "b/mb", userMessages: []string{secondOccupier}},
+				{model: "m", userMessages: []string{firstOccupier}, after: firstOccupierArrives},
+				{model: "m", userMessages: []string{newcomer}, after: newcomerArrives - firstOccupierArrives},
+			},
+			reached:              map[string][]string{"a": {firstOccupier}, "b": {secondOccupier}},
+			secondCheckAt:        firstFrees + 3*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {firstOccupier, newcomer}, "b": {secondOccupier}},
+			answered:             map[string]int{newcomer: http.StatusOK},
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): a row here for a first
 	// request waiting at a busy target when the other target, also busy at
 	// the crossing, stops being busy: it moves to that target then.

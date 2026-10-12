@@ -66,9 +66,9 @@ limiter. The steps below remain, in order.
     look when it frees up, so the request stays in the busy target's line
     while a first request arriving after is sent to the freed target. There
     is no known moment to check at, so the freed target's queue has to say
-    when it stops holding arrivals. (open) How many waiting first requests
-    move to it at once — all of them could make it busy again straight away;
-    growth's one-at-a-time rule is the likely answer.
+    when it stops holding arrivals. Each waiting first request then moves as a
+    first request arriving at that moment would, per *Who waits, and who
+    fails over*, so the freed target's queue takes them by its ordinary rule.
     - Tests: a first request waiting at a busy target moves to the other
       target, busy at the crossing, once it stops being busy.
   - The target's busy clock starts when the target became unable to take an
