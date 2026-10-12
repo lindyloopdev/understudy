@@ -7198,12 +7198,66 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			},
 		}
 	})
-	// TODO: add "should send only the request that reached the first-content
-	// timeout again, when it had its response header/another session's
-	// request with no response header was at the target as a refill". The
-	// other request's single send reaches the target until its own timeout.
-	// TODO: add "should send a displaced request again once, when another
-	// request at the target reaches the first-content timeout/the displaced
+	tests.AddFunc("should keep another session's request with no response header at the target when a request with its response header reaches the first-content timeout/the other request was sent as a refill", func(t *testing.T) test {
+		const (
+			stream   = "the streaming session asks"
+			headered = "the headered session asks"
+			refilled = "the refilled session asks"
+		)
+		var (
+			headeredArrives        = time.Second
+			refilledArrives        = headeredArrives + admissionGracePeriod + time.Second
+			streamEnds             = refilledArrives + 2*time.Second
+			headeredTimeoutExpires = headeredArrives + initialFirstContentTimeout
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			switch {
+			case sentMessage == stream:
+				return admissionStream(r, time.After(streamEnds), nil), nil
+			case sentMessage == headered && received.count(sentMessage) == 1:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			case sentMessage == refilled && received.count(sentMessage) == 1:
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
+				{inboundMessage: headered, body: admissionTurn(admissionMsg("user", headered)), after: headeredArrives},
+				// The headered request holds the target's arrivals past its
+				// grace period, so this one waits until the stream ends.
+				{inboundMessage: refilled, body: admissionTurn(admissionMsg("user", refilled)), after: refilledArrives - headeredArrives},
+			},
+			// Past the headered request's expiry and before the refilled
+			// request's, which began at the stream's end.
+			wait:     headeredTimeoutExpires + time.Second - refilledArrives,
+			followed: stream,
+			events:   []string{`{"id":"streamed"}`},
+			sends:    1,
+			check: func() {
+				want := []string{stream, headered, refilled}
+				if d := gocmp.Diff(want, received.all()); d != "" {
+					t.Errorf("sends that reached the target (-want +got):\n%s", d)
+				}
+			},
+		}
+	})
+	// TODO: add "should send the request waiting behind a displaced request
+	// once the displaced request's second send shows content, when another
+	// request at the target reached the first-content timeout/the displaced
 	// send had not yet ended". The displaced send's backend answers after
 	// its cancel, as in the raced-answer case above.
 	tests.AddFunc("should withdraw an older session's request silent past its grace period and send it again when a younger session's headered request holds the target", func(t *testing.T) test {
