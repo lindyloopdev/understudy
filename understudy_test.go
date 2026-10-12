@@ -6763,6 +6763,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		// after its timer fires: zero, at once; more, a firing Stop can no
 		// longer prevent.
 		handlerDelay time.Duration
+		// check, when set, runs the case's own assertions after the
+		// standard ones.
+		check func()
 	}
 
 	tests := testy.NewTable[test]()
@@ -7128,6 +7131,81 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
+	tests.AddFunc("should send each request with no response header at the target again, the older session's first, when the older session's request reaches the first-content timeout/both requests were sent as refills", func(t *testing.T) test {
+		const (
+			firstStream    = "the first streaming session asks"
+			secondStream   = "the second streaming session asks"
+			unconfirmed    = "the unconfirmed session asks"
+			olderMessage   = "the older session asks"
+			youngerMessage = "the younger session asks"
+		)
+		var (
+			secondStreamArrives   = time.Second / 2
+			unconfirmedArrives    = time.Second
+			olderArrives          = unconfirmedArrives + admissionGracePeriod + time.Second
+			youngerArrives        = olderArrives + time.Second/2
+			firstStreamEnds       = youngerArrives + 5*time.Second
+			secondStreamEnds      = firstStreamEnds + 3*time.Second
+			unconfirmedAnsweredAt = secondStreamEnds + 7*time.Second
+			olderTimeoutExpires   = firstStreamEnds + initialFirstContentTimeout
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			switch {
+			case sentMessage == firstStream:
+				return admissionStream(r, time.After(firstStreamEnds), nil), nil
+			case sentMessage == secondStream:
+				return admissionStream(r, time.After(secondStreamEnds-secondStreamArrives), nil), nil
+			case sentMessage == unconfirmed:
+				// Holds the target's arrivals until both refills are out,
+				// then answers and leaves before the timeout expires.
+				time.Sleep(unconfirmedAnsweredAt - unconfirmedArrives)
+				return sseAnswer(sentMessage), nil
+			case received.count(sentMessage) == 1:
+				// The refills' first sends wait with no response header
+				// until their attempts are withdrawn.
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: firstStream, body: admissionTurn(admissionMsg("user", firstStream))},
+				{inboundMessage: secondStream, body: admissionTurn(admissionMsg("user", secondStream)), after: secondStreamArrives},
+				// Its request holds the target's arrivals past its grace
+				// period, so both sessions wait in the target's queue.
+				{inboundMessage: unconfirmed, body: admissionTurn(admissionMsg("user", unconfirmed)), after: unconfirmedArrives - secondStreamArrives},
+				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage)), after: olderArrives - unconfirmedArrives},
+				{inboundMessage: youngerMessage, body: admissionTurn(admissionMsg("user", youngerMessage)), after: youngerArrives - olderArrives},
+			},
+			// The older request's timeout began at its refill, so this look
+			// falls just past its expiry and before the younger request's.
+			wait:     olderTimeoutExpires + time.Second - youngerArrives,
+			followed: olderMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, olderMessage)},
+			sends:    2,
+			check: func() {
+				// Only a restart at the older request's expiry has sent the
+				// younger request a second time by now.
+				want := []string{firstStream, secondStream, unconfirmed, olderMessage, youngerMessage, olderMessage, youngerMessage}
+				if d := gocmp.Diff(want, received.all()); d != "" {
+					t.Errorf("sends that reached the target (-want +got):\n%s", d)
+				}
+			},
+		}
+	})
+	// TODO: add "should send only the request that reached the first-content
+	// timeout again, when it had its response header/another session's
+	// request with no response header was at the target as a refill". The
+	// other request's single send reaches the target until its own timeout.
+	// TODO: add "should send a displaced request again once, when another
+	// request at the target reaches the first-content timeout/the displaced
+	// send had not yet ended". The displaced send's backend answers after
+	// its cancel, as in the raced-answer case above.
 	tests.AddFunc("should withdraw an older session's request silent past its grace period and send it again when a younger session's headered request holds the target", func(t *testing.T) test {
 		const (
 			olderMessage   = "the older session asks a target a younger session holds"
@@ -7295,6 +7373,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 			if got := tt.received.count(tt.followed); got != tt.sends {
 				t.Errorf("the backend received %q %d times, want %d", tt.followed, got, tt.sends)
+			}
+			if tt.check != nil {
+				tt.check()
 			}
 		})
 	})

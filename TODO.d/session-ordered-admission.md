@@ -40,9 +40,6 @@ limiter. The steps below remain, in order.
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - When it fires on a target that gives no work before its header, every
-    headerless request at that target restarts together, in rank order, so
-    the retry restores ordering rather than scrambling it.
   - A mass-retry after such a restart follows growth's ordinary rule — burst
     together, not serialized one at a time — since nothing about a retry
     changes what growth already knows to do with a fresh admission.

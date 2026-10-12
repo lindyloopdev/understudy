@@ -693,11 +693,9 @@ func (q *targetQueue) armFirstContentTimeout(p *pending) {
 // until first content — so the request can be sent again to the same target.
 // timer is the timer that fired. One that is no longer p's timeout in force
 // was started for a send that has since ended; that firing does nothing.
-//
-// TODO(TODO.d/session-ordered-admission.md): when the timeout fires on a
-// backend that gives no work before its header, every headerless request at
-// that target should restart together in send order, so the retry restores
-// ordering rather than scrambling it; this ends only the one attempt.
+// A headerless p restarts every other headerless request at the target
+// alongside it, so a retry restores rank order; each of those ends as a
+// displacement, so none doubles its own timeout.
 func (q *targetQueue) expireFirstContentTimeout(p *pending, timer **time.Timer) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -708,6 +706,17 @@ func (q *targetQueue) expireFirstContentTimeout(p *pending, timer **time.Timer) 
 	p.firstContentTimeouts++
 	q.insert(p)
 	p.cancel(errors.New("no content within the first-content timeout"))
+	if p.headered {
+		return
+	}
+	for _, o := range q.outstanding {
+		if o.headered || o.preempted {
+			continue
+		}
+		o.preempted = true
+		q.insert(o)
+		o.cancel(errPreempted)
+	}
 }
 
 // await blocks until the queue admits a displaced attempt, honoring ctx: a
