@@ -9068,9 +9068,64 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): a row here for a first
-	// request waiting at a busy target when the other target, also busy at
-	// the crossing, stops being busy: it moves to that target then.
+	// The second target's occupier is answered while the first target's is
+	// still running.
+	tests.AddFunc("should send a new session's first request waiting at the first target to the second target once the second target is no longer busy/the second target was busy when the first target crossed the failover threshold", func(t *testing.T) test {
+		const (
+			secondOccupier = "the second target's session asks"
+			firstOccupier  = "the first target's session asks"
+			newcomer       = "the new session asks"
+		)
+		// The first target is occupied after the second, so its busy clock's
+		// crossing falls that much later than the second's.
+		firstOccupierArrives := 3 * time.Second
+		newcomerArrives := firstOccupierArrives + admissionGracePeriod + defaultFailoverThreshold - 2*time.Second
+		secondFrees := firstOccupierArrives + admissionGracePeriod + defaultFailoverThreshold + time.Second
+		firstFrees := secondFrees + 5*time.Second
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == firstOccupier {
+				// Its answer falls past the second check, so its client's
+				// departure is what ends the wait at teardown.
+				select {
+				case <-r.Context().Done():
+					return nil, context.Cause(r.Context())
+				case <-time.After(firstFrees - firstOccupierArrives):
+				}
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		second := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedB.add(inboundMessage)
+			if inboundMessage == secondOccupier {
+				time.Sleep(secondFrees)
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		return test{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": second}, map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}}),
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				// Names the second target's backend and model directly; it shares
+				// that target's health key, so occupying it holds the target.
+				{model: "b/mb", userMessages: []string{secondOccupier}},
+				{model: "m", userMessages: []string{firstOccupier}, after: firstOccupierArrives},
+				// Arrives after the second target's crossing, before the
+				// first target's.
+				{model: "m", userMessages: []string{newcomer}, after: newcomerArrives - firstOccupierArrives},
+			},
+			reached: map[string][]string{"a": {firstOccupier}, "b": {secondOccupier}},
+			// After the second target's occupier is answered, before the
+			// first target's is.
+			secondCheckAt:        secondFrees + 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {firstOccupier}, "b": {secondOccupier, newcomer}},
+			answered:             map[string]int{newcomer: http.StatusOK},
+		}
+	})
 	// The new session's first request arrives before the first target's busy
 	// clock crosses the failover threshold, so it is waiting there at the
 	// crossing; the second target refuses every request it receives, and the

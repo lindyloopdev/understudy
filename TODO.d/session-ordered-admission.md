@@ -61,16 +61,6 @@ limiter. The steps below remain, in order.
   the row is [[understudy-error-envelope-type]]'s.
   - Tests: with every target unavailable for new sessions, a first turn gets
     the typed `400` at once.
-  - Check a waiting first request again when another target stops being busy.
-    A target unavailable for new sessions at the crossing gets no further
-    look when it frees up, so the request stays in the busy target's line
-    while a first request arriving after is sent to the freed target. There
-    is no known moment to check at, so the freed target's queue has to say
-    when it stops holding arrivals. Each waiting first request then moves as a
-    first request arriving at that moment would, per *Who waits, and who
-    fails over*, so the freed target's queue takes them by its ordinary rule.
-    - Tests: a first request waiting at a busy target moves to the other
-      target, busy at the crossing, once it stops being busy.
   - The target's busy clock starts when the target became unable to take an
     arrival. A request that arrived to wait counts from its own arrival — the
     request's clock, not the target's — which sets the crossing once the

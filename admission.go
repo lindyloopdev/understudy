@@ -115,7 +115,7 @@ func (s *server) admissionQueue(key, upstream string) *targetQueue {
 			upstream:             upstream,
 			firstContentSchedule: s.firstContentSchedule,
 			failoverThreshold:    s.failoverThreshold,
-			changed:              func() { s.applyBusyRefusal(upstream) },
+			changed:              func() { s.applyBusyRefusal(upstream); s.moveWaitingFirstRequests() },
 		}
 		s.admission[key] = q
 	}
@@ -259,6 +259,34 @@ func (s *server) serverBusyWaitEnded(upstream string, p *pending) {
 	p.queue.mu.Unlock()
 }
 
+// moveWaitingFirstRequests reruns the leave check of every first request
+// waiting at a target unavailable for new sessions: such a target names no
+// moment of its own to check at, so a request in its line learns another
+// target stopped holding arrivals only from a queue change. The moments a
+// check names stay the wait's timers' to keep. Takes the server's and each
+// queue's lock itself, so callers must hold neither.
+func (s *server) moveWaitingFirstRequests() {
+	s.mu.Lock()
+	queues := make([]*targetQueue, 0, len(s.admission))
+	for _, q := range s.admission {
+		queues = append(queues, q)
+	}
+	s.mu.Unlock()
+	now := time.Now()
+	for _, q := range queues {
+		q.mu.Lock()
+		_, crossed := q.failoverCrossingLocked(now)
+		waiting := slices.Clone(q.waiting)
+		q.mu.Unlock()
+		if !crossed {
+			continue
+		}
+		for _, p := range waiting {
+			q.leaveIfAnotherTargetTakes(p, now)
+		}
+	}
+}
+
 // targetQueue orders admission to one target by session age: the backend
 // cannot see conversations, so the layer holding every request orders them —
 // oldest session first, so sessions finish rather than interleave turn by
@@ -283,8 +311,9 @@ type targetQueue struct {
 	// it is taken from the server at the queue's creation.
 	failoverThreshold time.Duration
 	// changed runs after a send's response header arrives or a send ends,
-	// so the server can apply its busy-refusal rules; it is taken from the
-	// server at the queue's creation and runs without q.mu held.
+	// so the server can apply its busy-refusal rules and rerun the leave
+	// checks of waiting first requests; it is taken from the server at the
+	// queue's creation and runs without q.mu held.
 	changed func()
 	// refusedModelWaitRank is the rank of the earliest request the server
 	// refused as busy, zero while none waits. It is set while that request
@@ -315,6 +344,12 @@ type pending struct {
 	// left is closed to end the wait of a first turn whose target has held
 	// arrivals past the failover threshold, so the walk routes it elsewhere.
 	left chan struct{}
+	// moveOn is the leave check of a first request waiting in enter: it
+	// reports whether another target would take a first request arriving
+	// now, and otherwise the moment to check again. Set only while that
+	// wait runs, so both the wait's timers and a queue change rerun the
+	// check while it is set.
+	moveOn func() (bool, time.Time)
 	// firstContentTimeouts counts the attempts at this target the
 	// first-content timeout has ended; each doubles the next attempt's
 	// timeout. Per target: one target's slowness says nothing about
@@ -394,7 +429,8 @@ func (q *targetQueue) failoverCrossingLocked(now time.Time) (at time.Time, cross
 // consulted when the target has held arrivals past the failover threshold;
 // if it reports another target taking new sessions, the wait ends with
 // [errUnavailableForNewSessions]; otherwise it reports a moment to consult
-// it again, and the check reruns then. A nil moveOn waits regardless.
+// it again, and the check reruns then or when the target's queue changes.
+// A nil moveOn waits regardless.
 func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc, rank time.Time, moveOn func() (bool, time.Time)) (*pending, error) {
 	p := &pending{queue: q, rank: rank, cancel: cancel, admitted: make(chan struct{}), left: make(chan struct{})}
 	q.mu.Lock()
@@ -425,8 +461,9 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	if held || refusedHolds {
 		q.insert(p)
 		if moveOn != nil {
+			p.moveOn = moveOn
 			at, _ := q.failoverCrossingLocked(now)
-			q.leaveWhenUnavailable(p, at, moveOn)
+			q.leaveWhenUnavailable(p, at)
 		}
 		q.mu.Unlock()
 		select {
@@ -459,42 +496,55 @@ func (q *targetQueue) enter(ctx context.Context, cancel context.CancelCauseFunc,
 	return p, nil
 }
 
-// leaveWhenUnavailable ends p's wait once the queue has held arrivals past
-// the failover threshold and moveOn reports another target taking new
-// sessions. Holding can begin later than at — the earliest holder may
-// leave — so the check reruns at the crossing the queue's holding start
-// then names, and at the moment moveOn names when it reports none taking
-// new sessions.
-func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time, moveOn func() (bool, time.Time)) {
+// leaveWhenUnavailable runs p's leave check at at, and again at each
+// moment the check names.
+func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time) {
 	time.AfterFunc(time.Until(at), func() {
-		now := time.Now()
-		q.mu.Lock()
-		if !slices.Contains(q.waiting, p) {
-			// Admitted, or gone with its client: the wait already ended.
-			q.mu.Unlock()
-			return
-		}
-		next, crossed := q.failoverCrossingLocked(now)
-		q.mu.Unlock()
-		if !crossed && next.After(now) {
-			q.leaveWhenUnavailable(p, next, moveOn)
-			return
-		}
-		// moveOn takes the server's lock, so it is called without q.mu held.
-		taking, askAgain := moveOn()
-		if !taking {
-			if askAgain.After(now) {
-				q.leaveWhenUnavailable(p, askAgain, moveOn)
-			}
-			return
-		}
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		if slices.Contains(q.waiting, p) {
-			q.dropWaiting(p)
-			close(p.left)
+		if next := q.leaveIfAnotherTargetTakes(p, time.Now()); !next.IsZero() {
+			q.leaveWhenUnavailable(p, next)
 		}
 	})
+}
+
+// leaveIfAnotherTargetTakes ends p's wait once the queue has held arrivals
+// past the failover threshold and p's moveOn reports another target taking
+// new sessions, and otherwise returns the moment to check again, or the
+// zero time when none is known. Holding can begin later than the first
+// crossing named — the earliest holder may leave — so the check reruns at
+// each moment named. moveOn takes the server's lock, so it is called
+// without q.mu held.
+func (q *targetQueue) leaveIfAnotherTargetTakes(p *pending, now time.Time) (checkAgain time.Time) {
+	q.mu.Lock()
+	moveOn := p.moveOn
+	if moveOn == nil || !slices.Contains(q.waiting, p) {
+		q.mu.Unlock()
+		return time.Time{}
+	}
+	next, crossed := q.failoverCrossingLocked(now)
+	q.mu.Unlock()
+	if !crossed && next.After(now) {
+		return next
+	}
+	taking, askAgain := moveOn()
+	if taking {
+		q.leave(p)
+		return time.Time{}
+	}
+	if askAgain.After(now) {
+		return askAgain
+	}
+	return time.Time{}
+}
+
+// leave drops p from the waiting line and ends its wait, when it still
+// waits: the walk routes the request as a first request arriving now.
+func (q *targetQueue) leave(p *pending) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if slices.Contains(q.waiting, p) {
+		q.dropWaiting(p)
+		close(p.left)
+	}
 }
 
 // formByWaiting forms the queue: p has waited past its grace period headerless
@@ -765,6 +815,9 @@ func (q *targetQueue) admit() {
 	}
 	p := q.waiting[0]
 	q.waiting = q.waiting[1:]
+	// The leave check belongs to the wait in enter; an admitted request
+	// waits out any later displacement in await.
+	p.moveOn = nil
 	p.arrived = time.Now()
 	q.outstanding = append(q.outstanding, p)
 	close(p.admitted)
