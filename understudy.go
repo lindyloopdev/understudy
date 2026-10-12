@@ -257,7 +257,7 @@ type server struct {
 
 	// TODO(TODO.d/collapse-the-server-state-maps.md): the six maps below sit
 	// in three key spaces — health and admission share a target key, affinity
-	// and sessionAges share a tenant-and-conversation key, and busyLinks
+	// and sessionAges share a tenant-and-conversation key, and busyRefusals
 	// joins upstreamLimiters on the upstream key — so three records would
 	// say what six maps now do. The merge waits on per-field expiry: affinity
 	// releases at its idle TTL while a session's rank outlives it, and a
@@ -279,9 +279,9 @@ type server struct {
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	admission map[string]*targetQueue
-	// busyLinks holds, per canonical upstream account, the targets whose
-	// waiting requests a busy refusal linked to the server's other models.
-	busyLinks map[string]map[*targetQueue]struct{}
+	// busyRefusals holds, per canonical upstream account, the server's
+	// standing busy refusal, if any.
+	busyRefusals map[string]*busyRefusal
 	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
 	// identity, bounding concurrent in-flight requests to each account.
 	upstreamLimiters map[string]*upstreamLimiter
@@ -605,7 +605,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		affinity:                 make(map[string]map[string]lastServed),
 		sessionAges:              make(map[string]map[string]sessionRecord),
 		admission:                make(map[string]*targetQueue),
-		busyLinks:                make(map[string]map[*targetQueue]struct{}),
+		busyRefusals:             make(map[string]*busyRefusal),
 		upstreamLimiters:         make(map[string]*upstreamLimiter),
 	}
 	for _, opt := range opts {

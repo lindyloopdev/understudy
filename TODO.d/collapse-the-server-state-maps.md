@@ -17,14 +17,13 @@ holds two maps:
 | `admission` | `healthKey` — the same key | `*targetQueue` |
 | `affinity` | tenant → conversation key | `lastServed` |
 | `sessionAges` | tenant → conversation key — the same key | first-seen rank and last-seen time |
-| `busyLinks` | `canonicalUpstreamKey` (url + key) | `map[*targetQueue]struct{}` |
+| `busyRefusals` | `canonicalUpstreamKey` (url + key) | `*busyRefusal` |
 | `upstreamLimiters` | `canonicalUpstreamKey` — the same key | `*upstreamLimiter` |
 
 Three records would say the same thing: one per target holding its health and
 its queue, one per conversation holding its bound target and its admission
 standing — the rank it was first seen at, and when it last took a turn — and
-one per upstream account holding its limiter and the busy-refusal links among
-its models.
+one per upstream account holding its limiter and its standing busy refusal.
 
 ## Why it is not a mechanical merge
 
