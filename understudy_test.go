@@ -9126,6 +9126,66 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{newcomer: http.StatusOK},
 		}
 	})
+	// The second target is failing past the failover threshold at the first
+	// target's crossing, and a request naming it directly succeeds there
+	// while the first target is still busy.
+	tests.AddFunc("should send a new session's first request waiting at the first target to the second target once a request to the second target succeeds/the second target was failing past the failover threshold, with its recovery probe not yet due", func(t *testing.T) test {
+		const (
+			demoter  = "the session naming the second target asks"
+			healer   = "the session naming the second target asks again"
+			occupier = "the other session asks"
+			newcomer = "the new session asks"
+		)
+		occupierArrives := time.Second
+		crossing := occupierArrives + admissionGracePeriod + defaultFailoverThreshold
+		newcomerArrives := crossing - 2*time.Second
+		healerArrives := crossing + 2*time.Second
+		firstFrees := defaultRecoveryInterval + 10*time.Second
+		receivedA, receivedB := &receivedMessages{}, &receivedMessages{}
+		first := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedA.add(inboundMessage)
+			if inboundMessage == occupier {
+				select {
+				case <-r.Context().Done():
+					return nil, context.Cause(r.Context())
+				case <-time.After(firstFrees - occupierArrives):
+				}
+			}
+			return admissionJSON(inboundMessage), nil
+		})
+		second := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+			receivedB.add(inboundMessage)
+			if inboundMessage != demoter {
+				return admissionJSON(inboundMessage), nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"only available hosted in China and requires explicit opt in"}}`)),
+			}, nil
+		})
+		return test{
+			server: newTargetsServer(t, map[string]*http.Client{"a": first, "b": second}, map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "a", model: "ma"},
+				{backend: "b", model: "mb"},
+			}}}),
+			received: map[string]*receivedMessages{"a": receivedA, "b": receivedB},
+			arrivals: []clientTurn{
+				// Both name the second target's backend and model directly;
+				// they share its health key, so the refusal demotes the
+				// target and the success clears it.
+				{model: "b/mb", userMessages: []string{demoter}},
+				{model: "m", userMessages: []string{occupier}, after: occupierArrives},
+				{model: "m", userMessages: []string{newcomer}, after: newcomerArrives - occupierArrives},
+				{model: "b/mb", userMessages: []string{healer}, after: healerArrives - newcomerArrives},
+			},
+			reached: map[string][]string{"a": {occupier}, "b": {demoter, healer, newcomer}},
+			// Before the second target's recovery probe is due.
+			secondCheckAt:        defaultRecoveryInterval - 2*time.Second,
+			reachedAtSecondCheck: map[string][]string{"a": {occupier}, "b": {demoter, healer, newcomer}},
+			answered:             map[string]int{newcomer: http.StatusOK, healer: http.StatusOK},
+		}
+	})
 	// The new session's first request arrives before the first target's busy
 	// clock crosses the failover threshold, so it is waiting there at the
 	// crossing; the second target refuses every request it receives, and the
