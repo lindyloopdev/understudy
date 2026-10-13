@@ -255,12 +255,10 @@ type server struct {
 	// whether that handler or the re-send it must not touch runs first.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 
-	// TODO(TODO.d/collapse-the-server-state-maps.md): health and admission
-	// share a target key, and affinity and sessionAges share a
-	// tenant-and-conversation key, so two records would say what four maps
-	// now do. The merge waits on per-field expiry: affinity releases at its
-	// idle TTL while a session's rank outlives it, and a swept health entry
-	// must not take a queue that requests still wait in.
+	// TODO(TODO.d/collapse-the-server-state-maps.md): affinity and
+	// sessionAges share a tenant-and-conversation key, so one record would
+	// say what two maps now do. The merge waits on per-field expiry:
+	// affinity releases at its idle TTL while a session's rank outlives it.
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
