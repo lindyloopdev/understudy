@@ -163,6 +163,61 @@ type targetHealth struct {
 // still being probed is never mistaken for a stranded one.
 const healthTTL = 24 * time.Hour
 
+// healthRecords holds each target's health, keyed by the [healthKey] computed
+// for it. Every change goes through [healthRecords.update], which sweeps first.
+type healthRecords struct {
+	mu      sync.Mutex
+	entries map[string]targetHealth
+}
+
+// update drops every entry untouched for [healthTTL], then runs change on the
+// entries that remain, all under the records' lock. The sweep is the only thing
+// that reclaims an entry named directly and so never walked past.
+func (r *healthRecords) update(change func(e healthEntries)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for id, h := range r.entries {
+		if now.Sub(h.lastTouch) >= healthTTL {
+			delete(r.entries, id)
+		}
+	}
+	change(healthEntries{entries: r.entries, now: now})
+}
+
+// get returns the entry keyed id, and whether there is one.
+func (r *healthRecords) get(id string) (targetHealth, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h, ok := r.entries[id]
+	return h, ok
+}
+
+// healthEntries is the health entries [healthRecords.update] hands a change,
+// with the moment its sweep ran.
+type healthEntries struct {
+	entries map[string]targetHealth
+	now     time.Time
+}
+
+// get returns the entry keyed id, and whether there is one.
+func (e healthEntries) get(id string) (targetHealth, bool) {
+	h, ok := e.entries[id]
+	return h, ok
+}
+
+// put stores h as id's entry, stamped with the sweep's own clock, so a write
+// cannot be aged out by the sweep that preceded it.
+func (e healthEntries) put(id string, h targetHealth) {
+	h.lastTouch = e.now
+	e.entries[id] = h
+}
+
+// drop removes id's entry: the target is healthy again.
+func (e healthEntries) drop(id string) {
+	delete(e.entries, id)
+}
+
 // defaultMaxConcurrentPerUpstream is the per-account limiter's cold-start
 // allowance. It is a starting point, not a ceiling: grow() raises the cap toward
 // the upstream's real capacity on success (shrink()/throttle() pull it back on a
@@ -255,10 +310,12 @@ type server struct {
 	// whether that handler or the re-send it must not touch runs first.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 
+	// health records each target's current failure streak; a target with no
+	// entry is healthy. It has its own lock: a path holding s.mu takes it
+	// inside s.mu, never the other way round.
+	health healthRecords
+
 	mu sync.Mutex
-	// health records each target's current failure streak; a target absent from
-	// the map is healthy.
-	health map[string]targetHealth
 	// conversations holds each conversation's state; the tenant groups the
 	// records so a tenant's can be dropped with it.
 	conversations map[string]map[string]*conversation
@@ -595,7 +652,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
 		fdLimitReader:            readFDSoftLimit,
 		firstContentSchedule:     time.AfterFunc,
-		health:                   make(map[string]targetHealth),
+		health:                   healthRecords{entries: make(map[string]targetHealth)},
 		conversations:            make(map[string]map[string]*conversation),
 		admission:                make(map[string]*targetQueue),
 		upstreams:                make(map[string]*upstreamAccount),
@@ -725,33 +782,39 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	var skipped []Attempt
-	for _, t := range targets {
-		if _, err := s.resolveBackend(backends, t.backend); err != nil {
-			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
-			continue
+	var picked *pick
+	s.health.update(func(e healthEntries) {
+		for _, t := range targets {
+			if _, err := s.resolveBackend(backends, t.backend); err != nil {
+				skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
+				continue
+			}
+			id := healthKey(t, backends)
+			if firstTurn && s.unavailableForNewSessions(id, e.now) {
+				continue
+			}
+			if s.withinFailoverThreshold(e, id) {
+				picked = &pick{target: t, ok: true, skipped: skipped}
+				return
+			}
+			h, _ := e.get(id)
+			if !s.dueRecoveryProbe(e, id) {
+				notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
+					s.nextReattempt(h).Format(time.RFC3339), h.lastError)
+				skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
+				s.noteBackendDown(logLater, e, id, t, h)
+				continue
+			}
+			h.readmitAt = time.Time{}
+			h.lastProbe = e.now
+			e.put(id, h)
+			picked = &pick{target: t, ok: true, demoted: true, skipped: skipped}
+			return
 		}
-		id := healthKey(t, backends)
-		if firstTurn && s.unavailableForNewSessions(id, now) {
-			continue
-		}
-		if s.withinFailoverThreshold(id, now) {
-			return pick{target: t, ok: true, skipped: skipped}
-		}
-		h := s.health[id]
-		if !s.dueRecoveryProbe(id, now) {
-			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
-				s.nextReattempt(h).Format(time.RFC3339), h.lastError)
-			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
-			s.noteBackendDown(logLater, id, t, h)
-			continue
-		}
-		h.readmitAt = time.Time{}
-		h.lastProbe = now
-		h.lastTouch = now
-		s.health[id] = h
-		return pick{target: t, ok: true, demoted: true, skipped: skipped}
+	})
+	if picked != nil {
+		return *picked
 	}
 	// Nothing was healthy, but a target health kept back is still worth attempting.
 	last, ok := s.lastCallableTarget(targets, backends)
@@ -761,19 +824,18 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 // withinFailoverThreshold reports whether the target keyed id has no failure
 // streak, or one the failover threshold has not yet run out on. An entry with
 // no streak is a target tracked for something other than failure — a busy run
-// — and is still fit to serve. Caller holds s.mu.
-func (s *server) withinFailoverThreshold(id string, now time.Time) bool {
-	h, tracked := s.health[id]
-	return !tracked || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold
+// — and is still fit to serve, as of e's sweep.
+func (s *server) withinFailoverThreshold(e healthEntries, id string) bool {
+	h, tracked := e.get(id)
+	return !tracked || h.failingSince.IsZero() || e.now.Sub(h.failingSince) <= s.failoverThreshold
 }
 
 // dueRecoveryProbe reports whether the target keyed id has a health record
-// whose next reattempt has passed, making the target due a recovery probe.
-// It does not claim the probe; only an actual send takes one. Caller holds
-// s.mu.
-func (s *server) dueRecoveryProbe(id string, now time.Time) bool {
-	h, tracked := s.health[id]
-	return tracked && !now.Before(s.nextReattempt(h))
+// whose next reattempt has passed by e's sweep, making the target due a
+// recovery probe. It does not claim the probe; only an actual send takes one.
+func (s *server) dueRecoveryProbe(e healthEntries, id string) bool {
+	h, tracked := e.get(id)
+	return tracked && !e.now.Before(s.nextReattempt(h))
 }
 
 // unavailableForNewSessions reports whether the target keyed id is
@@ -798,17 +860,20 @@ func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey s
 		if id == waitingAtKey {
 			continue
 		}
+		var taking bool
 		s.mu.Lock()
-		now := s.evictStaleHealth()
-		_, unusable := s.resolveBackend(backends, t.backend)
-		taking := unusable == nil && !s.unavailableForNewSessions(id, now) && (s.withinFailoverThreshold(id, now) || s.dueRecoveryProbe(id, now))
-		if !taking && unusable == nil && !s.unavailableForNewSessions(id, now) {
-			// Past the threshold with its probe not yet due: ask again
-			// when the probe falls due.
-			if at := s.nextReattempt(s.health[id]); earliestProbeDue.IsZero() || at.Before(earliestProbeDue) {
-				earliestProbeDue = at
+		s.health.update(func(e healthEntries) {
+			_, unusable := s.resolveBackend(backends, t.backend)
+			taking = unusable == nil && !s.unavailableForNewSessions(id, e.now) && (s.withinFailoverThreshold(e, id) || s.dueRecoveryProbe(e, id))
+			if !taking && unusable == nil && !s.unavailableForNewSessions(id, e.now) {
+				// Past the threshold with its probe not yet due: ask again
+				// when the probe falls due.
+				h, _ := e.get(id)
+				if at := s.nextReattempt(h); earliestProbeDue.IsZero() || at.Before(earliestProbeDue) {
+					earliestProbeDue = at
+				}
 			}
-		}
+		})
 		s.mu.Unlock()
 		if taking {
 			return true, time.Time{}
@@ -1035,7 +1100,6 @@ func pacedTo(at time.Time) downCause {
 // the one understudy's own pacing sets, never both. Built here so the walk and the
 // demotion paths cannot drift apart. Names h.backend, the target that actually
 // failed — not t, which may be a sibling alias the walk never called.
-// Caller holds s.mu only if h came from the map.
 func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 	return []any{
 		slog.String("backend", h.backend),
@@ -1112,7 +1176,7 @@ func (h targetHealth) failedSince() slog.Attr {
 // was recorded, and otherwise a full recovery interval past its last attempt. The
 // walk routes around a failing target until this moment and the "backend down"
 // record reports it, so both read the moment from here. Which schedule set it is
-// still read from readmitAt at each site. Caller holds s.mu.
+// still read from readmitAt at each site.
 func (s *server) nextReattempt(h targetHealth) time.Time {
 	if h.readmitAt.IsZero() {
 		return h.lastProbe.Add(s.recoveryInterval)
@@ -1122,51 +1186,33 @@ func (s *server) nextReattempt(h targetHealth) time.Time {
 
 // noteBackendDown logs t's "backend down" transition once per failure streak, saying
 // why the walk routed around it. It logs through logLater rather than directly,
-// because the caller holds s.mu.
-func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h targetHealth) {
+// because the caller holds the health lock.
+func (s *server) noteBackendDown(logLater deferredLog, e healthEntries, id string, t Target, h targetHealth) {
 	if h.downLogged {
 		return
 	}
 	h.downLogged = true
-	h.lastTouch = time.Now()
-	s.health[id] = h
+	e.put(id, h)
 	// Always paced: every path that benches a target reports its own demotion and
 	// marks it, so a streak still owing a record is one this walk accrued.
 	logLater(msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 }
 
-// evictStaleHealth drops every entry untouched for healthTTL and returns the
-// sweep time, so a caller's own write agrees with the eviction. Caller holds s.mu.
-func (s *server) evictStaleHealth() time.Time {
-	now := time.Now()
-	for id, h := range s.health {
-		if now.Sub(h.lastTouch) >= healthTTL {
-			delete(s.health, id)
-		}
-	}
-	return now
-}
-
-// writeHealth stores t's health under s.mu. It sweeps first — the only thing that
-// reclaims an entry named directly and so never walked past — then stamps the
-// entry with the sweep's own clock, so a write cannot be aged out by the sweep
-// that preceded it. beginStreak builds the entry for a key the map does not hold —
-// a target with no entry is not failing, so a new one opens a streak; updateStreak,
-// when non-nil, revises a streak already under way.
+// writeHealth stores t's health. beginStreak builds the entry for a target
+// with no entry — no entry means not failing, so a new one opens a streak;
+// updateStreak, when non-nil, revises a streak already under way.
 func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak func(now time.Time) targetHealth, updateStreak func(now time.Time, h targetHealth) targetHealth) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
-	h, ok := s.health[id]
-	switch {
-	case !ok:
-		h = beginStreak(now)
-	case updateStreak != nil:
-		h = updateStreak(now, h)
-	}
-	h.lastTouch = now
-	s.health[id] = h
+	s.health.update(func(e healthEntries) {
+		h, ok := e.get(id)
+		switch {
+		case !ok:
+			h = beginStreak(e.now)
+		case updateStreak != nil:
+			h = updateStreak(e.now, h)
+		}
+		e.put(id, h)
+	})
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
@@ -1236,9 +1282,7 @@ func (s *server) withSynthesizedBackoff(ctx context.Context, t Target, backends 
 // failingFor reports how long t's current failure streak has run, or zero when
 // t is healthy.
 func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h, ok := s.health[healthKey(t, backends)]
+	h, ok := s.health.get(healthKey(t, backends))
 	if !ok {
 		return 0
 	}
@@ -1318,7 +1362,7 @@ func (e terminalError) Unwrap() error { return e.error }
 // the upstream asked for outlives the streak that led to it.
 func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
 	// Logged after recordSuccess returns, so the consumer's handler does not block
-	// every other request's walk behind s.mu.
+	// every other request's walk behind the health lock.
 	if backend, shouldLogSuccess := s.recordSuccess(t, backends); shouldLogSuccess {
 		s.logTransition(ctx, "backend up",
 			slog.String("backend", backend),
@@ -1328,7 +1372,7 @@ func (s *server) clearFailure(ctx context.Context, t Target, backends map[string
 }
 
 // logTransition emits a target's health transition. The transition is decided and
-// committed under s.mu before this runs, so the record cannot depend on the request
+// committed under the health lock before this runs, so the record cannot depend on the request
 // that noticed it still being around: a client that leaves in that window would
 // otherwise take a committed state change out of the log with it. A consumer's
 // values travel; only cancellation is dropped.
@@ -1342,29 +1386,30 @@ func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
 // elapsed the entry survives ("", not owed), so the walk still routes around
 // it until the bench clears.
 func (s *server) recordSuccess(t Target, backends map[string]Backend) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
-	h, ok := s.health[id]
-	if !ok {
-		return "", false
-	}
-	if now.Before(h.readmitAt) {
-		s.health[id] = targetHealth{
-			failingSince: now.Add(-s.failoverThreshold),
-			streakBegan:  h.streakBegan,
-			lastProbe:    now,
-			readmitAt:    h.readmitAt,
-			downLogged:   h.downLogged,
-			lastError:    h.lastError,
-			lastTouch:    now,
-			backend:      h.backend,
+	var backend string
+	var owed bool
+	s.health.update(func(e healthEntries) {
+		h, ok := e.get(id)
+		if !ok {
+			return
 		}
-		return "", false
-	}
-	delete(s.health, id)
-	return h.backend, h.downLogged
+		if e.now.Before(h.readmitAt) {
+			e.put(id, targetHealth{
+				failingSince: e.now.Add(-s.failoverThreshold),
+				streakBegan:  h.streakBegan,
+				lastProbe:    e.now,
+				readmitAt:    h.readmitAt,
+				downLogged:   h.downLogged,
+				lastError:    h.lastError,
+				backend:      h.backend,
+			})
+			return
+		}
+		e.drop(id)
+		backend, owed = h.backend, h.downLogged
+	})
+	return backend, owed
 }
 
 // clientFacing maps an error returned by a provider call into the status the

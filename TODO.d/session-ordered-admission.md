@@ -32,27 +32,18 @@ limiter. The steps below remain, in order.
   - Tests: a tenant dropped by the registry leaves no conversation state
     behind once its last request has ended.
 - **Finish the first-content timeout.** DESIGN.md's *A first-content
-  timeout* is built for one request at a time: an attempt with no content
-  within its timeout is canceled and sent again to the same target, on its own
-  timer. The timeout is 60s, doubling with each re-send it causes at that
-  target; a displacement leaves it where it was, and a failover's new target
-  starts again at 60s. What remains:
+  timeout* is built: an attempt with no content within its timeout is canceled
+  and sent again to the same target, together with every other request there
+  that has no response header. The timeout is 60s, doubling with each re-send
+  it causes at that target; a displacement leaves it where it was, and a
+  failover's new target starts again at 60s. What remains:
   - Take the first value from the consumer's own time limit when one is
     supplied, rather than the 60s default sized from lindy's
     notes/2026-09-30-time-to-first-content-measurements.md.
-  - A mass-retry after such a restart follows growth's ordinary rule — burst
-    together, not serialized one at a time — since nothing about a retry
-    changes what growth already knows to do with a fresh admission.
-  - (open) Whether a new arrival accelerates the drop of an already-wedged
-    *headered* request, or only the timeout's own independent timer ever
-    resolves it, is undecided.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two
     decide precedence is unsettled.
-  - Tests: several headerless requests at one target, all wedged together,
-    restart together and are re-admitted per growth's burst rule rather than
-    one at a time.
 - **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
   over*): the typed `400` when every target is unavailable for new sessions —
   the row is [[understudy-error-envelope-type]]'s.
