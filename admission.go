@@ -68,38 +68,28 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evictForgottenSessions(now)
-	ages, ok := s.sessionAges[tenant]
-	if !ok {
-		ages = make(map[string]sessionRecord)
-		s.sessionAges[tenant] = ages
+	c := s.conversationLocked(tenant, key)
+	if c.session != nil {
+		c.session.lastSeen = now
+		return c.session.firstSeen
 	}
-	if rec, ok := ages[key]; ok {
-		ages[key] = sessionRecord{firstSeen: rec.firstSeen, lastSeen: now}
-		return rec.firstSeen
-	}
-	ages[key] = sessionRecord{firstSeen: now, lastSeen: now}
+	c.session = &sessionRecord{firstSeen: now, lastSeen: now}
 	return now
 }
 
-// evictForgottenSessions drops every conversation quiet for
-// [sessionForgetAfter], and every tenant left with nothing.
+// evictForgottenSessions clears every conversation's admission standing quiet
+// for [sessionForgetAfter].
 //
 // TODO(TODO.d/expose-operator-metrics.md): nothing tests this eviction. Test
 // it through the tracked-conversations gauge once it exists.
 //
 // Caller holds s.mu.
 func (s *server) evictForgottenSessions(now time.Time) {
-	for tenant, conversations := range s.sessionAges {
-		for key, rec := range conversations {
-			if now.Sub(rec.lastSeen) >= sessionForgetAfter {
-				delete(conversations, key)
-			}
+	s.evictConversationParts(func(c *conversation) {
+		if c.session != nil && now.Sub(c.session.lastSeen) >= sessionForgetAfter {
+			c.session = nil
 		}
-		// A tenant with nothing left is a run that ended.
-		if len(conversations) == 0 {
-			delete(s.sessionAges, tenant)
-		}
-	}
+	})
 }
 
 // admissionQueue returns the admission queue for a target's availability key

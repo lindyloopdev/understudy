@@ -255,24 +255,13 @@ type server struct {
 	// whether that handler or the re-send it must not touch runs first.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 
-	// TODO(TODO.d/collapse-the-server-state-maps.md): affinity and
-	// sessionAges share a tenant-and-conversation key, so one record would
-	// say what two maps now do. The merge waits on per-field expiry:
-	// affinity releases at its idle TTL while a session's rank outlives it.
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
 	health map[string]targetHealth
-	// affinity records, per token and conversation, the target that last served
-	// it, so a later turn keeps its prefix cache. It is a hint, not a lease: it
-	// reorders candidates pickTarget would accept, and expires once idle. The
-	// token groups the records so a tenant's can be dropped with it.
-	affinity map[string]map[string]lastServed
-	// sessionAges records, per tenant conversation, when it was first seen —
-	// its admission rank — and when it was last seen, which [sessionForgetAfter]
-	// is measured from. The rank is taken at the first turn, so ordering
-	// engages before any history exists to stay coherent with.
-	sessionAges map[string]map[string]sessionRecord
+	// conversations holds each conversation's state; the tenant groups the
+	// records so a tenant's can be dropped with it.
+	conversations map[string]map[string]*conversation
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	// It stays apart from health: a health entry is swept once stale, but a
@@ -607,8 +596,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		fdLimitReader:            readFDSoftLimit,
 		firstContentSchedule:     time.AfterFunc,
 		health:                   make(map[string]targetHealth),
-		affinity:                 make(map[string]map[string]lastServed),
-		sessionAges:              make(map[string]map[string]sessionRecord),
+		conversations:            make(map[string]map[string]*conversation),
 		admission:                make(map[string]*targetQueue),
 		upstreams:                make(map[string]*upstreamAccount),
 	}
@@ -897,6 +885,53 @@ func conversationKey(prefix []json.RawMessage) string {
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
+// conversation is the state Understudy keeps for one tenant conversation. Each
+// part expires on its own clock, and the record goes once both have.
+type conversation struct {
+	// served is the target that last served the conversation, so a later turn
+	// keeps its prefix cache. It is a hint, not a lease: it reorders
+	// candidates pickTarget would accept. nil once idle past
+	// [affinityIdleTTL].
+	served *lastServed
+	// session is the conversation's admission standing. Its rank is taken at
+	// the first turn, so ordering engages before any history exists to stay
+	// coherent with. nil once quiet past [sessionForgetAfter].
+	session *sessionRecord
+}
+
+// conversationLocked returns tenant's conversation key's record, creating it
+// on first use. Caller holds s.mu.
+func (s *server) conversationLocked(tenant, key string) *conversation {
+	conversations, ok := s.conversations[tenant]
+	if !ok {
+		conversations = make(map[string]*conversation)
+		s.conversations[tenant] = conversations
+	}
+	c, ok := conversations[key]
+	if !ok {
+		c = &conversation{}
+		conversations[key] = c
+	}
+	return c
+}
+
+// evictConversationParts runs clearExpired on each conversation, then drops
+// every conversation left with neither part, and every tenant left with no
+// conversation — a run that ended. Caller holds s.mu.
+func (s *server) evictConversationParts(clearExpired func(c *conversation)) {
+	for tenant, conversations := range s.conversations {
+		for key, c := range conversations {
+			clearExpired(c)
+			if c.served == nil && c.session == nil {
+				delete(conversations, key)
+			}
+		}
+		if len(conversations) == 0 {
+			delete(s.conversations, tenant)
+		}
+	}
+}
+
 // lastServed is a conversation's target and when it last served — the age the
 // idle TTL measures.
 type lastServed struct {
@@ -920,27 +955,19 @@ func (s *server) recordServe(tenant, key string, t Target) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.evictIdleAffinity()
-	if s.affinity[tenant] == nil {
-		s.affinity[tenant] = make(map[string]lastServed)
-	}
-	s.affinity[tenant][key] = lastServed{target: t, lastUse: now}
+	s.conversationLocked(tenant, key).served = &lastServed{target: t, lastUse: now}
 }
 
-// evictIdleAffinity drops every record idle past affinityIdleTTL and returns the
-// sweep time, so a caller's write agrees with it. Caller holds s.mu.
+// evictIdleAffinity clears every conversation's target idle past
+// affinityIdleTTL and returns the sweep time, so a caller's write agrees with
+// it. Caller holds s.mu.
 func (s *server) evictIdleAffinity() time.Time {
 	now := time.Now()
-	for tenant, conversations := range s.affinity {
-		for key, b := range conversations {
-			if now.Sub(b.lastUse) >= affinityIdleTTL {
-				delete(conversations, key)
-			}
+	s.evictConversationParts(func(c *conversation) {
+		if c.served != nil && now.Sub(c.served.lastUse) >= affinityIdleTTL {
+			c.served = nil
 		}
-		// A tenant with nothing left is a group with nothing to name it.
-		if len(conversations) == 0 {
-			delete(s.affinity, tenant)
-		}
-	}
+	})
 	return now
 }
 
@@ -950,7 +977,12 @@ func (s *server) evictIdleAffinity() time.Time {
 // idle past affinityIdleTTL is ignored.
 func (s *server) preferLastServed(candidates []Target, tenant, key string) []Target {
 	s.mu.Lock()
-	bound, ok := s.affinity[tenant][key]
+	var bound lastServed
+	c, ok := s.conversations[tenant][key]
+	ok = ok && c.served != nil
+	if ok {
+		bound = *c.served
+	}
 	s.mu.Unlock()
 	if !ok || time.Since(bound.lastUse) >= affinityIdleTTL {
 		return candidates

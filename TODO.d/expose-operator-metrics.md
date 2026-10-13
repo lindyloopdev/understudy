@@ -17,7 +17,8 @@ where to serve them.
 
 - **Decide the metrics surface in DESIGN.md**: how the embedder supplies the
   registry, and what is exposed.
-- **A gauge of the conversations the daemon tracks** (`sessionAges`).
+- **A gauge of the conversations the daemon tracks** (`conversations` with an
+  admission standing).
   - Tests: a conversation quiet past `sessionForgetAfter` is no longer counted
     once another conversation takes a turn. This is the test the eviction
     (`evictForgottenSessions`) ships without.

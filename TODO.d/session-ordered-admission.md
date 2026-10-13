@@ -23,7 +23,7 @@ limiter. The steps below remain, in order.
 ## Work
 
 - **Reclaim a dropped tenant's conversation state at teardown.** The forget
-  backstop drops a quiet conversation's record only after
+  backstop drops a quiet conversation's admission standing only after
   `sessionForgetAfter` — up to a day after a run ends — and a run's token
   never returns, so nothing else names the state again. The consumer's
   session-end signal, when it lands (new library surface, shared with
