@@ -7255,11 +7255,85 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			},
 		}
 	})
-	// TODO: add "should send the request waiting behind a displaced request
-	// once the displaced request's second send shows content, when another
-	// request at the target reached the first-content timeout/the displaced
-	// send had not yet ended". The displaced send's backend answers after
-	// its cancel, as in the raced-answer case above.
+	tests.AddFunc("should send the request waiting behind a displaced request once the displaced request's second send shows content, when another request at the target reached the first-content timeout/the displaced send had not yet ended", func(t *testing.T) test {
+		const (
+			stream     = "the streaming session asks"
+			timedOut   = "the timed-out session asks"
+			older      = "the older session asks"
+			olderAgain = "the older session asks again"
+			displaced  = "the displaced session asks"
+			waiting    = "the waiting session asks"
+		)
+		var (
+			timedOutArrives = time.Second
+			// Within the grace period, so it is sent at once and ranks
+			// between the timed-out and displaced requests.
+			olderArrives      = timedOutArrives + admissionGracePeriod/2
+			displacedArrives  = timedOutArrives + admissionGracePeriod + time.Second
+			streamEnds        = displacedArrives + 2*time.Second
+			timedOutExpires   = timedOutArrives + initialFirstContentTimeout
+			olderAgainArrives = timedOutExpires - time.Second
+			waitingArrives    = olderAgainArrives + time.Second/2
+			displacedSendEnds = timedOutExpires + time.Second
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			switch {
+			case sentMessage == stream:
+				// Its end sends the displaced session's request as a refill.
+				return admissionStream(r, time.After(streamEnds), nil), nil
+			case sentMessage == older:
+				return sseAnswer(sentMessage), nil
+			case sentMessage == displaced && received.count(sentMessage) == 1:
+				// The displacement cancels this send before the timed-out
+				// request's timeout fires, but the send ends after it: the
+				// condition under test.
+				<-r.Context().Done()
+				time.Sleep(displacedSendEnds - olderAgainArrives)
+				return nil, context.Cause(r.Context())
+			case sentMessage == waiting, sentMessage == timedOut && received.count(sentMessage) == 1:
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// The remaining sends never finish, so none triggers sending
+			// a further request.
+			return admissionStream(r, nil, nil), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
+				{inboundMessage: timedOut, body: admissionTurn(admissionMsg("user", timedOut)), after: timedOutArrives},
+				{inboundMessage: older, body: admissionTurn(admissionMsg("user", older)), after: olderArrives - timedOutArrives},
+				// The timed-out request holds the target's arrivals past its
+				// grace period, so this one waits until the stream ends.
+				{inboundMessage: displaced, body: admissionTurn(admissionMsg("user", displaced)), after: displacedArrives - olderArrives},
+				// Outranks the displaced session's request, and is outranked
+				// by the timed-out one, so it displaces only the first.
+				{inboundMessage: olderAgain, body: admissionTurn(
+					admissionMsg("user", older),
+					admissionMsg("assistant", "answered"),
+					admissionMsg("user", olderAgain),
+				), after: olderAgainArrives - displacedArrives},
+				{inboundMessage: waiting, body: admissionTurn(admissionMsg("user", waiting)), after: waitingArrives - olderAgainArrives},
+			},
+			wait:     displacedSendEnds + time.Second - waitingArrives,
+			followed: older,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, older)},
+			sends:    1,
+			check: func() {
+				// The re-sent requests show content and stay open, so the
+				// waiting request is sent last, when the displaced
+				// request's re-send shows content.
+				want := []string{stream, timedOut, older, displaced, timedOut, olderAgain, displaced, waiting}
+				if d := gocmp.Diff(want, received.all()); d != "" {
+					t.Errorf("sends that reached the target (-want +got):\n%s", d)
+				}
+			},
+		}
+	})
 	tests.AddFunc("should withdraw an older session's request silent past its grace period and send it again when a younger session's headered request holds the target", func(t *testing.T) test {
 		const (
 			olderMessage   = "the older session asks a target a younger session holds"
