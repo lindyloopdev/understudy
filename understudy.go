@@ -255,13 +255,12 @@ type server struct {
 	// whether that handler or the re-send it must not touch runs first.
 	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
 
-	// TODO(TODO.d/collapse-the-server-state-maps.md): the six maps below sit
-	// in three key spaces — health and admission share a target key, affinity
-	// and sessionAges share a tenant-and-conversation key, and busyRefusals
-	// joins upstreamLimiters on the upstream key — so three records would
-	// say what six maps now do. The merge waits on per-field expiry: affinity
-	// releases at its idle TTL while a session's rank outlives it, and a
-	// swept health entry must not strand a queue's waiters.
+	// TODO(TODO.d/collapse-the-server-state-maps.md): health and admission
+	// share a target key, and affinity and sessionAges share a
+	// tenant-and-conversation key, so two records would say what four maps
+	// now do. The merge waits on per-field expiry: affinity releases at its
+	// idle TTL while a session's rank outlives it, and a swept health entry
+	// must not take a queue that requests still wait in.
 	mu sync.Mutex
 	// health records each target's current failure streak; a target absent from
 	// the map is healthy.
@@ -279,12 +278,17 @@ type server struct {
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	admission map[string]*targetQueue
-	// busyRefusals holds, per canonical upstream account, the server's
-	// standing busy refusal, if any.
-	busyRefusals map[string]*busyRefusal
-	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
-	// identity, bounding concurrent in-flight requests to each account.
-	upstreamLimiters map[string]*upstreamLimiter
+	// upstreams holds each canonical upstream account's state, keyed by
+	// [canonicalUpstreamKey].
+	upstreams map[string]*upstreamAccount
+}
+
+// upstreamAccount is the state Understudy keeps for one upstream account.
+type upstreamAccount struct {
+	// limiter bounds concurrent in-flight requests to the account.
+	limiter *upstreamLimiter
+	// busyRefusal is the server's standing busy refusal, if any.
+	busyRefusal *busyRefusal
 }
 
 // upstreamLimiter bounds concurrent in-flight requests to one upstream. Unlike a
@@ -605,8 +609,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		affinity:                 make(map[string]map[string]lastServed),
 		sessionAges:              make(map[string]map[string]sessionRecord),
 		admission:                make(map[string]*targetQueue),
-		busyRefusals:             make(map[string]*busyRefusal),
-		upstreamLimiters:         make(map[string]*upstreamLimiter),
+		upstreams:                make(map[string]*upstreamAccount),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -652,12 +655,18 @@ func healthKey(t Target, backends map[string]Backend) string {
 func (s *server) upstreamLimiter(key string) *upstreamLimiter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	lim, ok := s.upstreamLimiters[key]
+	return s.upstreamAccountLocked(key).limiter
+}
+
+// upstreamAccountLocked returns the state for the given canonical upstream
+// key, creating it on first use. Caller holds s.mu.
+func (s *server) upstreamAccountLocked(key string) *upstreamAccount {
+	a, ok := s.upstreams[key]
 	if !ok {
-		lim = newUpstreamLimiter(s.maxConcurrentPerUpstream)
-		s.upstreamLimiters[key] = lim
+		a = &upstreamAccount{limiter: newUpstreamLimiter(s.maxConcurrentPerUpstream)}
+		s.upstreams[key] = a
 	}
-	return lim
+	return a
 }
 
 // ServeHTTP dispatches to the server's built middleware chain.

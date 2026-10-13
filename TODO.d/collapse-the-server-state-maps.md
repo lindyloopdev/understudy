@@ -8,7 +8,7 @@ per-target health the walk reads); [DESIGN.md §Session-Ordered
 Admission](../DESIGN.md#session-ordered-admission) — the queue's key and a
 session's rank.
 
-Six maps hang off `server` under one `mu`, in three key spaces, each of which
+Four maps hang off `server` under one `mu`, in two key spaces, each of which
 holds two maps:
 
 | Map | Key | Value |
@@ -17,13 +17,10 @@ holds two maps:
 | `admission` | `healthKey` — the same key | `*targetQueue` |
 | `affinity` | tenant → conversation key | `lastServed` |
 | `sessionAges` | tenant → conversation key — the same key | first-seen rank and last-seen time |
-| `busyRefusals` | `canonicalUpstreamKey` (url + key) | `*busyRefusal` |
-| `upstreamLimiters` | `canonicalUpstreamKey` — the same key | `*upstreamLimiter` |
 
-Three records would say the same thing: one per target holding its health and
-its queue, one per conversation holding its bound target and its admission
-standing — the rank it was first seen at, and when it last took a turn — and
-one per upstream account holding its limiter and its standing busy refusal.
+Two records would say the same thing: one per target holding its health and
+its queue, and one per conversation holding its bound target and its admission
+standing — the rank it was first seen at, and when it last took a turn.
 
 ## Why it is not a mechanical merge
 

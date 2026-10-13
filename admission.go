@@ -143,11 +143,11 @@ func (s *server) queueBehindServerBusy(upstream string, p *pending) bool {
 	p.queue.insert(p)
 	p.serverBusyWait = true
 	p.queue.mu.Unlock()
-	refusal := s.busyRefusals[upstream]
-	if refusal == nil {
-		refusal = &busyRefusal{waiters: make(map[*pending]struct{})}
-		s.busyRefusals[upstream] = refusal
+	account := s.upstreamAccountLocked(upstream)
+	if account.busyRefusal == nil {
+		account.busyRefusal = &busyRefusal{waiters: make(map[*pending]struct{})}
 	}
+	refusal := account.busyRefusal
 	refusal.waiters[p] = struct{}{}
 	refusal.awaited = make(map[*targetQueue]struct{}, len(running))
 	for _, q := range running {
@@ -182,11 +182,12 @@ type busyRefusal struct {
 // requests again in rank order. Runs without any queue's lock held.
 func (s *server) applyBusyRefusal(upstream string) {
 	s.mu.Lock()
-	refusal := s.busyRefusals[upstream]
-	if refusal == nil {
+	account := s.upstreams[upstream]
+	if account == nil || account.busyRefusal == nil {
 		s.mu.Unlock()
 		return
 	}
+	refusal := account.busyRefusal
 	var resendQueues []*targetQueue
 	for p := range refusal.waiters {
 		p.queue.mu.Lock()
@@ -199,7 +200,7 @@ func (s *server) applyBusyRefusal(upstream string) {
 		p.queue.mu.Unlock()
 	}
 	if len(refusal.waiters) == 0 {
-		delete(s.busyRefusals, upstream)
+		account.busyRefusal = nil
 		var holding []*targetQueue
 		for _, q := range s.admission {
 			if q.upstream != upstream {

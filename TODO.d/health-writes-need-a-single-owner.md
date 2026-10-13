@@ -16,7 +16,7 @@ path repeats the `lock, sweep, key` preamble for itself.
 - **Decide who owns the health state.** Extract a type that owns the map and
   sweeps inside its only mutating entry point, so the sweep-before-write rule
   is enforced rather than merely followed by convention. This also splits
-  `s.mu`, which today also guards `upstreamLimiters`.
+  `s.mu`, which today also guards the `upstreams` map.
 
 Not a data race: `s.mu` serialises every read and write today. This is about
 what a health write means, which no lock answers.
