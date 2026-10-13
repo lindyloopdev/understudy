@@ -4240,7 +4240,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should fail over within the request when a target returns a sustainedRate 429", test{
+	tests.Add("should fail over within the request when a target answers with a 429 whose Retry-After is long enough to demote it", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(*http.Request, int) (*http.Response, error) {
 				return &http.Response{
@@ -4258,7 +4258,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should fail over within the request when a target returns a transientRate 429", test{
+	tests.Add("should fail over within the request when a target answers with a 429 whose Retry-After is too short to demote it", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("5", "slow down")},
 			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
@@ -4269,11 +4269,21 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/pin-a-transient-429-with-no-targets-left.md): add "should relay a
-	// transientRate 429 to the client when the walk exhausts every target" — every
-	// case above pairs the transientRate 429 with a healthy fallback; none covers
-	// the walk running out of candidates with a transientRate 429 as the last
-	// failure.
+	tests.Add("should answer the client with a 429 when every target answers with a 429 whose Retry-After is too short to demote it", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("5", "slow down")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: throttling("5", "slow down")},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "5", wantBackend: "b"},
+		},
+	})
+	// TODO(TODO.d/weigh-every-candidates-contribution.md): add "should give the
+	// client the soonest Retry-After when every target answers with a 429 whose
+	// Retry-After is too short to demote it" — with a at 3s and b at 5s the
+	// client is told 5s today, since the client gets the last target's failure
+	// unless that failure is a refusal or a 501.
 
 	tests.Add("should fail over within the request when a target's credential is out of funds", test{
 		backends: map[string]backendStub{
@@ -10665,7 +10675,7 @@ func TestClassifyLimit(t *testing.T) {
 			condition:   bareRateLimit,
 		},
 	})
-	tests.AddFunc("should classify a 429 with a Retry-After at the sustained-rate threshold as sustainedRate", func(*testing.T) test {
+	tests.AddFunc("should classify a 429 whose Retry-After reaches the demotion threshold as long enough to demote the target", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
 				return retryAfterError{
@@ -10683,7 +10693,7 @@ func TestClassifyLimit(t *testing.T) {
 			},
 		}
 	})
-	tests.AddFunc("should classify a 429 with a Retry-After just below the sustained-rate threshold as transientRate", func(*testing.T) test {
+	tests.AddFunc("should classify a 429 whose Retry-After is just under the demotion threshold as too short to demote the target", func(*testing.T) test {
 		return test{
 			buildErr: func() error {
 				return retryAfterError{
