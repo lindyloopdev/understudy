@@ -41,14 +41,16 @@ break one of them:
   per-field expiry: drop the bound target at the idle TTL, and keep the rank
   until the last-seen time falls that far behind.
 - **`evictStaleHealth` sweeps health, but a `targetQueue` can hold goroutines
-  parked waiting to be admitted.** Evicting a queue with waiters strands them, so the
-  sweep must skip a queue that is not empty (or the queue must hold the record
-  alive itself).
+  parked waiting to be admitted.** Evicting a queue with waiters splits it: a
+  new arrival gets a fresh queue and is sent ahead of them. So the sweep must
+  skip a queue that is not empty (or the queue must hold the record alive
+  itself).
 
 ## Work
 
 - Merge each pair into one record, keeping `mu`'s single-lock discipline.
-- Give each field its own expiry rule, per above, and pin in a test that a
-  target with a non-empty queue is not swept.
-- Strict refactor: no behavior change, no test diff beyond that expiry pin,
-  which is behavior the existing sweeps already own.
+- Give each field its own expiry rule, per above.
+- Strict refactor: no behavior change, no test diff.
+  - Tests: "should hold a new request at a target behind a request that has
+    waited there longer than the target's health record is kept" pins the
+    queue's survival.

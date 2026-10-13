@@ -9679,6 +9679,53 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			reached: map[string][]string{"a": {bound, occupier}},
 		}
 	})
+	tests.AddFunc("should hold a new request at a target behind a request that has waited there longer than the target's health record is kept", func(t *testing.T) test {
+		const (
+			occupier = "the occupying session asks"
+			waiter   = "the waiting session asks"
+			late     = "the late session asks"
+		)
+		occupierAnswerAfter := healthTTL + 2*time.Minute
+		// The occupier is sent again at each first-content timeout, so
+		// only the other requests are recorded.
+		received := &receivedMessages{}
+		var answerAt time.Time
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			if inboundMessage != occupier {
+				received.add(inboundMessage)
+				return admissionJSON(inboundMessage), nil
+			}
+			if answerAt.IsZero() {
+				answerAt = time.Now().Add(occupierAnswerAfter)
+			}
+			select {
+			case <-r.Context().Done():
+				return nil, context.Cause(r.Context())
+			case <-time.After(time.Until(answerAt)):
+				// An open stream holds its place without ending, so the
+				// queue sends one request at a time, oldest session first.
+				return admissionStream(r, nil, nil), nil
+			}
+		})
+		return test{
+			server: newTargetsServer(t, map[string]*http.Client{"openai": backend}, map[string]LogicalModel{"m": {Targets: []Target{
+				{backend: "openai", model: "gpt-4"},
+			}}}),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{model: "m", userMessages: []string{occupier}, clientLeavesAfter: 2 * healthTTL},
+				{model: "m", userMessages: []string{waiter}, after: admissionGracePeriod + time.Second, clientLeavesAfter: 2 * healthTTL},
+				// Its walk to the logical model's target sweeps the health
+				// records, once the waiting request has waited longer than
+				// they are kept.
+				{model: "m", userMessages: []string{late}, after: healthTTL + time.Minute},
+			},
+			reached:              map[string][]string{},
+			secondCheckAt:        occupierAnswerAfter + time.Minute,
+			reachedAtSecondCheck: map[string][]string{"openai": {waiter, late}},
+			answered:             map[string]int{waiter: http.StatusOK, late: http.StatusOK},
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
