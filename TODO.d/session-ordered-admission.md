@@ -58,14 +58,6 @@ limiter. The steps below remain, in order.
   the row is [[understudy-error-envelope-type]]'s.
   - Tests: with every target unavailable for new sessions, a first turn gets
     the typed `400` at once.
-  - The target's busy clock starts when the target became unable to take an
-    arrival. A request that arrived to wait counts from its own arrival — the
-    request's clock, not the target's — which sets the crossing once the
-    earliest waiter leaves before it. (open) Which moment the remaining busy
-    period began then.
-    - Tests: a first turn waiting when the earliest waiter leaves before the
-      crossing moves on at the crossing the target's remaining busy period
-      names.
 - **A 429 with `Retry-After` on a request that waits benches the target** —
   the existing `recordRateLimited` — **and admits the highest-ranked request
   whose target is not benched**, instead of taking the ladder. Blocked on the

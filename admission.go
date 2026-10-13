@@ -322,6 +322,11 @@ type targetQueue struct {
 	// request that waiter outranks. The server sets and clears it under
 	// q.mu.
 	refusedModelWaitRank time.Time
+	// holdingSince is when the queue's present holding of arrivals began,
+	// the clock the failover crossing counts from. A request leaving the
+	// queue leaves it standing; it is zero while the queue would take an
+	// arrival without holding it. holdingSinceLocked updates it.
+	holdingSince time.Time
 }
 
 // refusedModelWaiting reports whether a request the server refused as busy
@@ -376,13 +381,13 @@ func (p *pending) pastGrace(now time.Time) bool {
 }
 
 // holdingSinceLocked reports whether q would hold an arrival arriving at
-// now, and the earliest moment its state shows that holding beginning: an
-// unconfirmed request past its grace period holds from the moment its grace
-// period ended — a displaced request no less than one at the target, since
-// displacement moved nothing — and a request that arrived to wait holds from
-// its arrival. The clock comes from the queue's own state,
-// not from arrivals: a target skipped on a first turn may get none. Caller
-// holds q.mu.
+// now, and when the present holding began, keeping [targetQueue.holdingSince]
+// from moving later once set. The members name the holding's start: an
+// unconfirmed request past its grace period holds from the moment its
+// grace period ended — a displaced request no less than one at the target,
+// since displacement moved nothing — and a request that arrived to wait
+// holds from its arrival. A target skipped on a first turn may never hold,
+// leaving the clock zero. Caller holds q.mu.
 func (q *targetQueue) holdingSinceLocked(now time.Time) (time.Time, bool) {
 	var since time.Time
 	for _, p := range q.waiting {
@@ -404,7 +409,13 @@ func (q *targetQueue) holdingSinceLocked(now time.Time) (time.Time, bool) {
 			since = at
 		}
 	}
-	return since, !since.IsZero()
+	switch {
+	case since.IsZero():
+		q.holdingSince = time.Time{}
+	case q.holdingSince.IsZero() || since.Before(q.holdingSince):
+		q.holdingSince = since
+	}
+	return q.holdingSince, !q.holdingSince.IsZero()
 }
 
 // failoverCrossingLocked reports the moment the queue's holding of arrivals
@@ -509,9 +520,9 @@ func (q *targetQueue) leaveWhenUnavailable(p *pending, at time.Time) {
 // leaveIfAnotherTargetTakes ends p's wait once the queue has held arrivals
 // past the failover threshold and p's moveOn reports another target taking
 // new sessions, and otherwise returns the moment to check again, or the
-// zero time when none is known. Holding can begin later than the first
-// crossing named — the earliest holder may leave — so the check reruns at
-// each moment named. moveOn takes the server's lock, so it is called
+// zero time when none is known. The clock stops when the queue would take an
+// arrival without holding it, and holding may begin again later, so the check
+// reruns at each moment named. moveOn takes the server's lock, so it is called
 // without q.mu held.
 func (q *targetQueue) leaveIfAnotherTargetTakes(p *pending, now time.Time) (checkAgain time.Time) {
 	q.mu.Lock()
