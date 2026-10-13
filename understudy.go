@@ -275,6 +275,9 @@ type server struct {
 	sessionAges map[string]map[string]sessionRecord
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
+	// It stays apart from health: a health entry is swept once stale, but a
+	// queue is never dropped, since dropping one would let a new arrival be
+	// sent ahead of the requests still waiting in it.
 	admission map[string]*targetQueue
 	// upstreams holds each canonical upstream account's state, keyed by
 	// [canonicalUpstreamKey].

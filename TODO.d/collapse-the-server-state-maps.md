@@ -16,8 +16,7 @@ Two maps hang off `server` under one `mu` with the same key:
 
 One record per conversation would say the same thing: its bound target and its
 admission standing — the rank it was first seen at, and when it last took a
-turn. (Target health stays apart from the admission queues:
-[notes/2026-10-13-health-stays-apart-from-admission-queues.md](../notes/2026-10-13-health-stays-apart-from-admission-queues.md).)
+turn.
 
 ## Why it is not a mechanical merge
 
