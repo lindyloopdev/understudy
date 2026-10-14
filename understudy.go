@@ -1313,6 +1313,30 @@ func (f failedAttempt) record(ctx context.Context) {
 	addLogCalled(ctx, f.backend, f.upstreamModel, f.status(), f.raw)
 }
 
+// throttledDisplaces reports whether the verdict answers with incumbent, a
+// throttle the walk replayed past, rather than with last, the failure that
+// ended the walk: for a refusal or an unimplemented operation, which offers
+// nothing a client could wait out; otherwise, when both sent a delay upstream
+// and incumbent's is sooner. A delay understudy synthesized, on either error,
+// is not weighed.
+// TODO(TODO.d/weigh-every-candidates-contribution.md): weigh synthesized
+// delays.
+func throttledDisplaces(last, incumbent error) bool {
+	if isAccessRefused(last) || yerrors.HTTPStatus(last) == http.StatusNotImplemented {
+		return true
+	}
+	sentDelay := func(err error) (time.Duration, bool) {
+		if _, synthesized := errors.AsType[retryAfterError](err); synthesized {
+			return 0, false
+		}
+		sig := classifyLimit(err)
+		return sig.retryAfter, sig.hasRetryAfter
+	}
+	lastDelay, lastSent := sentDelay(last)
+	incumbentDelay, incumbentSent := sentDelay(incumbent)
+	return lastSent && incumbentSent && incumbentDelay < lastDelay
+}
+
 // terminalFailure marks err terminal — the response path rejects it as
 // non-retryable rather than relaying it — when remaining holds nothing understudy
 // could call, whether because it is empty or because every candidate in it names a
@@ -2722,12 +2746,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 	// The walk is over, by either road: it ran out of candidates, or its last failure
 	// was one no other candidate could answer for. What it answers with is that
-	// failure, unless an earlier candidate offered a return it can still make.
+	// failure, unless an earlier candidate offered the sooner return.
 	f := *lastFailure
 	setLogUpstreamStatus(r.Context(), f.status())
 	answer, answering := f.answer, f.target
-	if throttled != nil &&
-		(isAccessRefused(f.raw) || yerrors.HTTPStatus(f.raw) == http.StatusNotImplemented) {
+	if throttled != nil && throttledDisplaces(f.raw, throttled.raw) {
 		// An earlier candidate answers, so this one is a target the request did not
 		// serve from — and the only record of why.
 		f.record(r.Context())

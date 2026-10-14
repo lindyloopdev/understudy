@@ -26,15 +26,12 @@ is also computable. The rows below are blocked on each other, not independent:
 - A **plain `5xx` from a fresh (within-threshold) pick** offers that endpoint's
   synthesized interval, but never replays, so it ends the walk as the last failure
   rather than contributing to the verdict — and takes an earlier throttle's sooner
-  return down with it, since the verdict displaces the last failure only for a
-  refusal or a `501`. This blocks the bench row: the walk that leaves a bench
-  uncalled usually ends on a `5xx`, so the comparison has nothing to weigh the
-  bench against. A demoted target's due half-open probe replays a `5xx` onto the
-  next untried target instead, scoping this row to the fresh-pick case.
-- When the **last target tried answers a 429 with a delay**, the client gets
-  that delay even when an earlier target's is sooner: measured, with `[a: 429
-  for 3s, b: 429 for 5s]` the client is told 5s. The cause is the same as the
-  `5xx` row's: the last failure is replaced only by a refusal or a `501`.
+  return down with it, since the verdict weighs only delays an upstream sent,
+  not the interval it synthesizes for this row. This blocks the bench row: the
+  walk that leaves a bench uncalled usually ends on a `5xx`, so the comparison
+  has nothing to weigh the bench against. A demoted target's due half-open
+  probe replays a `5xx` onto the next untried target instead, scoping this row
+  to the fresh-pick case.
 - A **stall** offers the synthesized stall backoff.
 - A walk ending on a target **unusable as configured** still discards an earlier
   throttle. Reachability unverified: `pickTarget` skips such targets rather than

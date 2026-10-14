@@ -4279,11 +4279,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "5", wantBackend: "b"},
 		},
 	})
-	// TODO(TODO.d/weigh-every-candidates-contribution.md): add "should give the
-	// client the soonest Retry-After when every target answers with a 429 whose
-	// Retry-After is too short to demote it" — with a at 3s and b at 5s the
-	// client is told 5s today, since the client gets the last target's failure
-	// unless that failure is a refusal or a 501.
+	tests.Add("should give the client the soonest Retry-After when every target answers with a 429 whose Retry-After is too short to demote it", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("3", "back in three")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: throttling("5", "back in five")},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in three","type":"rate_limit_error"}}`, wantRetryAfter: "3", wantBackend: "b"},
+		},
+	})
 
 	tests.Add("should fail over within the request when a target's credential is out of funds", test{
 		backends: map[string]backendStub{
