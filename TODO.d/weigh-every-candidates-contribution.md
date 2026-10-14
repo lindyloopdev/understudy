@@ -23,21 +23,18 @@ is also computable. The rows below are blocked on each other, not independent:
   because `untriedTargets` ignores health, so any replay calls the benched
   candidate anyway. Measured: with `[a benched, b: 401]` the walk calls `a`, so
   "declined to call" is far rarer than §Understudy implies.
-- A **plain `5xx` from a fresh (within-threshold) pick** offers that endpoint's
-  synthesized interval, but never replays, so it ends the walk as the last failure
-  rather than contributing to the verdict — and takes an earlier throttle's sooner
-  return down with it, since the verdict weighs only delays an upstream sent,
-  not the interval it synthesizes for this row. This blocks the bench row: the
-  walk that leaves a bench uncalled usually ends on a `5xx`, so the comparison
-  has nothing to weigh the bench against. A demoted target's due half-open
-  probe replays a `5xx` onto the next untried target instead, scoping this row
-  to the fresh-pick case.
+- An **earlier candidate's synthesized interval** — the wait understudy hands a
+  replayed-past `429` that sent no delay of its   own — is not weighed: only
+  a delay the incumbent's upstream sent displaces the failure that ended the
+  walk. Measured: an earlier bare `429` against a later target's Retry-After of
+  120 is answered with 120.
 - A **stall** offers the synthesized stall backoff.
 - A walk ending on a target **unusable as configured** still discards an earlier
   throttle. Reachability unverified: `pickTarget` skips such targets rather than
   ending a walk with their error.
 
-So the `5xx` row comes next, then the rest of the table together. Building the
+So the rest of the table comes next, together — the last failure's synthesized
+interval is now weighed, which was what the bench row waited on. Building the
 bench row alone would honor the promise in one corner and break it in the common
 case, which is worse than breaking it everywhere.
 

@@ -4446,9 +4446,20 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should give the client an earlier target's Retry-After when it is sooner than the wait understudy gives for the last target's server error", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: throttling("3", "back in three")},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in three","type":"rate_limit_error"}}`, wantRetryAfter: "3"},
+		},
+	})
+
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): the rows that entry leaves
-	// unbuilt — a bench, a stall, a synthesized interval — belong beside these once
-	// there is something to weigh them against.
+	// unbuilt — a bench, a stall, an earlier candidate's synthesized interval — belong
+	// beside these once there is something to weigh them against.
 
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{

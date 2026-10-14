@@ -1316,11 +1316,12 @@ func (f failedAttempt) record(ctx context.Context) {
 // throttledDisplaces reports whether the verdict answers with incumbent, a
 // throttle the walk replayed past, rather than with last, the failure that
 // ended the walk: for a refusal or an unimplemented operation, which offers
-// nothing a client could wait out; otherwise, when both sent a delay upstream
-// and incumbent's is sooner. A delay understudy synthesized, on either error,
-// is not weighed.
-// TODO(TODO.d/weigh-every-candidates-contribution.md): weigh synthesized
-// delays.
+// nothing a client could wait out; otherwise, when the delay incumbent sent
+// upstream is sooner than the wait last offers — a delay last's upstream
+// sent, or one understudy synthesized for it. A delay understudy synthesized
+// for incumbent is not weighed.
+// TODO(TODO.d/weigh-every-candidates-contribution.md): weigh a delay
+// understudy synthesized for the incumbent.
 func throttledDisplaces(last, incumbent error) bool {
 	if isAccessRefused(last) || yerrors.HTTPStatus(last) == http.StatusNotImplemented {
 		return true
@@ -1332,9 +1333,9 @@ func throttledDisplaces(last, incumbent error) bool {
 		sig := classifyLimit(err)
 		return sig.retryAfter, sig.hasRetryAfter
 	}
-	lastDelay, lastSent := sentDelay(last)
 	incumbentDelay, incumbentSent := sentDelay(incumbent)
-	return lastSent && incumbentSent && incumbentDelay < lastDelay
+	lastSig := classifyLimit(last)
+	return incumbentSent && lastSig.hasRetryAfter && incumbentDelay < lastSig.retryAfter
 }
 
 // terminalFailure marks err terminal — the response path rejects it as
