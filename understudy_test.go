@@ -7681,8 +7681,8 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// received by the second check; nil means no answer is checked.
 		answered map[string]int
 		// waited is how long each inbound message's log record must report
-		// the request waited for its target before it was sent, read at the
-		// second check; nil means no record is checked.
+		// the request waited for its target, read at the second check;
+		// nil means no record is checked.
 		waited map[string]time.Duration
 	}
 
@@ -9796,9 +9796,61 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			waited:               map[string]time.Duration{second: secondWaits},
 		}
 	})
-	// TODO(TODO.d/log-request-timings.md): add "should log the total time a
-	// request waited for its target when it was sent there again after a
-	// displacement or a first-content timeout".
+
+	tests.AddFunc("should log the total time a request waited for its target when it was sent there again after an older session's request displaced it", func(t *testing.T) test {
+		const (
+			olderOpening = "the older session asks"
+			olderLater   = "the older session asks again"
+			followed     = "the followed session asks"
+		)
+		var (
+			// Past the opening request's grace period, so the target holds
+			// the followed request.
+			followedArrives = admissionGracePeriod + time.Second
+			firstWait       = 5 * time.Second
+			secondWait      = 3 * time.Second
+			// The followed request has sat at the target past its grace
+			// period by then, so the older session's request displaces it.
+			displacesAt = followedArrives + firstWait + admissionGracePeriod + time.Second
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			switch inboundMessage {
+			case olderOpening:
+				// Its content is what lets the followed request through the
+				// first time.
+				return admissionStreamContentAt(r, time.After(followedArrives+firstWait), nil), nil
+			case olderLater:
+				// Its content is what lets the followed request through the
+				// second time.
+				return admissionStreamContentAt(r, time.After(secondWait), nil), nil
+			case followed:
+				if received.count(followed) > 1 {
+					return admissionJSON(inboundMessage), nil
+				}
+			}
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		return test{
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{olderOpening}},
+				{userMessages: []string{followed}, after: followedArrives},
+				{userMessages: []string{olderOpening, olderLater}, after: displacesAt - followedArrives},
+			},
+			reached: map[string][]string{"openai": {olderOpening, followed, olderLater}},
+			// The followed request appears twice: the older session's
+			// request displaces its first send, and its client receives the
+			// second send's answer.
+			secondCheckAt:        displacesAt + secondWait + time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {olderOpening, followed, olderLater, followed}},
+			answered:             map[string]int{followed: http.StatusOK},
+			waited:               map[string]time.Duration{followed: firstWait + secondWait},
+		}
+	})
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
@@ -9830,7 +9882,7 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 					continue
 				}
 				if rec.TimeQueued != want {
-					t.Errorf("%q's record reports it waited %s for its target before it was sent, want %s", label, rec.TimeQueued, want)
+					t.Errorf("%q's record reports it waited %s for its target, want %s", label, rec.TimeQueued, want)
 				}
 			}
 		})

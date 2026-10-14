@@ -1646,9 +1646,9 @@ type LogRecord struct {
 	// request upstream to that attempt's first content, or zero when no
 	// content was relayed.
 	TimeToFirstContent time.Duration
-	// TimeQueued is how long the request waited in understudy's queue for
-	// the target that served it before understudy sent it there, or zero
-	// for a request that was sent without waiting.
+	// TimeQueued is the total of every wait in understudy's queue
+	// before each send of the request to the target that served it,
+	// or zero for a request that was sent without waiting.
 	TimeQueued time.Duration
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
@@ -1765,6 +1765,12 @@ func setLogTimeToResponseHeader(ctx context.Context, d time.Duration) {
 func setLogTimeQueued(ctx context.Context, d time.Duration) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.TimeQueued = d
+	}
+}
+
+func addLogTimeQueued(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeQueued += d
 	}
 }
 
@@ -2526,8 +2532,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			return fmt.Errorf("held in the admission queue: %w", err)
 		}
-		// TODO(TODO.d/log-request-timings.md): add the waits before each
-		// re-send to this one.
 		setLogTimeQueued(r.Context(), time.Since(entered))
 
 		// The resend replays the same bytes to the same target when the queue
@@ -2826,8 +2830,9 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 
 // waitToResend readies a re-send after a displacement or a first-content
 // timeout: it closes the response, releases the slot, and cancels the send's
-// context, waits for the queue to admit the request again, and takes a fresh
-// context and body for the next send.
+// context, waits for the queue to admit the request again — adding that wait
+// to the request's logged queue time — and takes a fresh context and body for
+// the next send.
 func (a *attempt) waitToResend() error {
 	if a.resp != nil {
 		_ = a.resp.Body.Close()
@@ -2835,9 +2840,11 @@ func (a *attempt) waitToResend() error {
 	}
 	a.releaseSlot()
 	a.cancel(nil)
+	reentered := time.Now()
 	if err := a.pend.queue.await(a.r.Context(), a.pend); err != nil {
 		return fmt.Errorf("held in the admission queue: %w", err)
 	}
+	addLogTimeQueued(a.r.Context(), time.Since(reentered))
 	a.ctx, a.cancel = context.WithCancelCause(a.r.Context())
 	a.pend.queue.rearm(a.pend, a.cancel)
 	body, err := a.resend()
