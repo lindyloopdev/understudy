@@ -34,7 +34,8 @@ session-ordered admission.
 
 ## Work
 
-- **Log the time a request was held in the admission queue before it was
-  sent.** Shows what admission costs each request.
+- **Log the total time a request was held in the admission queue before it
+  was sent, including the waits between re-sends after a displacement or a
+  first-content timeout.** Shows what admission costs each request.
 - (later) Timings for abandoned attempts — failovers and displacements — in
   `Attempt`.

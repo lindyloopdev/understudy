@@ -1623,8 +1623,9 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 
 // LogRecord carries the per-request telemetry only understudy can supply: which
 // backend and model served, the upstream status, the real error behind an
-// obfuscated body, and the serving attempt's times to its response header and
-// first content. Generic HTTP facts (response status, byte counts) are
+// obfuscated body, the serving attempt's times to its response header and
+// first content, and how long the request waited in the admission queue.
+// Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
 type LogRecord struct {
@@ -1645,6 +1646,10 @@ type LogRecord struct {
 	// request upstream to that attempt's first content, or zero when no
 	// content was relayed.
 	TimeToFirstContent time.Duration
+	// TimeQueued is how long the request waited in understudy's queue for
+	// the target that served it before understudy sent it there, or zero
+	// for a request that was sent without waiting.
+	TimeQueued time.Duration
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
 	// backends a listing could not use or could not reach. A chat request records
@@ -1754,6 +1759,12 @@ func setLogTimeToFirstContent(ctx context.Context, d time.Duration) {
 func setLogTimeToResponseHeader(ctx context.Context, d time.Duration) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.TimeToResponseHeader = d
+	}
+}
+
+func setLogTimeQueued(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeQueued = d
 	}
 }
 
@@ -2502,7 +2513,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				return s.anotherTargetTakingNewSessions(untriedTargets(logicalTargets, tried, backend.Backends), waitingAtKey, backend.Backends)
 			}
 		}
-		pend, err := queue.enter(ctx, cancel, s.sessionAge(convTenant, convKey), moveOn)
+		rank := s.sessionAge(convTenant, convKey)
+		entered := time.Now()
+		pend, err := queue.enter(ctx, cancel, rank, moveOn)
 		if err != nil {
 			cancel(nil)
 			if errors.Is(err, errUnavailableForNewSessions) {
@@ -2513,6 +2526,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			return fmt.Errorf("held in the admission queue: %w", err)
 		}
+		// TODO(TODO.d/log-request-timings.md): add the waits before each
+		// re-send to this one.
+		setLogTimeQueued(r.Context(), time.Since(entered))
 
 		// The resend replays the same bytes to the same target when the queue
 		// displaces an attempt: the pick is settled, so the reader is rebuilt

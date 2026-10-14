@@ -6224,22 +6224,25 @@ func newBackendsServer(t *testing.T, backends map[string]Backend, models map[str
 	return srv
 }
 
-// admissionPoster posts chat turns at a server and keeps each answer under its
-// label, so a case can ask whether a request has been answered yet, and in
-// what order the answers reached their clients.
+// admissionPoster posts chat turns at a server and keeps each answer and
+// each request's log record under its label, so a case can ask whether a
+// request has been answered yet, in what order the answers reached their
+// clients, and what the request's handler recorded.
 type admissionPoster struct {
 	t       *testing.T
 	srv     http.Handler
 	mu      sync.Mutex
 	answers map[string]*httptest.ResponseRecorder
+	records map[string]LogRecord
 	order   []string
 }
 
 func newAdmissionPoster(t *testing.T, srv http.Handler) *admissionPoster {
-	return &admissionPoster{t: t, srv: srv, answers: map[string]*httptest.ResponseRecorder{}}
+	return &admissionPoster{t: t, srv: srv, answers: map[string]*httptest.ResponseRecorder{}, records: map[string]LogRecord{}}
 }
 
 func (p *admissionPoster) post(ctx context.Context, label, body string) {
+	ctx = WithLogCtx(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		p.t.Error(err)
@@ -6252,6 +6255,9 @@ func (p *admissionPoster) post(ctx context.Context, label, body string) {
 	p.mu.Lock()
 	p.answers[label] = rec
 	p.order = append(p.order, label)
+	if record, ok := LogRecordFromContext(ctx); ok {
+		p.records[label] = record
+	}
 	p.mu.Unlock()
 }
 
@@ -6259,6 +6265,15 @@ func (p *admissionPoster) answered(label string) (*httptest.ResponseRecorder, bo
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rec, ok := p.answers[label]
+	return rec, ok
+}
+
+// logRecord returns the log record of the request posted under label, once
+// that request's answer has reached its client.
+func (p *admissionPoster) logRecord(label string) (LogRecord, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rec, ok := p.records[label]
 	return rec, ok
 }
 
@@ -7665,6 +7680,10 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		// answered is the status each inbound message's client must have
 		// received by the second check; nil means no answer is checked.
 		answered map[string]int
+		// waited is how long each inbound message's log record must report
+		// the request waited for its target before it was sent, read at the
+		// second check; nil means no record is checked.
+		waited map[string]time.Duration
 	}
 
 	tests := testy.NewTable[test]()
@@ -9737,6 +9756,50 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log how long a request waited for a busy target before it was sent", func(t *testing.T) test {
+		const (
+			first  = "the first session asks a target slow to answer"
+			second = "the second session asks the busy target"
+		)
+		var (
+			// Past the first request's grace period, so the target holds
+			// the second request.
+			secondArrives        = admissionGracePeriod + time.Second
+			secondWaits          = 4 * time.Second
+			secondHeaderArrives  = 5 * time.Second
+			secondContentArrives = 6 * time.Second
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if inboundMessage == first {
+				// Its content is what lets the second request through.
+				return admissionStreamContentAt(r, time.After(secondArrives+secondWaits), nil), nil
+			}
+			// The second request's own header and content come after
+			// delays distinct from its wait, so neither can pass for it.
+			time.Sleep(secondHeaderArrives)
+			contentFollowsHeader := secondContentArrives - secondHeaderArrives
+			return admissionStreamContentAt(r, time.After(contentFollowsHeader), time.After(contentFollowsHeader)), nil
+		})
+		return test{
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
+			received: map[string]*receivedMessages{"openai": received},
+			arrivals: []clientTurn{
+				{userMessages: []string{first}},
+				{userMessages: []string{second}, after: secondArrives},
+			},
+			reached:              map[string][]string{"openai": {first}},
+			secondCheckAt:        secondArrives + secondWaits + secondContentArrives + time.Second,
+			reachedAtSecondCheck: map[string][]string{"openai": {first, second}},
+			answered:             map[string]int{second: http.StatusOK},
+			waited:               map[string]time.Duration{second: secondWaits},
+		}
+	})
+	// TODO(TODO.d/log-request-timings.md): add "should log the total time a
+	// request waited for its target when it was sent there again after a
+	// displacement or a first-content timeout".
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			poster := newAdmissionPoster(t, tt.server)
@@ -9760,6 +9823,16 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 				}
 			}
 			poster.answeredWith(tt.answered)
+			for label, want := range tt.waited {
+				rec, ok := poster.logRecord(label)
+				if !ok {
+					t.Errorf("%q was never answered", label)
+					continue
+				}
+				if rec.TimeQueued != want {
+					t.Errorf("%q's record reports it waited %s for its target before it was sent, want %s", label, rec.TimeQueued, want)
+				}
+			}
 		})
 	})
 }
