@@ -3430,7 +3430,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 			{
 				messages:   `[{"role":"user","content":"a different conversation"}]`,
-				wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "b", wantRetryAfter: "120",
+				wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantBackend: "b", wantRetryAfter: "5",
 			},
 			{
 				advance:    time.Second,
@@ -4457,9 +4457,25 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
+	tests.Add("should give the client the wait understudy gives an earlier target's 429 without a Retry-After when it is sooner than the last target's Retry-After", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: throttling("60", "back in a minute")},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "5"},
+		},
+	})
+	// TODO(TODO.d/weigh-every-candidates-contribution.md): add "should give the
+	// client the last target's Retry-After when it is sooner than the wait
+	// understudy gives an earlier target's 429 without a Retry-After" — a answers
+	// a 429 with no Retry-After, b a 429 with a shorter Retry-After than
+	// understudy's wait for a, and the client gets b's 429 and Retry-After.
+
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): the rows that entry leaves
-	// unbuilt — a bench, a stall, an earlier candidate's synthesized interval — belong
-	// beside these once there is something to weigh them against.
+	// unbuilt — a bench, a stall — belong beside these once there is something to
+	// weigh them against.
 
 	tests.Add("should fail over within the request when a target forbids the request", test{
 		backends: map[string]backendStub{

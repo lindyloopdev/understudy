@@ -23,20 +23,14 @@ is also computable. The rows below are blocked on each other, not independent:
   because `untriedTargets` ignores health, so any replay calls the benched
   candidate anyway. Measured: with `[a benched, b: 401]` the walk calls `a`, so
   "declined to call" is far rarer than §Understudy implies.
-- An **earlier candidate's synthesized interval** — the wait understudy hands a
-  replayed-past `429` that sent no delay of its   own — is not weighed: only
-  a delay the incumbent's upstream sent displaces the failure that ended the
-  walk. Measured: an earlier bare `429` against a later target's Retry-After of
-  120 is answered with 120.
 - A **stall** offers the synthesized stall backoff.
 - A walk ending on a target **unusable as configured** still discards an earlier
   throttle. Reachability unverified: `pickTarget` skips such targets rather than
   ending a walk with their error.
 
-So the rest of the table comes next, together — the last failure's synthesized
-interval is now weighed, which was what the bench row waited on. Building the
-bench row alone would honor the promise in one corner and break it in the common
-case, which is worse than breaking it everywhere.
+So build the rest of the table together. Building the bench row alone would
+honor the promise in one corner and break it in the common case, which is worse
+than breaking it everywhere.
 
 **Also open:** whether a candidate left untried because the walk stopped
 contributes at all. §Understudy counts benched candidates beyond those tried; a
