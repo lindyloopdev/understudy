@@ -954,6 +954,8 @@ status, so a row reads as the rule it follows.
 | overloaded (`529` and kin) | `502` | *open* | as `5xx` |
 | every candidate stalled before its first content | `504` | `server_error` | — |
 | failing past the terminal threshold, nowhere left | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+| a session's first request, with no target taking new sessions (§Session-Ordered Admission) | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
+| a request without content past the consumer's time limit (§Session-Ordered Admission) | `400` | `upstream_unavailable` | `retry_after_ms` in the body |
 
 **A walk that runs out of candidates answers for the request, not for its last
 target.** Relaying the final failure makes the answer depend on list order: with
@@ -1375,8 +1377,9 @@ another target stays there; if that target costs more, the
 cost-weighted wait budget accounts for it.
 
 When every target is unavailable for new sessions, Understudy answers a first
-turn at once with a typed `400` giving the reason and when to retry, as it does
-for the rate-limit reject (§Understudy). On the retry, the walk takes the first
+turn at once with a `400` of type `upstream_unavailable` and when to retry, as it
+does for the rate-limit reject (§Understudy). Why the targets are unavailable goes
+to the log, as it does for the time limit below. On the retry, the walk takes the first
 target in order that is taking new sessions. New sessions that retry at the
 same time may be served in any order.
 
@@ -1405,12 +1408,11 @@ models are linked.
 
 A request that fails over takes the ladder unchanged.
 
-**A consumer's time limit ends a wait with a reason.** A consumer may set how
+**A consumer's time limit ends a wait with when to retry.** A consumer may set how
 long a request can go without content — held in Understudy's queue, or submitted
 to a backend that has produced nothing. Past it, Understudy cancels the request
-and answers with a typed `400` carrying the reason (behind older sessions, or
-waiting on a model swap), its position, and when to retry. The retry-after hint
-comes from the interval *Synthesized backoff* grows, timed here from how long the
+and answers as it does when nothing is left to serve a request: a `400` of type
+`upstream_unavailable`, with when to retry. The retry time comes from the interval *Synthesized backoff* grows, timed here from how long the
 target has been holding arrivals rather than from how long it has been failing.
 It is uncapped, since this answer is already the terminal `400` that *Synthesized
 backoff*'s ceiling leads to, and travels as `retry_after_ms` in the body like
@@ -1418,12 +1420,15 @@ that `400`'s. A `400` because
 a consumer like opencode gives up on it at once instead of looping, and its
 envelope reaches the consumer's error event intact (the rate-limit firewall
 relies on the same path); the consumer then decides — resend later, route the
-session elsewhere, abort. A resent conversation keeps its key, so it returns at
-its rank. To answer with a status at all, Understudy withholds the backend's
-status and headers from the client until the first content, and the limit
-overrides the header rule above. With no limit set, Understudy waits. A queued
-request is alive, and saying so with a reason is what keeps a schedulable wait
-from being read as death.
+session elsewhere, abort. Why the request waited (behind older sessions, or
+waiting on a model swap) and where it stood in the queue change none of those
+choices, so the answer does not carry them. The reason goes to the log, where an
+operator reads why a request ran out of time — the split *A failure the caller
+cannot act on says so and no more* (§Understudy) makes for a refusal. A resent
+conversation keeps its key, so it returns at its rank. To answer with a status at
+all, Understudy withholds the backend's status and headers from the client until
+the first content, and the limit overrides the header rule above. With no limit
+set, Understudy waits.
 
 **Backend configuration.** On Kronk the admission-permit pool is
 `NSeqMax × QueueDepth`. At the default depth of 2 the probe takes a spare permit

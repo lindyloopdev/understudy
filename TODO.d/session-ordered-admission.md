@@ -45,10 +45,12 @@ limiter. The steps below remain, in order.
     question (which target) for the same triggering silence; how the two
     decide precedence is unsettled.
 - **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
-  over*): the typed `400` when every target is unavailable for new sessions —
-  the row is [[understudy-error-envelope-type]]'s.
+  over*): when every target is unavailable for new sessions, answer a first
+  turn at once with a `400` of type `upstream_unavailable` and
+  `retry_after_ms`, as the nothing-left answer does; why the targets are
+  unavailable goes to the log.
   - Tests: with every target unavailable for new sessions, a first turn gets
-    the typed `400` at once.
+    the `400` `upstream_unavailable` at once.
 - **A 429 with `Retry-After` on a request that waits benches the target** —
   the existing `recordRateLimited` — **and admits the highest-ranked request
   whose target is not benched**, instead of taking the ladder. Blocked on the
@@ -66,23 +68,24 @@ limiter. The steps below remain, in order.
   re-queued by the 429 rule counts progress across the linked set.
 - **The consumer's time limit.** An optional library setting (Lindy supplies
   it, as it supplies the response interceptor): a request that has produced no
-  content within the limit — held, or submitted — is canceled and answered with
-  a typed `400` carrying the reason (behind older sessions, or waiting on a model
-  swap), its position, and a retry-after hint. The envelope type is
-  [[understudy-error-envelope-type]]'s row. Unset, Understudy waits. A resent
-  conversation keeps its rank.
-  - Tests: a held request past the limit is answered with the typed `400` and
-    its position; a submitted request with a header but no content past the
-    limit is canceled at the backend and answered the same way; with no limit,
-    the request waits; a resent conversation returns at its original rank.
+  content within the limit — held, or submitted — is canceled and answered as
+  nothing left to serve it is: a `400` of type `upstream_unavailable`, with
+  `retry_after_ms` in the body. Why the request waited (behind older sessions,
+  or waiting on a model swap) goes to the log, not the answer. Unset,
+  Understudy waits. A resent conversation keeps its rank.
+  - Tests: a held request past the limit is answered with the `400`
+    `upstream_unavailable`; a submitted request with a header but no content
+    past the limit is canceled at the backend and answered the same way; with
+    no limit, the request waits; a resent conversation returns at its original
+    rank.
 - **Operator guidance.** Kronk's `QueueDepth` (keep the default of 2; a depth of
   1 needs `AdmissionTimeout` raised past the longest turn) belongs in
   [[documentation]].
 
 ## Outside this repo
 
-- Lindy dispatches the still-queued `400` and the no-target-taking-new-sessions
-  `400` (resend later, route the beat elsewhere, or abort) and sends the
+- Lindy dispatches the `400` of type `upstream_unavailable` — resend at
+  `retry_after_ms`, route the beat elsewhere, or abort — and sends the
   session-end signal.
 - Lindy chooses a beat's target from its own history of beat durations — the
   per-session routing the design leaves to the consumer.
