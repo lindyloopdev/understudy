@@ -4467,6 +4467,28 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: rateLimit429, wantRetryAfter: "5"},
 		},
 	})
+	tests.Add("should give the client the wait understudy gives the last target's server error when it is sooner than the wait it gives an earlier target's 429 without a Retry-After", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return resp(http.StatusOK, `{"id":"from-b"}`), nil
+				}
+				return resp(http.StatusBadGateway, `{"error":{"message":"bad gateway"}}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b"},
+			{
+				// a has been failing long enough that understudy's wait for it has
+				// grown; b's failure is its first.
+				advance:    5 * time.Second,
+				messages:   `[{"role":"user","content":"a different conversation"}]`,
+				wantStatus: http.StatusBadGateway, wantBody: badGateway502, wantRetryAfter: "5",
+			},
+		},
+	})
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): add "should give the
 	// client the last target's Retry-After when it is sooner than the wait
 	// understudy gives an earlier target's 429 without a Retry-After" — a answers
