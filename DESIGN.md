@@ -1081,6 +1081,16 @@ This log record is understudy's own, distinct from the served-model provenance
 downstream joins/cost, while the `LogRecord` snapshot is what the mount projects to the log
 line. They overlap on backend/model but answer to different consumers, so they stay separate.
 
+<a id="operator-counts"></a>**Operator counts are a snapshot the embedder reads.** Some of
+the state understudy holds grows with traffic: conversations with an admission standing,
+conversations with an affinity record, targets with a health entry, and requests waiting in
+admission queues. An operator running the daemon for weeks needs those counts to tell a leak
+from load, and to confirm a fix. understudy hands them over as one plain value, read at the
+moment it is asked for, and exports nothing itself. Whether the counts reach Prometheus, a log
+line, or a debug page is the embedder's choice, as what becomes of the log record is, and
+understudy takes on no metrics library to offer them. They are totals, not counts per target:
+a target's identity includes its account's key, which a count must not carry.
+
 ## Concurrency & Rate Limiting <a id="concurrency-rate-limiting"></a>
 
 understudy bounds the requests it holds in flight to one upstream account, so a burst

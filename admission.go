@@ -81,7 +81,7 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 // for [sessionForgetAfter].
 //
 // TODO(TODO.d/expose-operator-metrics.md): nothing tests this eviction. Test
-// it through the tracked-conversations gauge once it exists.
+// it through the snapshot's count of conversations once it exists.
 //
 // Caller holds s.mu.
 func (s *server) evictForgottenSessions(now time.Time) {
