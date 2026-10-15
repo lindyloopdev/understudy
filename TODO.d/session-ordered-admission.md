@@ -4,9 +4,9 @@
 
 **Design:** [DESIGN.md §Session-Ordered
 Admission](../DESIGN.md#session-ordered-admission) — ordering, when a queue
-forms, refill and growth, the 429 rule, the consumer's time limit, and Kronk
-configuration; [DESIGN.md §Understudy](../DESIGN.md#understudy) — *Affinity and
-admission* (session identity, the coherence-driven wait budget) and the
+forms, refill and growth, the 429 rule, and Kronk configuration;
+[DESIGN.md §Understudy](../DESIGN.md#understudy) — *Affinity and admission*
+(session identity, the coherence-driven wait budget) and the
 `Retry-After` ladder; [DESIGN.md §Concurrency & Rate
 Limiting](../DESIGN.md#concurrency-rate-limiting) — where the admission queue
 sits relative to the learned cap.
@@ -37,9 +37,9 @@ limiter. The steps below remain, in order.
   that has no response header. The timeout is 60s, doubling with each re-send
   it causes at that target; a displacement leaves it where it was, and a
   failover's new target starts again at 60s. What remains:
-  - Take the first value from the consumer's own time limit when one is
-    supplied, rather than the 60s default sized from lindy's
-    notes/2026-09-30-time-to-first-content-measurements.md.
+  - Take the first value from the target's own turnover — its observed time
+    to first content ([[log-request-timings]]) — rather than the 60s default
+    sized from lindy's notes/2026-09-30-time-to-first-content-measurements.md.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two
@@ -66,18 +66,6 @@ limiter. The steps below remain, in order.
     admitted; a bare 429 with nothing running takes the ladder.
 - **Linked models** (DESIGN.md, *The queue is keyed on the target*). A request
   re-queued by the 429 rule counts progress across the linked set.
-- **The consumer's time limit.** An optional library setting (Lindy supplies
-  it, as it supplies the response interceptor): a request that has produced no
-  content within the limit — held, or submitted — is canceled and answered as
-  nothing left to serve it is: a `400` of type `upstream_unavailable`, with
-  `retry_after_ms` in the body. Why the request waited (behind older sessions,
-  or waiting on a model swap) goes to the log, not the answer. Unset,
-  Understudy waits. A resent conversation keeps its rank.
-  - Tests: a held request past the limit is answered with the `400`
-    `upstream_unavailable`; a submitted request with a header but no content
-    past the limit is canceled at the backend and answered the same way; with
-    no limit, the request waits; a resent conversation returns at its original
-    rank.
 - **Operator guidance.** Kronk's `QueueDepth` (keep the default of 2; a depth of
   1 needs `AdmissionTimeout` raised past the longest turn) belongs in
   [[documentation]].

@@ -4,9 +4,8 @@
 
 **Design:** [DESIGN.md §Session-Ordered
 Admission](../DESIGN.md#session-ordered-admission) — *A first-content timeout*:
-its first value comes "from the target's own turnover" where the consumer
-supplies no time limit, which needs each target's observed time to first
-content.
+its first value comes from the target's own turnover, which needs each target's
+observed time to first content.
 
 lindy's request log records both timings, and its
 notes/2026-09-30-time-to-first-content-measurements.md sized the timeout's

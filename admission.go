@@ -33,7 +33,7 @@ var errUnavailableForNewSessions = errors.New("left a target unavailable for new
 // notes/2026-09-30-time-to-first-content-measurements.md).
 //
 // TODO(TODO.d/session-ordered-admission.md): take the first value from the
-// consumer's own time limit when one is supplied, instead of this default.
+// target's own turnover, instead of this default.
 const initialFirstContentTimeout = 60 * time.Second
 
 // sessionForgetAfter is how long a conversation may go with no request before
