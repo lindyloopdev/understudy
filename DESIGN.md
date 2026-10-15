@@ -1409,7 +1409,12 @@ A request that fails over takes the ladder unchanged.
 long a request can go without content — held in Understudy's queue, or submitted
 to a backend that has produced nothing. Past it, Understudy cancels the request
 and answers with a typed `400` carrying the reason (behind older sessions, or
-waiting on a model swap), its position, and a retry-after hint. A `400` because
+waiting on a model swap), its position, and when to retry. The retry-after hint
+comes from the interval *Synthesized backoff* grows, timed here from how long the
+target has been holding arrivals rather than from how long it has been failing.
+It is uncapped, since this answer is already the terminal `400` that *Synthesized
+backoff*'s ceiling leads to, and travels as `retry_after_ms` in the body like
+that `400`'s. A `400` because
 a consumer like opencode gives up on it at once instead of looping, and its
 envelope reaches the consumer's error event intact (the rate-limit firewall
 relies on the same path); the consumer then decides — resend later, route the
