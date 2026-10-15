@@ -4489,11 +4489,16 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 		},
 	})
-	// TODO(TODO.d/weigh-every-candidates-contribution.md): add "should give the
-	// client the last target's Retry-After when it is sooner than the wait
-	// understudy gives an earlier target's 429 without a Retry-After" — a answers
-	// a 429 with no Retry-After, b a 429 with a shorter Retry-After than
-	// understudy's wait for a, and the client gets b's 429 and Retry-After.
+	tests.Add("should give the client the last target's Retry-After when it is sooner than the wait understudy gives an earlier target's 429 without a Retry-After", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: throttling("2", "back in two")},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{advance: 0, wantStatus: http.StatusTooManyRequests, wantBody: `{"error":{"message":"upstream returned status 429: back in two","type":"rate_limit_error"}}`, wantRetryAfter: "2"},
+		},
+	})
 
 	// TODO(TODO.d/weigh-every-candidates-contribution.md): the rows that entry leaves
 	// unbuilt — a bench, a stall — belong beside these once there is something to
