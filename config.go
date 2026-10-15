@@ -43,15 +43,15 @@ type LogicalModelSpec struct {
 // which provider handler serves the backend.
 //
 // A backend names its upstream credential through one of api_key, api_key_file,
-// or api_key_env, any one of which satisfies the validate tags. Naming more than
-// one is not yet rejected: only api_key and api_key_file exclude each other, and
-// Resolve applies whichever sources are set in order, api_key_env last.
+// or api_key_env, any one of which satisfies the validate tags. api_key excludes
+// the other two; api_key_file and api_key_env may combine, and Resolve applies
+// whichever are set in that order, api_key_env last.
 // TODO(TODO.d/auth-requirement-and-key-env-source.md): the auth field replaces
 // these tags and makes the sources mutually exclusive.
 type BackendSpec struct {
 	ProviderType string `toml:"provider_type" validate:"required,oneof=openai"`
 	BaseURL      string `toml:"base_url" validate:"required,url"`
-	APIKey       string `toml:"api_key" validate:"required_without_all=APIKeyFile APIKeyEnv,excluded_with=APIKeyFile"`
+	APIKey       string `toml:"api_key" validate:"required_without_all=APIKeyFile APIKeyEnv,excluded_with=APIKeyFile APIKeyEnv"`
 
 	// APIKeyFile is the absolute path to a file whose trimmed contents Resolve
 	// uses as the backend's key when set; Resolve rejects a relative path.
