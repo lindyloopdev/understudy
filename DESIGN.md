@@ -992,7 +992,14 @@ which a history authored under `?thinking={"type":"disabled"}` lacks. That says 
 target's health, so the walk replays onto the next untried candidate and leaves its
 health alone. It does not rewrite the body to suit: disabling a thinking mode the
 operator configured substitutes a capability nobody declared, and that judgment
-belongs to whoever composed the list ([[understudy-scope]]). The rejection recurs for
+belongs to whoever composed the list ([[understudy-scope]]). A history rejection is
+recognized two ways: by a provider's known wording, and by any `400` a target answers
+to a conversation another target served last, whatever it says. The second catches a
+provider's rejection before its wording has been seen, and keeps catching it when the
+wording changes; the price is that a malformed request in a conversation that has
+moved is tried at more targets before its `400` reaches the client. A conversation
+still on the target that served it last, and a first request, get their `400`
+directly. The rejection recurs for
 every request of that conversation, so it reaches the operator on `Excluded` like any
 other skip, never understudy's own log.
 

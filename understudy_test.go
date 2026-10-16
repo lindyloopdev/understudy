@@ -3887,12 +3887,9 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// carry no reasoning_content — the prose the walk matches on.
 	const reasoningErrorMessage = `The reasoning_content in the thinking mode must be passed back to the API`
 
-	// TODO(TODO.d/fail-over-on-a-history-rejecting-400.md): consider "should
-	// serve from the next target when one answers a 400 to a conversation another
-	// target served last", whatever the message says. It would catch a provider's
-	// rejection of a history before its wording has been seen, and keep catching
-	// it if the wording changes; the price is that a malformed request is tried
-	// at more targets before its 400 reaches the client.
+	// TODO(TODO.d/fail-over-on-a-history-rejecting-400.md): also serve from the
+	// next target when one answers a 400 to a conversation another target served
+	// last, whatever the message says.
 	tests.Add("should serve from the next target when one rejects the request's history", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, reasoningErrorMessage))},
