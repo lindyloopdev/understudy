@@ -371,9 +371,8 @@ understudy withholds an upstream's status, headers, and any comment lines or
 leading whitespace until the first **content**: a stream's first `data:` event,
 or a body's first non-whitespace byte. Until then the attempt is pre-content and
 nothing has been committed to the client. **Switching cost**, when replay *is* possible, is set by conversation
-position: a *first request* has no prompt-cache or coherence to forfeit (~0), a
-*subsequent request* forfeits the pinned target's warm cache and mid-conversation
-coherence (high). Mid-stream collapses the cost axis — replay being impossible,
+position: a *first request* has no coherence to forfeit (~0), a
+*subsequent request* forfeits its coherence with the pinned target (high). Mid-stream collapses the cost axis — replay being impossible,
 position is moot — leaving three cases:
 
 1. **First-request pre-content stall** — replayable, cost ~0 → **synthesized
@@ -444,7 +443,7 @@ failing past the failover threshold — orphaning the session and re-pinning.
 Neither a slow nor a stalled target is swapped out by the availability layer:
 the idle deadline cancels a hung request but does not demote its target (a stall
 is a cost signal, not an availability verdict), and switching mid-session
-forfeits prompt-cache and coherence, an unquantifiable cost that lindy's small
+forfeits coherence, an unquantifiable cost that lindy's small
 isolated beats bound anyway. Because a forced re-pin already
 pays that cost, it reconsiders the whole list (a recovered-cheaper target is
 eligible again), which is why the re-walk starts from the top. The candidate list
@@ -687,8 +686,8 @@ longer for):
   §Concurrency & Rate Limiting; a short Retry-After is a momentary throttle),
   so the target keeps its place in the walk.
 - **≤ wait budget → wait in place.** Sleep out the throttle and retry the *same*
-  target; the client sees a slow success, never the 429, and the preferred model
-  (its prompt cache, its coherence) is preserved. *(Staged — the transient-absorb
+  target; the client sees a slow success, never the 429, and the conversation
+  stays on the model it is coherent with. *(Staged — the transient-absorb
   refinement. `T_wait` is decided empirically against held-connection cost, not
   guessed; until it lands, a short throttle takes the fail-over rung above
   instead.)*
@@ -729,15 +728,14 @@ once). This is the concrete realization of session binding above; two dependenci
 gate it, both staged:
 
 - **Session identity.** understudy must recognize which requests belong to one
-  conversation. opencode sends a per-session identifier (`x-session-affinity`)
-  on every OpenAI-compat call, but understudy does not key affinity on it: a
-  caller-supplied id survives compaction and would need an explicit release (see
-  *Affinity is a short-lived hint, not a lease*, below), while a payload hash
-  releases itself when compaction rewrites the leading messages. So the key is
-  **inferred from the payload and scoped to the token**: a hash of the
-  invariant leading messages (system + first user turn), which is also exactly
-  what prompt-cache coherence keys on, mixed with the bearer token so one
-  tenant's affinity cannot steer another's routing in the shared daemon. The
+  conversation. Affinity's key is **inferred from the payload and scoped to the
+  token**: a hash of the invariant leading messages (system + first user turn),
+  mixed with the bearer token so one tenant's affinity cannot steer another's
+  routing in the shared daemon. Compaction rewrites those messages, so the
+  compacted conversation arrives under a new key (*Compaction starts the target
+  choice over*, below). A session's place in line keys instead on the caller's
+  session identifier where it sends one, so it survives compaction (§Session-Ordered
+  Admission). The
   token groups a tenant's state raw, unhashed: it arrives in memory with every
   request's Authorization header, and a process holding live upstream
   credentials is already the thing a memory inspection reads, so hashing it
@@ -750,26 +748,24 @@ gate it, both staged:
   within-threshold target and a probe-due one are both reached by first turns. A
   first turn still *records* the target its later turns prefer.
 
-  **Affinity is a short-lived hint, not a lease.** No end-of-conversation signal
-  reaches the wire, so it is refreshed by use and expires on idle, its lifetime
-  tracking the provider's prefix cache: once that is cold, staying buys nothing.
-  Turns are seconds apart and runs minutes or hours, so idle expiry scopes
-  affinity to an active conversation without understudy knowing what a
-  conversation is — and bounds the map, an idle record being worthless by
-  construction rather than merely old.
+  **Affinity lasts as long as the conversation.** A conversation's earlier turns
+  are shaped for the target that authored them however long it has been quiet, so
+  idleness alone never makes its record worthless. No end-of-conversation signal
+  reaches the wire, so the record is refreshed by use and forgotten after the same
+  long backstop with no request as a session's place in line (§Session-Ordered
+  Admission), which also bounds the map.
 
-  **Compaction releases affinity, and should.** A compacted session continues as a
+  **Compaction starts the target choice over.** A compacted session continues as a
   summary plus a recent window, so the first user turn stops being sent and the key
-  changes — the mechanism agreeing with the policy, since the cache it preserved is
-  cold on every target at that moment, making compaction the cheapest point to
-  re-balance. A caller-supplied identifier would hold on past it and need an
-  explicit release to match. What compaction does *not* clear is wire-format
-  compatibility: the preserved window still carries turns shaped for the target
-  that authored them ([[keep-a-conversation-on-one-thinking-mode]]).
+  changes: understudy cannot tell the compacted conversation from a new one, and
+  it takes the walk. Its place in line survives where the caller sends a session
+  identifier. What the new key does not clear is wire-format compatibility: the
+  preserved window still carries turns shaped for the target that authored them
+  ([[keep-a-conversation-on-one-thinking-mode]]).
 
   **Affinity is tenant state, not account state.** Health and the concurrency cap
   describe an upstream account and outlive the tenant that taught them; affinity
-  describes a caller's conversation, so it goes when the conversation idles out
+  describes a caller's conversation, so it goes when the conversation does
   (§Shared understudy daemon, *Two lifecycles*). It is grouped per tenant rather
   than keyed on the messages alone — the conversation key says which conversation,
   the group says whose — so two tenants that open with the same messages hold
@@ -1180,8 +1176,12 @@ session. The motivating case is a local model server whose decode streams number
 one or two, but nothing in the mechanism is specific to one.
 
 **Admission ordering is oldest-session-first.** A session's rank is its age —
-when its conversation key was first seen — and it keeps that rank for its whole
-life, between turns and through long quiet stretches such as a tool run.
+when its session key was first seen — and it keeps that rank for its whole
+life, between turns, through long quiet stretches such as a tool run, and
+through compaction. The session key is the caller's session identifier where it
+sends one (opencode's `x-session-affinity`, on every request and unchanged by
+compaction), scoped to the token; otherwise it is the conversation key, which
+compaction changes, so such a session ranks as new once compacted.
 Sessions therefore finish in arrival order, and a newer session waits behind
 older ones for as long as they keep taking turns. That is the design, not a
 cost: under contention some sessions cannot finish in time, and it is better to
@@ -1189,8 +1189,8 @@ hold back the ones that have not started than to let every session interleave
 and time out together. Understudy forgets a session when the consumer signals
 that it ended, or after a long backstop (on the order of a day) with no request,
 for consumers that send no such signal; a session returning after the backstop
-ranks as new. A request with no conversation key ranks by its own arrival. Two
-conversations that share a key share a place in line — a collision costs
+ranks as new. A request with no session key ranks by its own arrival. Two
+sessions that share a key share a place in line — a collision costs
 ordering, never correctness. In the shared daemon the ordering is global across
 runs (§Shared understudy daemon). Session age is a policy slot: explicit
 classes (interactive over batch) compose without touching the mechanism.
@@ -1356,7 +1356,7 @@ order, so a retry restores rank order rather than scrambling it.
 
 **Who waits, and who fails over.** The wait budget is the one §Understudy's
 *Affinity and admission* derives from coherence. A later turn is bound to its
-target — switching forfeits its prompt cache and coherence — so it waits. A
+target — switching forfeits its coherence — so it waits. A
 first turn has nothing to lose by moving. So when a target's queue has held new
 arrivals for the failover threshold, the target is **unavailable for new
 sessions**: the walk skips it for first turns, as it skips any target that has

@@ -22,6 +22,10 @@ limiter. The steps below remain, in order.
 
 ## Work
 
+- **Rank a session by the caller's session identifier.** DESIGN.md's
+  *Admission ordering is oldest-session-first*: where a request carries
+  `x-session-affinity`, its session's age keys on that, scoped to the token,
+  so a compacted session keeps its place in line.
 - **Finish the first-content timeout.** DESIGN.md's *A first-content
   timeout* is built: an attempt with no content within its timeout is canceled
   and sent again to the same target, together with every other request there
