@@ -334,7 +334,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
 		}}
-		return New(validator, WithLogger(testLogger(t)), WithResponseInterceptor(interceptor)).(*server)
+		return New(validator, WithLogger(testLogger(t)), WithResponseInterceptor(interceptor)).server
 	}
 
 	type test struct {
@@ -658,7 +658,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"target \"/gpt-4\" must be <backend>/<model>","type":"invalid_request_error"}}`,
@@ -673,7 +673,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"openai/gpt-4?messages=[]","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"model \"openai/gpt-4?messages=[]\": override key \"messages\" is reserved","type":"invalid_request_error"}}`,
@@ -688,7 +688,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"openai/gpt-4?stream=true","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"model \"openai/gpt-4?stream=true\": override key \"stream\" is reserved","type":"invalid_request_error"}}`,
@@ -703,7 +703,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"openai/gpt-4?temperature=0.7&temperature=1.5","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"model \"openai/gpt-4?temperature=0.7&temperature=1.5\": override key \"temperature\" is repeated","type":"invalid_request_error"}}`,
@@ -718,7 +718,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"openai/gpt-4?thinking=%zz","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"invalid URL escape \"%zz\"","type":"invalid_request_error"}}`,
@@ -733,7 +733,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"openai/","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"target \"openai/\" must be <backend>/<model>","type":"invalid_request_error"}}`,
@@ -751,7 +751,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusBadRequest,
 			wantBody:            `{"error":{"message":"model is required","type":"invalid_request_error"}}`,
@@ -822,7 +822,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusNotFound,
 			wantBody:            `{"error":{"message":"logical model \"m\" has no targets","type":"invalid_request_error"}}`,
@@ -840,7 +840,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"empty","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusNotFound,
 			wantBody:            `{"error":{"message":"logical model \"empty\" has no targets","type":"invalid_request_error"}}`,
@@ -918,7 +918,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			return nil, ErrInvalidToken
 		}}
 		return test{
-			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			server:     New(validator, WithLogger(testLogger(t))).server,
 			wantStatus: http.StatusUnauthorized,
 			wantBody:   `{"error":{"message":"Unauthorized","type":"authentication_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -932,7 +932,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			return nil, errors.New("db down")
 		}}
 		return test{
-			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			server:     New(validator, WithLogger(testLogger(t))).server,
 			wantStatus: http.StatusInternalServerError,
 			wantBody:   `{"error":{"message":"Internal Server Error","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -946,7 +946,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			return nil, yerrors.WithHTTPStatus(http.StatusServiceUnavailable, errors.New("db down"))
 		}}
 		return test{
-			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			server:     New(validator, WithLogger(testLogger(t))).server,
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   `{"error":{"message":"Service Unavailable","type":"server_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -960,7 +960,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			return &BackendConfig{Backends: nil}, nil
 		}}
 		return test{
-			server:      New(validator, WithLogger(testLogger(t))).(*server),
+			server:      New(validator, WithLogger(testLogger(t))).server,
 			requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:  http.StatusNotFound,
 			wantBody:    `{"error":{"message":"no backend configured to serve model \"gpt-4\"","type":"invalid_request_error"}}`,
@@ -989,7 +989,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			server:     New(validator, WithLogger(testLogger(t))).server,
 			wantStatus: http.StatusNotFound,
 			wantBody:   `{"error":{"message":"model references unknown backend \"openai\"","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -1018,7 +1018,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}}, nil
 		}}
 		return test{
-			server:     New(validator, WithLogger(testLogger(t))).(*server),
+			server:     New(validator, WithLogger(testLogger(t))).server,
 			wantStatus: http.StatusNotFound,
 			wantBody:   `{"error":{"message":"model references unusable backend \"openai\": must provide base_url","type":"invalid_request_error"}}`,
 			wantResponseHeaders: http.Header{
@@ -1046,7 +1046,7 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 			}, nil
 		}}
 		return test{
-			server:              New(validator, WithLogger(testLogger(t))).(*server),
+			server:              New(validator, WithLogger(testLogger(t))).server,
 			requestBody:         `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			wantStatus:          http.StatusOK,
 			wantBody:            `{"id":"from-good","choices":[]}`,
@@ -4650,7 +4650,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
-			srv := New(validator, WithLogger(testLogger(t))).(*server)
+			srv := New(validator, WithLogger(testLogger(t))).server
 			// These cases assert the interval exactly; scattering it is
 			// TestGraduatedBackoff's subject.
 			srv.jitterFactor = 0
@@ -5068,7 +5068,7 @@ func TestChatCompletionsTransitionLogging(t *testing.T) {
 			validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 				return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: tt.targets}}}, nil
 			}}
-			srv := New(validator, WithLogger(logger)).(*server)
+			srv := New(validator, WithLogger(logger)).server
 
 			doRequest := func(model string) {
 				req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`))
@@ -5125,7 +5125,7 @@ func TestChatCompletionsLimiterCancelNamesTheWaitPoint(t *testing.T) {
 		validator := &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return &BackendConfig{Backends: backends, Models: map[string]LogicalModel{"m": {Targets: []Target{{backend: "a", model: "ma"}}}}}, nil
 		}}
-		srv := New(validator, WithLogger(logger)).(*server)
+		srv := New(validator, WithLogger(logger)).server
 		srv.maxConcurrentPerUpstream = 1
 
 		req := func(ctx context.Context) *http.Request {
@@ -5210,7 +5210,7 @@ func TestChatCompletionsProcessBudgetShed(t *testing.T) {
 				}, nil
 			}}
 			// fdSlotBudget(66) = (66-64)/2 = 1: a single process-wide slot.
-			srv := New(validator, WithLogger(testLogger(t)), withFDSoftLimit(66)).(*server)
+			srv := New(validator, WithLogger(testLogger(t)), withFDSoftLimit(66)).server
 			// These cases assert the interval exactly; scattering it is
 			// TestChatCompletionsScattersBusyBackoff's subject.
 			srv.jitterFactor = 0
@@ -5877,6 +5877,52 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 			i, j := slices.Index(kept, tt.first), slices.Index(kept, tt.second)
 			if i < 0 || j < 0 || i > j {
 				t.Errorf("the backend kept attempts in order %v; Understudy should send %s before %s", kept, tt.first, tt.second)
+			}
+		})
+	})
+}
+
+func TestCounts(t *testing.T) {
+	type test struct {
+		// requests is one request per conversation, in the order the
+		// conversations send them.
+		requests []clientTurn
+		// want is the operator's counts once every request has been
+		// answered.
+		want Counts
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.Add("should count only the conversations that sent a request within the last day, once another conversation sends one", test{
+		requests: []clientTurn{
+			{label: "conversation A", userMessages: []string{"conversation A asks"}},
+			{label: "conversation B", after: 12 * time.Hour, userMessages: []string{"conversation B asks"}},
+			// More than a day after conversation A's request, and less
+			// than a day after conversation B's.
+			{label: "conversation C", after: 13 * time.Hour, userMessages: []string{"conversation C asks"}},
+		},
+		want: Counts{Conversations: 2},
+	})
+
+	tests.Run(t, func(t *testing.T, tt test) {
+		synctest.Test(t, func(t *testing.T) {
+			backend := admissionClient(t, nil, func(_ *http.Request, inboundMessage string) (*http.Response, error) {
+				return admissionJSON(inboundMessage), nil
+			})
+			handler := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", backend), nil
+			}}, WithLogger(testLogger(t)))
+			poster := newAdmissionPoster(t, handler)
+			postTurns(t, poster, tt.requests)
+			labels := make([]string, 0, len(tt.requests))
+			for _, request := range tt.requests {
+				labels = append(labels, request.name())
+			}
+			poster.answeredOK(labels...)
+
+			if d := gocmp.Diff(tt.want, handler.Counts()); d != "" {
+				t.Errorf("unexpected operator counts (-want +got):\n%s", d)
 			}
 		})
 	})

@@ -80,9 +80,6 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 // evictForgottenSessions clears every conversation's admission standing quiet
 // for [sessionForgetAfter].
 //
-// TODO(TODO.d/expose-operator-metrics.md): nothing tests this eviction. Test
-// it through the snapshot's count of conversations once it exists.
-//
 // Caller holds s.mu.
 func (s *server) evictForgottenSessions(now time.Time) {
 	s.evictConversationParts(func(c *conversation) {

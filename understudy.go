@@ -628,15 +628,46 @@ func defaultProviders() map[string]providers.Handler {
 	return map[string]providers.Handler{ProviderOpenAI: openaiProvider{}}
 }
 
-// New returns a new HTTP handler that uses v to validate bearer tokens.
-func New(v TokenValidator, opts ...Option) http.Handler {
+// Handler is the proxy as an [http.Handler]; the operator reads its state
+// through [Counts].
+type Handler struct {
+	*server
+}
+
+// Counts is a snapshot of the state a handler holds, handed to the operator
+// as one plain value. Its fields are totals, never per target: a target's
+// identity includes its account's API key, which a count must not carry.
+type Counts struct {
+	// Conversations is the number of conversations with an admission
+	// standing.
+	Conversations int
+}
+
+// Counts returns a snapshot of the state the handler holds as one plain
+// [Counts] value.
+func (h *Handler) Counts() Counts {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	conversations := 0
+	for _, byKey := range h.conversations {
+		for _, c := range byKey {
+			if c.session != nil {
+				conversations++
+			}
+		}
+	}
+	return Counts{Conversations: conversations}
+}
+
+// New returns a new Handler that uses v to validate bearer tokens.
+func New(v TokenValidator, opts ...Option) *Handler {
 	s := newServer(v, opts...)
 	for name, h := range defaultProviders() {
 		if _, ok := s.providers[name]; !ok {
 			s.providers[name] = h
 		}
 	}
-	return s
+	return &Handler{server: s}
 }
 
 // newServer builds a fully-wired *server, which satisfies http.Handler via
