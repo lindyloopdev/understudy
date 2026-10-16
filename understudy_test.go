@@ -3887,9 +3887,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 	// carry no reasoning_content — the prose the walk matches on.
 	const reasoningErrorMessage = `The reasoning_content in the thinking mode must be passed back to the API`
 
-	// TODO(TODO.d/fail-over-on-a-history-rejecting-400.md): also serve from the
-	// next target when one answers a 400 to a conversation another target served
-	// last, whatever the message says.
 	tests.Add("should serve from the next target when one rejects the request's history", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: always(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, reasoningErrorMessage))},
@@ -3909,6 +3906,70 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 			},
 		},
 	})
+
+	// unrecognized400 is arbitrary wording — the walk matches no prose here.
+	const unrecognized400 = `cannot serve these messages`
+
+	tests.Add("should serve from the next target when one answers a 400 to a conversation another target served last", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					// A bare 429, so the conversation's first request moves to
+					// b and the record names b, without benching a.
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, unrecognized400)), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return resp(http.StatusOK, `{"id":"from-b"}`), nil
+				}
+				// A bare 429 again, so the conversation's next request leaves b
+				// down the walk rather than waiting at it.
+				return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+			}},
+			"c": {baseURL: mustParseURL(t, "http://c/v1"), apiKey: "sk-c", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 2 {
+					return resp(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, unrecognized400)), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-c"}`), nil
+			}},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}, {backend: "c", model: "mc"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			{
+				advance:    time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-c"}`, wantBackend: "c",
+				wantExcluded: []Attempt{
+					{Backend: "b", ModelUpstream: "mb", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
+					{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusBadRequest, Err: fmt.Errorf("upstream returned status 400: %s", unrecognized400), Called: true},
+				},
+			},
+			// c served the conversation last, so its own 400 is the client's —
+			// the failover above reads the record, not the status alone.
+			{
+				advance:     time.Second,
+				messages:    `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"},{"role":"assistant","content":"more"},{"role":"user","content":"go on"}]`,
+				wantStatus:  http.StatusBadRequest,
+				wantBody:    fmt.Sprintf(`{"error":{"message":"upstream returned status 400: %s","type":"invalid_request_error"}}`, unrecognized400),
+				wantBackend: "c",
+			},
+		},
+	})
+
+	// TODO [TODO.d/relay-a-first-request-400-from-a-served-conversation.md]:
+	// should relay a 400 to the client when it answers the first request of
+	// a conversation another target served last.
+
+	// TODO(TODO.d/bind-a-conversation-to-its-target.md): should relay a 400 to the
+	// client when it answers a conversation another target served more than a day
+	// before. Written once a conversation keeps its target for that long; today
+	// the record lapses after minutes idle.
 
 	tests.Add("should route to the last target when all are failing", test{
 		backends: map[string]backendStub{

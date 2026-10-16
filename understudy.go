@@ -1060,39 +1060,54 @@ func (s *server) recordServe(tenant, key string, t Target) {
 func (s *server) evictIdleAffinity() time.Time {
 	now := time.Now()
 	s.evictConversationParts(func(c *conversation) {
-		if c.served != nil && now.Sub(c.served.lastUse) >= affinityIdleTTL {
+		if c.served != nil && c.served.idle(now) {
 			c.served = nil
 		}
 	})
 	return now
 }
 
+func (l lastServed) idle(now time.Time) bool {
+	return now.Sub(l.lastUse) >= affinityIdleTTL
+}
+
+// affinity returns the target that last served the conversation, and false when
+// there is none or its record is idle.
+func (s *server) affinity(tenant, key string) (Target, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.conversations[tenant][key]
+	if !ok || c.served == nil || c.served.idle(time.Now()) {
+		return Target{}, false
+	}
+	return c.served.target, true
+}
+
 // preferLastServed moves key's recorded target to the front of candidates, and
 // nothing more: pickTarget still applies every usability and health check, so a
-// stale record costs only its place in line and can resurrect nothing. A record
-// idle past affinityIdleTTL is ignored.
+// stale record costs only its place in line and can resurrect nothing.
 func (s *server) preferLastServed(candidates []Target, tenant, key string) []Target {
-	s.mu.Lock()
-	var bound lastServed
-	c, ok := s.conversations[tenant][key]
-	ok = ok && c.served != nil
-	if ok {
-		bound = *c.served
-	}
-	s.mu.Unlock()
-	if !ok || time.Since(bound.lastUse) >= affinityIdleTTL {
+	bound, ok := s.affinity(tenant, key)
+	if !ok {
 		return candidates
 	}
 	var preferred []Target
 	rest := make([]Target, 0, len(candidates))
 	for _, t := range candidates {
-		if t.backend == bound.target.backend && t.model == bound.target.model {
+		if t.backend == bound.backend && t.model == bound.model {
 			preferred = append(preferred, t)
 		} else {
 			rest = append(rest, t)
 		}
 	}
 	return append(preferred, rest...)
+}
+
+// servedByAnother reports whether the conversation was last served by a target
+// other than answering, within the idle window.
+func (s *server) servedByAnother(tenant, key string, answering Target) bool {
+	bound, ok := s.affinity(tenant, key)
+	return ok && (bound.backend != answering.backend || bound.model != answering.model)
 }
 
 // msgBackendDown announces a target leaving rotation. Its pair is "backend up".
@@ -2741,10 +2756,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			// A sustainedRate 429 or refused access has just demoted chosen above; a
 			// bare or transient 429 and a rejected history leave it healthy, costing it
-			// only its turn here. A fatal failure on chosenDemoted is the same story —
-			// already routed around for future requests, so this one needn't wait
-			// either. In every case an untried target beats surfacing the failure.
-			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(a.ctx)))) {
+			// only its turn here. A rejected history is also recognized without
+			// wording, though only a request carrying history has any to reject.
+			// A fatal failure on chosenDemoted is the same story — already routed
+			// around for future requests, so this one needn't wait either. In
+			// every case an untried target beats surfacing the failure.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (carriesHistory && yerrors.HTTPStatus(err) == http.StatusBadRequest && s.servedByAnother(convTenant, convKey, chosen)) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(a.ctx)))) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains

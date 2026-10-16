@@ -13,6 +13,10 @@ a bound request would otherwise divert.
 - **Keep a conversation's target for as long as the conversation lasts.** An
   affinity record is forgotten after the same backstop with no request as a
   session's place in line, not after minutes idle.
+- **Count a target's query overrides in its identity to a conversation.**
+  Preferring the last-served target, and telling a 400 from "another target
+  served last", compare the whole target, overrides included; health still
+  keys on the account and model.
 - **Treat two requests in flight on one key as a collision.** A conversation is
   serial, so the later arrival is a different one whatever produced the same key,
   and takes the normal walk. This is what degrades quietly if the caller stops
@@ -26,6 +30,10 @@ a bound request would otherwise divert.
   from the shipped opencode bundle 2026-08-14 — compaction cuts at a user-message
   boundary against a `preserve_recent_tokens` budget — but not yet seen on a
   captured body.
+- **Relay a `400` to the client when it answers a conversation another target
+  served more than a day before.** The failover that reads the record lapses
+  with the record, so a history rejection after the idle window again looks
+  like the client's.
 - **Settle what a caller-initiated model switch means for affinity.** opencode's
   session carries `ModelSwitched` and `AgentSwitched`, so the caller can change
   model without understudy; affinity that fought that would be wrong.

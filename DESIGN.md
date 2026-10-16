@@ -471,7 +471,9 @@ more — no feature policy leaks into the transport parse. The target's
 `(backend, model)` is what gets **dialed**; **availability** keys on the
 canonical upstream account + model (`healthKey`) — both projections that drop
 the query overrides, so the override profiles of one model share health (same
-endpoint) while carrying different body policy.
+endpoint) while carrying different body policy. Affinity does not drop them: a
+conversation's target is the whole target, overrides included (§Understudy,
+*Affinity is tenant state, not account state*).
 That projection is what lets the *same* model appear as distinct profiles across
 logical models — a home a global per-model flag (bakes one behavior in) or a
 logical-model-per-profile (nests logical models) can't provide. The **domain
@@ -771,7 +773,12 @@ gate it, both staged:
   the group says whose — so two tenants that open with the same messages hold
   separate records. A tenant's deregistration is not a signal understudy acts on: a
   dropped token fails validation at arrival, and the tenant's records end on their
-  own clocks.
+  own clocks. The target a record names is the whole target, query overrides
+  included, where health keys on the account and model alone: an override can
+  change the shape of what a model writes — a thinking mode does — so two profiles
+  of one model are as different to a conversation as two models are. Understudy
+  does not interpret overrides, so it does not pick out the ones that matter;
+  every override counts, in any order of its parameters.
 
   **Concurrency on a key is the tell that it has collided.** A conversation is
   serial: the caller cannot send a turn until the last one answers. So a key with
