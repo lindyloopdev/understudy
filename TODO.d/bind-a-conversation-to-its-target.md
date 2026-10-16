@@ -22,9 +22,6 @@ a bound request would otherwise divert.
   Affinity releases at compaction only because the key changes. Read from the
   shipped opencode bundle 2026-08-14 — compaction cuts at a user-message boundary
   against a `preserve_recent_tokens` budget — but not yet seen on a captured body.
-- **Drop a tenant's affinity when it goes**, rather than leaving it to the TTL.
-  No registry exists here yet, so it lands with
-  [[understudy-shared-daemon-subserver]].
 - **Settle what a caller-initiated model switch means for affinity.** opencode's
   session carries `ModelSwitched` and `AgentSwitched`, so the caller can change
   model without understudy; affinity that fought that would be wrong.

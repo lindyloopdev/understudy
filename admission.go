@@ -57,9 +57,8 @@ type sessionRecord struct {
 // [sessionForgetAfter]. A request with no conversation key ranks by its own
 // arrival.
 //
-// TODO(TODO.d/session-ordered-admission.md): the consumer's session-end signal
-// is unbuilt, so a dropped tenant's conversation state is reclaimed by the
-// forget backstop rather than at teardown.
+// TODO(TODO.d/admission-reservation-window.md): forget the session's age on
+// the consumer's session-end signal.
 func (s *server) sessionAge(tenant, key string) time.Time {
 	now := time.Now()
 	if key == "" {

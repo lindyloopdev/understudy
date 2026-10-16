@@ -22,15 +22,6 @@ limiter. The steps below remain, in order.
 
 ## Work
 
-- **Reclaim a dropped tenant's conversation state at teardown.** The forget
-  backstop drops a quiet conversation's admission standing only after
-  `sessionForgetAfter` — up to a day after a run ends — and a run's token
-  never returns, so nothing else names the state again. The consumer's
-  session-end signal, when it lands (new library surface, shared with
-  [[admission-reservation-window]]), needs a hook the embedding daemon's
-  tenant registry can call so the state goes at teardown instead.
-  - Tests: a tenant dropped by the registry leaves no conversation state
-    behind once its last request has ended.
 - **Finish the first-content timeout.** DESIGN.md's *A first-content
   timeout* is built: an attempt with no content within its timeout is canceled
   and sent again to the same target, together with every other request there

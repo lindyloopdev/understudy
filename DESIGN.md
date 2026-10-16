@@ -769,11 +769,13 @@ gate it, both staged:
 
   **Affinity is tenant state, not account state.** Health and the concurrency cap
   describe an upstream account and outlive the tenant that taught them; affinity
-  describes a caller's conversation, so it goes when that tenant is deregistered or
-  idles out (§Shared understudy daemon, *Two lifecycles*). It is therefore grouped
-  per tenant rather than keyed on it — the conversation key says which conversation,
-  the group says whose — which is what lets a teardown find them. Until a registry
-  exists to call it, the idle TTL is the only reclamation.
+  describes a caller's conversation, so it goes when the conversation idles out
+  (§Shared understudy daemon, *Two lifecycles*). It is grouped per tenant rather
+  than keyed on the messages alone — the conversation key says which conversation,
+  the group says whose — so two tenants that open with the same messages hold
+  separate records. A tenant's deregistration is not a signal understudy acts on: a
+  dropped token fails validation at arrival, and the tenant's records end on their
+  own clocks.
 
   **Concurrency on a key is the tell that it has collided.** A conversation is
   serial: the caller cannot send a turn until the last one answers. So a key with

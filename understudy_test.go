@@ -6069,10 +6069,8 @@ func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atO
 	})
 }
 
-// TODO(TODO.d/session-ordered-admission.md): a session's age is forgotten on
-// the consumer's session-end signal — until it lands, a dropped tenant's
-// conversation state is reclaimed by the forget backstop rather than at
-// teardown.
+// TODO(TODO.d/admission-reservation-window.md): a session's age is forgotten on
+// the consumer's session-end signal.
 
 // admissionLongMessage is the occupying session's message, whose turn holds
 // the target's only slot until the test ends its generation
