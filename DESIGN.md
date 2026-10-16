@@ -895,8 +895,9 @@ The orchestrator-side selection that *composes* a logical model's membership —
 calibration, cost/quality tradeoffs, escalation — is future work, not covered here.
 
 **Handler boundary: the mount emits; each side owns its own log record.**
-<a id="handler-boundary"></a> understudy's `New` returns an `http.Handler` a
-composition root mounts. The boundary splits three ways:
+<a id="handler-boundary"></a> understudy's `New` returns a value a composition root
+mounts as an `http.Handler` and reads the operator counts from (§Operator counts).
+The boundary splits three ways:
 
 - **Emitting the request log is the mount's**, not understudy's — the mount emits one
   structured entry per request, so every route it serves (a daemon's `/session` control
@@ -1086,7 +1087,8 @@ the state understudy holds grows with traffic: conversations with an admission s
 conversations with an affinity record, targets with a health entry, and requests waiting in
 admission queues. An operator running the daemon for weeks needs those counts to tell a leak
 from load, and to confirm a fix. understudy hands them over as one plain value, read at the
-moment it is asked for, and exports nothing itself. Whether the counts reach Prometheus, a log
+moment it is asked for, from a method on what `New` returns, and exports nothing itself. A
+new count is a new field of the counts value, not a new method. Whether the counts reach Prometheus, a log
 line, or a debug page is the embedder's choice, as what becomes of the log record is, and
 understudy takes on no metrics library to offer them. They are totals, not counts per target:
 a target's identity includes its account's key, which a count must not carry.
