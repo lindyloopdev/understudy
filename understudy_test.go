@@ -6191,8 +6191,8 @@ func busyTarget(t *testing.T, attempts *targetAttempts, opens time.Duration, atO
 	})
 }
 
-// TODO(TODO.d/admission-reservation-window.md): a session's age is forgotten on
-// the consumer's session-end signal.
+// TODO(TODO.d/admission-reservation-window.md): a turn arriving within the
+// reservation window keeps the session's place uncontested.
 
 // admissionLongMessage is the occupying session's message, whose turn holds
 // the target's only slot until the test ends its generation

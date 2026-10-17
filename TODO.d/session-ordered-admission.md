@@ -46,7 +46,6 @@ limiter. The steps below remain, in order.
 ## Outside this repo
 
 - Lindy dispatches the `400` of type `upstream_unavailable` — resend at
-  `retry_after_ms`, route the beat elsewhere, or abort — and sends the
-  session-end signal.
+  `retry_after_ms`, route the beat elsewhere, or abort.
 - Lindy chooses a beat's target from its own history of beat durations — the
   per-session routing the design leaves to the consumer.

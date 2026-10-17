@@ -1200,10 +1200,12 @@ Sessions therefore finish in arrival order, and a newer session waits behind
 older ones for as long as they keep taking turns. That is the design, not a
 cost: under contention some sessions cannot finish in time, and it is better to
 hold back the ones that have not started than to let every session interleave
-and time out together. Understudy forgets a session when the consumer signals
-that it ended, or after a long backstop (on the order of a day) with no request,
-for consumers that send no such signal; a session returning after the backstop
-ranks as new. A request with no session key ranks by its own arrival. Two
+and time out together. Understudy forgets a session after a long backstop (on the
+order of a day) with no request; a session returning after it ranks as new. No
+signal marks a session's end, and none is wanted: an ended session sends
+nothing, so remembering it costs only memory the backstop reclaims, while the
+only session that sends again is one resumed after an unclean end, which should
+keep its place. A request with no session key ranks by its own arrival. Two
 sessions that share a key share a place in line — a collision costs
 ordering, never correctness. In the shared daemon the ordering is global across
 runs (§Shared understudy daemon). Session age is a policy slot: explicit

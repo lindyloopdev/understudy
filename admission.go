@@ -44,8 +44,8 @@ const firstContentWindow = 10 * time.Minute
 // sessionForgetAfter is how long a conversation may go with no request before
 // its age is forgotten and it ranks as new again, so a session that keeps
 // taking turns — however old — is never outranked by one that has been away
-// longer. A backstop for consumers that send no session-end signal, and the
-// same one a conversation's target is forgotten on, so no record outlives it.
+// longer. The same backstop a conversation's target is forgotten on, so no
+// record outlives it.
 const sessionForgetAfter = 24 * time.Hour
 
 // sessionRecord is a conversation's standing in admission: firstSeen is its
@@ -67,8 +67,8 @@ func (r sessionRecord) idle(now time.Time) bool {
 // [sessionForgetAfter]. A request with no conversation key ranks by its own
 // arrival.
 //
-// TODO(TODO.d/admission-reservation-window.md): forget the session's age on
-// the consumer's session-end signal.
+// TODO(TODO.d/admission-reservation-window.md): hold the session's admission
+// priority for a window between its turns.
 func (s *server) sessionAge(tenant, key string) time.Time {
 	now := time.Now()
 	if key == "" {
