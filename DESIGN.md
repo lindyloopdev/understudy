@@ -1356,7 +1356,7 @@ was headered, so a rule that spares headered requests spares all of them. Being
 wrong is cheap and one-directional: canceling mid-prefill discards tens of
 seconds, while the silence it ends runs to tens of minutes.
 
-The timeout escalates with each attempt it ends at one target, because a timeout
+The timeout doubles with each attempt it ends at one target, because a timeout
 shorter than an honest time-to-first-content is worse than the stall it replaces
 — a cold model load that never fits inside it would be canceled and restarted
 forever. Only its own expiry escalates it: a displacement says nothing about how
@@ -1364,7 +1364,13 @@ long the target takes, and one target's slowness says nothing about another's,
 so a request that fails over starts again at the first value. Its first value
 must clear honest queueing at a slow backend, where a request can wait many
 minutes for its header with nothing wrong, so it comes from the target's own
-turnover. When it fires on a backend that gives no work before its header,
+turnover: twice the longest time to first content, counted from the send, among
+the last 20 requests the target served. A served request counts however many
+expiries it took, since its wait was honest. The first value is never below 60s,
+and is 60s for a target that has served nothing: the longest healthy time to
+first content Lindy measured was 26.2s. The margin and the count are starting
+values, adjusted from the timings Understudy logs. When it fires on a backend
+that gives no work before its header,
 every headerless request at that target restarts together in Understudy's send
 order, so a retry restores rank order rather than scrambling it.
 
