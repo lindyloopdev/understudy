@@ -7172,7 +7172,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    1,
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): should cut a request's send at the first-content timeout once the target's slow request is more than 20 served requests old.
+	// TODO(TODO.d/session-ordered-admission.md): should cut a request's send at the first-content timeout once the target's slow request's first content is more than 10 minutes old.
 	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout cut the first send", func(t *testing.T) test {
 		const (
 			message = "the lone session's target answers just after the timeout"

@@ -1365,11 +1365,15 @@ so a request that fails over starts again at the first value. Its first value
 must clear honest queueing at a slow backend, where a request can wait many
 minutes for its header with nothing wrong, so it comes from the target's own
 turnover: twice the longest time to first content, counted from the send, among
-the last 20 requests the target served. A served request counts however many
-expiries it took, since its wait was honest. The first value is never below 60s,
-and is 60s for a target that has served nothing: the longest healthy time to
-first content Lindy measured was 26.2s. The margin and the count are starting
-values, adjusted from the timings Understudy logs. When it fires on a backend
+the requests whose first content arrived in the last 10 minutes. Honest delay
+before first content is queueing, which is a matter of current traffic: a slow
+answer from a cleared queue says nothing about the next request, and would only
+hold the timeout up and slow the detection of a stall. A served request counts
+however many expiries it took, since its wait was honest. The first value is
+never below 60s, and is 60s for a target with no first content in the window:
+the longest healthy time to first content Lindy measured was 26.2s. The margin
+and the window are starting values, adjusted from the timings Understudy logs.
+When it fires on a backend
 that gives no work before its header,
 every headerless request at that target restarts together in Understudy's send
 order, so a retry restores rank order rather than scrambling it.
