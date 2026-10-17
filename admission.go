@@ -39,7 +39,8 @@ const initialFirstContentTimeout = 60 * time.Second
 // sessionForgetAfter is how long a conversation may go with no request before
 // its age is forgotten and it ranks as new again, so a session that keeps
 // taking turns — however old — is never outranked by one that has been away
-// longer. A backstop for consumers that send no session-end signal.
+// longer. A backstop for consumers that send no session-end signal, and the
+// same one a conversation's target is forgotten on, so no record outlives it.
 const sessionForgetAfter = 24 * time.Hour
 
 // sessionRecord is a conversation's standing in admission: firstSeen is its
@@ -48,6 +49,10 @@ const sessionForgetAfter = 24 * time.Hour
 type sessionRecord struct {
 	firstSeen time.Time
 	lastSeen  time.Time
+}
+
+func (r sessionRecord) idle(now time.Time) bool {
+	return now.Sub(r.lastSeen) >= sessionForgetAfter
 }
 
 // sessionAge returns when tenant's conversation was first seen, recording the
@@ -76,14 +81,14 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 	return now
 }
 
-// evictForgottenSessions clears every conversation's admission standing quiet
-// for [sessionForgetAfter].
+// evictForgottenSessions forgets every conversation quiet for
+// [sessionForgetAfter]: its place in line and its target go together.
 //
 // Caller holds s.mu.
 func (s *server) evictForgottenSessions(now time.Time) {
 	s.evictConversationParts(func(c *conversation) {
-		if c.session != nil && now.Sub(c.session.lastSeen) >= sessionForgetAfter {
-			c.session = nil
+		if c.session != nil && c.session.idle(now) {
+			c.session, c.served = nil, nil
 		}
 	})
 }

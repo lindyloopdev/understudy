@@ -981,13 +981,13 @@ func conversationKey(prefix []json.RawMessage) string {
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
-// conversation is the state Understudy keeps for one tenant conversation. Each
-// part expires on its own clock, and the record goes once both have.
+// conversation is the state Understudy keeps for one tenant conversation. Both
+// parts are forgotten together, after the conversation has gone
+// [sessionForgetAfter] with no request, and the record goes with them.
 type conversation struct {
-	// served is the target that last served the conversation, so a later turn
-	// keeps its prefix cache. It is a hint, not a lease: it reorders
-	// candidates pickTarget would accept. nil once idle past
-	// [affinityIdleTTL].
+	// served is the target that last served the conversation, so its later
+	// requests stay coherent with the answers that target authored. It is a
+	// hint, not a lease: it reorders candidates pickTarget would accept.
 	served *lastServed
 	// session is the conversation's admission standing. Its rank is taken at
 	// the first turn, so ordering engages before any history exists to stay
@@ -1028,56 +1028,38 @@ func (s *server) evictConversationParts(clearExpired func(c *conversation)) {
 	}
 }
 
-// lastServed is a conversation's target and when it last served — the age the
-// idle TTL measures.
+// lastServed is the target that last served a conversation.
 type lastServed struct {
-	target  Target
-	lastUse time.Time
+	target Target
 }
 
-// affinityIdleTTL is how long affinity survives its last use. The provider's
-// prefix cache sets the value — once it is cold, staying buys nothing — and five
-// minutes is the order of Anthropic's default. Expiring also bounds a map keyed
-// on caller-supplied content.
-const affinityIdleTTL = 5 * time.Minute
-
-// recordServe records t as the conversation's target and refreshes lastUse. The
-// sweep before each write is the only thing that reclaims an idle record — no
-// reader names one again.
+// recordServe records t as the conversation's target and refreshes its place
+// in line: a serve answers a request, so the two stay current together. A
+// request answered after its place in line was forgotten starts a fresh one,
+// so the record left behind is still one a later sweep forgets.
 func (s *server) recordServe(tenant, key string, t Target) {
 	if key == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.evictIdleAffinity()
-	s.conversationLocked(tenant, key).served = &lastServed{target: t, lastUse: now}
-}
-
-// evictIdleAffinity clears every conversation's target idle past
-// affinityIdleTTL and returns the sweep time, so a caller's write agrees with
-// it. Caller holds s.mu.
-func (s *server) evictIdleAffinity() time.Time {
 	now := time.Now()
-	s.evictConversationParts(func(c *conversation) {
-		if c.served != nil && c.served.idle(now) {
-			c.served = nil
-		}
-	})
-	return now
+	c := s.conversationLocked(tenant, key)
+	c.served = &lastServed{target: t}
+	if c.session == nil {
+		c.session = &sessionRecord{firstSeen: now}
+	}
+	c.session.lastSeen = now
 }
 
-func (l lastServed) idle(now time.Time) bool {
-	return now.Sub(l.lastUse) >= affinityIdleTTL
-}
-
-// affinity returns the target that last served the conversation, and false when
-// there is none or its record is idle.
+// affinity returns the target that last served the conversation, and false
+// when there is none or the conversation has gone [sessionForgetAfter] with
+// no request.
 func (s *server) affinity(tenant, key string) (Target, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c, ok := s.conversations[tenant][key]
-	if !ok || c.served == nil || c.served.idle(time.Now()) {
+	if !ok || c.served == nil || c.session == nil || c.session.idle(time.Now()) {
 		return Target{}, false
 	}
 	return c.served.target, true
@@ -1104,7 +1086,7 @@ func (s *server) preferLastServed(candidates []Target, tenant, key string) []Tar
 }
 
 // servedByAnother reports whether the conversation was last served by a target
-// other than answering, within the idle window.
+// other than answering, while its record stands.
 func (s *server) servedByAnother(tenant, key string, answering Target) bool {
 	bound, ok := s.affinity(tenant, key)
 	return ok && (bound.backend != answering.backend || bound.model != answering.model)

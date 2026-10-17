@@ -3502,7 +3502,8 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	tests.Add("should take the normal walk when a conversation returns after its affinity has gone idle", test{
+	// TODO(TODO.d/bind-a-conversation-to-its-target.md): should take the normal walk when a conversation returns after more than a day with no request.
+	tests.Add("should serve a conversation's later request from the target that served it last, after the conversation has been quiet for hours", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
 				// A momentary throttle: by the second turn a would serve.
@@ -3519,12 +3520,10 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
 				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
 			},
-			// Second turn, but past the idle TTL: the prefix cache affinity keyed
-			// on is cold, so staying on b buys nothing and a serves.
 			{
-				advance:    affinityIdleTTL + time.Second,
+				advance:    3 * time.Hour,
 				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
-				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
 			},
 		},
 	})
@@ -3968,8 +3967,7 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 
 	// TODO(TODO.d/bind-a-conversation-to-its-target.md): should relay a 400 to the
 	// client when it answers a conversation another target served more than a day
-	// before. Written once a conversation keeps its target for that long; today
-	// the record lapses after minutes idle.
+	// before.
 
 	tests.Add("should route to the last target when all are failing", test{
 		backends: map[string]backendStub{
@@ -8249,13 +8247,12 @@ func TestShouldSendOrHoldARequestOnArrival(t *testing.T) {
 			answered:             map[string]int{oldest: http.StatusOK},
 		}
 	})
-	// A session's rank outlives its affinity release.
-	tests.AddFunc("should cancel a younger session's request that has sent nothing past its grace period and send an older session's later request at once/the older session was quiet longer than affinity's idle time", func(t *testing.T) test {
+	tests.AddFunc("should cancel a younger session's request that has sent nothing past its grace period and send an older session's later request at once/the older session was quiet for five minutes and four seconds", func(t *testing.T) test {
 		const (
 			older   = "the older session asks"
 			younger = "the younger session asks"
 		)
-		youngerArrives := affinityIdleTTL + time.Second
+		youngerArrives := 5*time.Minute + time.Second
 		olderLaterArrives := admissionGracePeriod + time.Second
 		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {

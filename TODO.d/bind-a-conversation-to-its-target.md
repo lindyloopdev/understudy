@@ -10,9 +10,6 @@ a bound request would otherwise divert.
 
 ## Work
 
-- **Keep a conversation's target for as long as the conversation lasts.** An
-  affinity record is forgotten after the same backstop with no request as a
-  session's place in line, not after minutes idle.
 - **Count a target's query overrides in its identity to a conversation.**
   Preferring the last-served target, and telling a 400 from "another target
   served last", compare the whole target, overrides included; health still
@@ -32,8 +29,8 @@ a bound request would otherwise divert.
   captured body.
 - **Relay a `400` to the client when it answers a conversation another target
   served more than a day before.** The failover that reads the record lapses
-  with the record, so a history rejection after the idle window again looks
-  like the client's.
+  with the record, so a history rejection after the record is forgotten again
+  looks like the client's.
 - **Settle what a caller-initiated model switch means for affinity.** opencode's
   session carries `ModelSwitched` and `AgentSwitched`, so the caller can change
   model without understudy; affinity that fought that would be wrong.
