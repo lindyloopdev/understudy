@@ -28,8 +28,8 @@ limiter. The steps below remain, in order.
   so a compacted session keeps its place in line.
 - **Finish the first-content timeout** (DESIGN.md, *A first-content
   timeout*). What remains:
-  - Count only first content from the last 10 minutes toward a target's longest
-    time to first content.
+  - Test that a slow request's first content keeps raising a target's
+    first-content timeout while it is less than 10 minutes old.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two

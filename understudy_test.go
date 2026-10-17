@@ -7172,7 +7172,49 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    1,
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): should cut a request's send at the first-content timeout once the target's slow request's first content is more than 10 minutes old.
+	tests.AddFunc("should cut a request's send at the first-content timeout once the target's slow request's first content is more than 10 minutes old", func(t *testing.T) test {
+		const (
+			slowMessage  = "an earlier conversation waits fifty seconds for its answer"
+			laterMessage = "a later conversation waits ninety-nine seconds for its answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			if sentMessage == slowMessage {
+				time.Sleep(50 * time.Second)
+				return sseAnswer(sentMessage), nil
+			}
+			// The later request's first content sits inside the doubled
+			// 2×50s timeout the slow request's first content still holds
+			// up, and past [minFirstContentTimeout] once it stops counting;
+			// the doubled re-send of a cut attempt outlasts it.
+			select {
+			case <-r.Context().Done():
+				return nil, context.Cause(r.Context())
+			case <-time.After(99 * time.Second):
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
+				// The slow request's first content arrives fifty seconds
+				// after its send; the later request reaches the target one
+				// second past [firstContentWindow] after that, so the slow
+				// content is just outside the window.
+				{inboundMessage: laterMessage, body: admissionTurn(admissionMsg("user", laterMessage)), after: 50*time.Second + 10*time.Minute + time.Second},
+			},
+			// The first send is cut at [minFirstContentTimeout]; the
+			// doubled re-send answers inside it.
+			wait:     minFirstContentTimeout + 99*time.Second + time.Second,
+			followed: laterMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, laterMessage)},
+			sends:    2,
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): should keep raising a target's first-content timeout with a slow request's first content while it is less than 10 minutes old.
 	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout cut the first send", func(t *testing.T) test {
 		const (
 			message = "the lone session's target answers just after the timeout"

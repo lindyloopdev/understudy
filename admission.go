@@ -34,6 +34,13 @@ var errUnavailableForNewSessions = errors.New("left a target unavailable for new
 // notes/2026-09-30-time-to-first-content-measurements.md).
 const minFirstContentTimeout = 60 * time.Second
 
+// firstContentWindow is how recently a target's first content must have
+// arrived to count toward its first-content timeout's first value: honest
+// delay before first content is queueing, so a slow answer from a queue that
+// has since cleared stops holding the timeout up. A starting value, adjusted
+// from the timings Understudy logs.
+const firstContentWindow = 10 * time.Minute
+
 // sessionForgetAfter is how long a conversation may go with no request before
 // its age is forgotten and it ranks as new again, so a session that keeps
 // taking turns — however old — is never outranked by one that has been away
@@ -277,6 +284,13 @@ func (s *server) moveWaitingFirstRequests() {
 	}
 }
 
+// firstContent is one of a target's served first contents: at is when it
+// arrived, and took is how long its send waited for it.
+type firstContent struct {
+	at   time.Time
+	took time.Duration
+}
+
 // targetQueue orders admission to one target by session age: the backend
 // cannot see conversations, so the layer holding every request orders them —
 // oldest session first, so sessions finish rather than interleave turn by
@@ -317,9 +331,9 @@ type targetQueue struct {
 	// queue leaves it standing; it is zero while the queue would take an
 	// arrival without holding it. holdingSinceLocked updates it.
 	holdingSince time.Time
-	// longestTimeToFirstContent is the longest time from a send to its first
-	// content among the requests the target has served.
-	longestTimeToFirstContent time.Duration
+	// firstContents records the target's served first contents, pruned of
+	// first content older than [firstContentWindow].
+	firstContents []firstContent
 }
 
 // refusedModelWaiting reports whether a request the server refused as busy
@@ -677,8 +691,9 @@ func (q *targetQueue) endSend(p *pending) bool {
 // attempt: no content within the timeout — whether the attempt is still
 // waiting for its header or reading a body that has sent none — ends the
 // attempt and the request is sent again. The timeout's first value comes from
-// the target's own turnover: twice the longest time to first content among
-// the requests it has served, never below [minFirstContentTimeout]. Each
+// the target's own turnover: twice the longest time to first content, counted
+// from the send, among the requests whose first content arrived within
+// [firstContentWindow], never below [minFirstContentTimeout]. Each
 // earlier attempt at this target this timeout ended doubles it, so an honest
 // attempt slower than the first is not canceled and restarted forever; a
 // displacement leaves it where it was. First content disables it: once
@@ -690,8 +705,23 @@ func (q *targetQueue) armFirstContentTimeout(p *pending) {
 	// The handler reads timer only under q.mu, which is held here until it
 	// is set, so even a timer that fires at once finds it.
 	var timer *time.Timer
-	timer = q.firstContentSchedule(max(2*q.longestTimeToFirstContent, minFirstContentTimeout)<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p, &timer) })
+	timer = q.firstContentSchedule(max(2*q.longestTimeToFirstContent(time.Now()), minFirstContentTimeout)<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p, &timer) })
 	p.firstContentTimer = timer
+}
+
+// longestTimeToFirstContent returns the longest time from a send to its first
+// content among the target's served first contents younger than
+// [firstContentWindow], pruning the ones that have aged past it. Caller holds
+// q.mu.
+func (q *targetQueue) longestTimeToFirstContent(now time.Time) time.Duration {
+	for len(q.firstContents) > 0 && now.Sub(q.firstContents[0].at) >= firstContentWindow {
+		q.firstContents = q.firstContents[1:]
+	}
+	var longest time.Duration
+	for _, fc := range q.firstContents {
+		longest = max(longest, fc.took)
+	}
+	return longest
 }
 
 // expireFirstContentTimeout preempts p's attempt when its first-content timeout
@@ -780,7 +810,7 @@ func (q *targetQueue) confirm(p *pending, toFirstContent time.Duration) bool {
 	}
 	if !p.confirmed {
 		p.confirmed = true
-		q.longestTimeToFirstContent = max(q.longestTimeToFirstContent, toFirstContent)
+		q.firstContents = append(q.firstContents, firstContent{at: time.Now(), took: toFirstContent})
 		q.admitIfAllOutstandingConfirmed()
 	}
 	return true
