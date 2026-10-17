@@ -7097,12 +7097,47 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
-			wait:     initialFirstContentTimeout + 90*time.Second + time.Second,
+			wait:     minFirstContentTimeout + 90*time.Second + time.Second,
 			followed: message,
 			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
 			sends:    2,
 		}
 	})
+	tests.AddFunc("should wait for a target's first content for twice the longest it has taken before, sending the request again only after that", func(t *testing.T) test {
+		const (
+			earlierMessage = "an earlier conversation waits fifty seconds for its answer"
+			laterMessage   = "a later conversation waits ninety-nine seconds for its answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(_ *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			// The later request's first content is just inside twice the
+			// earlier one's, so its send stands.
+			if sentMessage == earlierMessage {
+				time.Sleep(50 * time.Second)
+			} else {
+				time.Sleep(99 * time.Second)
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
+				{inboundMessage: laterMessage, body: admissionTurn(admissionMsg("user", laterMessage)), after: 51 * time.Second},
+			},
+			// Long enough that the later answer arrives even if the send is
+			// cut and sent again, so the send count tells the first value
+			// apart.
+			wait:     165 * time.Second,
+			followed: laterMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, laterMessage)},
+			sends:    1,
+		}
+	})
+	// TODO(TODO.d/session-ordered-admission.md): should cut a request's send at the first-content timeout once the target's slow request is more than 20 served requests old.
+	// TODO(TODO.d/session-ordered-admission.md): should count a request served after the first-content timeout cut its earlier send toward the target's first value.
 	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout cut the first send", func(t *testing.T) test {
 		const (
 			message = "the lone session's target answers just after the timeout"
@@ -7135,7 +7170,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
-			wait:     initialFirstContentTimeout + time.Second,
+			wait:     minFirstContentTimeout + time.Second,
 			followed: message,
 			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
 			sends:    2,
@@ -7173,7 +7208,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
-			wait:     initialFirstContentTimeout + time.Second,
+			wait:     minFirstContentTimeout + time.Second,
 			followed: message,
 			events:   []string{fmt.Sprintf(`{"id":%q}`, message)},
 			sends:    2,
@@ -7258,7 +7293,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 					case 2:
 						// The next event comes past the first-content
 						// timeout.
-						time.Sleep(initialFirstContentTimeout + 30*time.Second)
+						time.Sleep(minFirstContentTimeout + 30*time.Second)
 						if err := context.Cause(r.Context()); err != nil {
 							return 0, err
 						}
@@ -7272,7 +7307,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			backends: map[string]*http.Client{"openai": backend},
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
-			wait:     initialFirstContentTimeout + 30*time.Second + time.Second,
+			wait:     minFirstContentTimeout + 30*time.Second + time.Second,
 			followed: message,
 			events:   []string{`{"n":1}`, `{"n":2}`},
 			sends:    1,
@@ -7403,7 +7438,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			firstStreamEnds       = youngerArrives + 5*time.Second
 			secondStreamEnds      = firstStreamEnds + 3*time.Second
 			unconfirmedAnsweredAt = secondStreamEnds + 7*time.Second
-			olderTimeoutExpires   = firstStreamEnds + initialFirstContentTimeout
+			olderTimeoutExpires   = firstStreamEnds + minFirstContentTimeout
 		)
 		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
@@ -7464,7 +7499,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			headeredArrives        = time.Second
 			refilledArrives        = headeredArrives + admissionGracePeriod + time.Second
 			streamEnds             = refilledArrives + 2*time.Second
-			headeredTimeoutExpires = headeredArrives + initialFirstContentTimeout
+			headeredTimeoutExpires = headeredArrives + minFirstContentTimeout
 		)
 		received := &receivedMessages{}
 		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
@@ -7527,7 +7562,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			olderArrives      = timedOutArrives + admissionGracePeriod/2
 			displacedArrives  = timedOutArrives + admissionGracePeriod + time.Second
 			streamEnds        = displacedArrives + 2*time.Second
-			timedOutExpires   = timedOutArrives + initialFirstContentTimeout
+			timedOutExpires   = timedOutArrives + minFirstContentTimeout
 			olderAgainArrives = timedOutExpires - time.Second
 			waitingArrives    = olderAgainArrives + time.Second/2
 			displacedSendEnds = timedOutExpires + time.Second

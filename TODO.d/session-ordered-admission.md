@@ -26,44 +26,26 @@ limiter. The steps below remain, in order.
   *Admission ordering is oldest-session-first*: where a request carries
   `x-session-affinity`, its session's age keys on that, scoped to the token,
   so a compacted session keeps its place in line.
-- **Finish the first-content timeout.** DESIGN.md's *A first-content
-  timeout* is built: an attempt with no content within its timeout is canceled
-  and sent again to the same target, together with every other request there
-  that has no response header. The timeout is 60s, doubling with each re-send
-  it causes at that target; a displacement leaves it where it was, and a
-  failover's new target starts again at 60s. What remains:
-  - Take the first value from the target's own turnover — its observed time
-    to first content ([[log-request-timings]]) — rather than the 60s default
-    sized from lindy's notes/2026-09-30-time-to-first-content-measurements.md.
+- **Finish the first-content timeout** (DESIGN.md, *A first-content
+  timeout*). What remains:
+  - Count only the target's last 20 served requests toward its longest time to
+    first content.
+  - Test that a request served after the first-content timeout cut its earlier
+    send counts toward the target's first value.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two
     decide precedence is unsettled.
-- **Who waits, and who fails over** (DESIGN.md, *Who waits, and who fails
-  over*): when every target is unavailable for new sessions, answer a first
-  turn at once with a `400` of type `upstream_unavailable` and
-  `retry_after_ms`, as the nothing-left answer does; why the targets are
-  unavailable goes to the log.
-  - Tests: with every target unavailable for new sessions, a first turn gets
-    the `400` `upstream_unavailable` at once.
-- **A 429 with `Retry-After` on a request that waits benches the target** —
-  the existing `recordRateLimited` — **and admits the highest-ranked request
-  whose target is not benched**, instead of taking the ladder. Blocked on the
-  wait budget: holding a request through a `Retry-After` is the Retry-After
-  ladder's wait-in-place rung, which applies only within the budget, and
-  `T_wait` is set from measured held-connection cost
-  ([[understudy-fallback]], [[understudy-adaptive-coordinated-backoff]]);
-  until it exists, such a 429 takes the fail-over rung. A bare 429 with
-  nothing running takes the ordinary ladder. Kronk's admission timeout is a
-  bare `429` `resource_exhausted`, identical to its model-does-not-fit error
-  (`notes/kronk.md` #2), so no rule may key on the code.
-  - Tests: a 429 with `Retry-After` holds only its own target while others are
-    admitted; a bare 429 with nothing running takes the ladder.
+- **Answer a session's first request at once when every target is unavailable
+  for new sessions** (DESIGN.md, *Who waits, and who fails over*).
+- **Admit around a target that a 429 with `Retry-After` benches** (DESIGN.md,
+  *A 429 on a request that waits re-queues it*). Blocked on the wait budget's
+  `T_wait` ([[understudy-fallback]],
+  [[understudy-adaptive-coordinated-backoff]]).
 - **Linked models** (DESIGN.md, *The queue is keyed on the target*). A request
   re-queued by the 429 rule counts progress across the linked set.
-- **Operator guidance.** Kronk's `QueueDepth` (keep the default of 2; a depth of
-  1 needs `AdmissionTimeout` raised past the longest turn) belongs in
-  [[documentation]].
+- **Operator guidance.** Kronk's `QueueDepth` (DESIGN.md, *Backend
+  configuration*) belongs in [[documentation]].
 
 ## Outside this repo
 

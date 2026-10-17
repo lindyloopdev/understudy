@@ -26,15 +26,13 @@ var errPreempted = errors.New("displaced for an older session")
 // against the target it left.
 var errUnavailableForNewSessions = errors.New("left a target unavailable for new sessions")
 
-// initialFirstContentTimeout is how long a request's first attempt at a
-// target may produce no content before the attempt is ended and the request
-// sent again. It must clear honest queueing at a slow backend: the longest
-// healthy time to first content measured was 26.2s (lindy repo,
+// minFirstContentTimeout is the least first value a target's
+// first-content timeout takes: the whole value while the target has served
+// nothing, and the floor its turnover raises it above. It must clear honest
+// queueing at a slow backend: the longest healthy time to first content
+// measured was 26.2s (lindy repo,
 // notes/2026-09-30-time-to-first-content-measurements.md).
-//
-// TODO(TODO.d/session-ordered-admission.md): take the first value from the
-// target's own turnover, instead of this default.
-const initialFirstContentTimeout = 60 * time.Second
+const minFirstContentTimeout = 60 * time.Second
 
 // sessionForgetAfter is how long a conversation may go with no request before
 // its age is forgotten and it ranks as new again, so a session that keeps
@@ -319,6 +317,9 @@ type targetQueue struct {
 	// queue leaves it standing; it is zero while the queue would take an
 	// arrival without holding it. holdingSinceLocked updates it.
 	holdingSince time.Time
+	// longestTimeToFirstContent is the longest time from a send to its first
+	// content among the requests the target has served.
+	longestTimeToFirstContent time.Duration
 }
 
 // refusedModelWaiting reports whether a request the server refused as busy
@@ -675,18 +676,21 @@ func (q *targetQueue) endSend(p *pending) bool {
 // armFirstContentTimeout arms the first-content timeout for p's current
 // attempt: no content within the timeout — whether the attempt is still
 // waiting for its header or reading a body that has sent none — ends the
-// attempt and the request is sent again. Each earlier attempt at this target
-// this timeout ended doubles it, so an honest attempt slower than the first is
-// not canceled and restarted forever; a displacement leaves it where it was.
-// First content disables it: once content has arrived, silence is the stream
-// idle deadline's to bound, not this timeout's.
+// attempt and the request is sent again. The timeout's first value comes from
+// the target's own turnover: twice the longest time to first content among
+// the requests it has served, never below [minFirstContentTimeout]. Each
+// earlier attempt at this target this timeout ended doubles it, so an honest
+// attempt slower than the first is not canceled and restarted forever; a
+// displacement leaves it where it was. First content disables it: once
+// content has arrived, silence is the stream idle deadline's to bound, not
+// this timeout's.
 func (q *targetQueue) armFirstContentTimeout(p *pending) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	// The handler reads timer only under q.mu, which is held here until it
 	// is set, so even a timer that fires at once finds it.
 	var timer *time.Timer
-	timer = q.firstContentSchedule(initialFirstContentTimeout<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p, &timer) })
+	timer = q.firstContentSchedule(max(2*q.longestTimeToFirstContent, minFirstContentTimeout)<<p.firstContentTimeouts, func() { q.expireFirstContentTimeout(p, &timer) })
 	p.firstContentTimer = timer
 }
 
@@ -762,10 +766,13 @@ func (q *targetQueue) rearm(p *pending, cancel context.CancelCauseFunc) {
 // confirm records p's first content — the moment the target has begun
 // answering — which frees the queue to admit its next waiter unless a
 // refused model's request waits on the server and outranks that waiter,
-// and reports whether the send still stands. A preempted send — by an
-// outranking arrival, or by its own first-content timeout — does not: its
-// content is discarded, and the caller sends the client nothing.
-func (q *targetQueue) confirm(p *pending) bool {
+// and reports whether the send still stands. toFirstContent is the time
+// from the send to this content. A send that stands counts toward the
+// target's turnover, widening the queue's first-content timeouts. A
+// preempted send — by an outranking arrival, or by its own first-content
+// timeout — does not: its content is discarded, and the caller sends the
+// client nothing.
+func (q *targetQueue) confirm(p *pending, toFirstContent time.Duration) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if p.preempted {
@@ -773,6 +780,7 @@ func (q *targetQueue) confirm(p *pending) bool {
 	}
 	if !p.confirmed {
 		p.confirmed = true
+		q.longestTimeToFirstContent = max(q.longestTimeToFirstContent, toFirstContent)
 		q.admitIfAllOutstandingConfirmed()
 	}
 	return true

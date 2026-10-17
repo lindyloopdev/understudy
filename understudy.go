@@ -2855,9 +2855,10 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
 			// again.
-			if a.pend.queue.confirm(a.pend) {
+			toFirstContent := time.Since(a.sent)
+			if a.pend.queue.confirm(a.pend, toFirstContent) {
 				held.commit()
-				setLogTimeToFirstContent(a.r.Context(), time.Since(a.sent))
+				setLogTimeToFirstContent(a.r.Context(), toFirstContent)
 			}
 		},
 	})
