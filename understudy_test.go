@@ -3502,7 +3502,6 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO(TODO.d/bind-a-conversation-to-its-target.md): should take the normal walk when a conversation returns after more than a day with no request.
 	tests.Add("should serve a conversation's later request from the target that served it last, after the conversation has been quiet for hours", test{
 		backends: map[string]backendStub{
 			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
@@ -3524,6 +3523,30 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 				advance:    3 * time.Hour,
 				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
 				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+			},
+		},
+	})
+
+	tests.Add("should serve a conversation's later request from the first target in the list, after the conversation has gone more than a day with no request", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusOK, `{"id":"from-a"}`), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			{
+				advance:    sessionForgetAfter + time.Second,
+				messages:   `[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"and then?"}]`,
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-a"}`, wantBackend: "a",
 			},
 		},
 	})
