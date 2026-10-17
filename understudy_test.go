@@ -7214,7 +7214,38 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    2,
 		}
 	})
-	// TODO(TODO.d/session-ordered-admission.md): should keep raising a target's first-content timeout with a slow request's first content while it is less than 10 minutes old.
+	tests.AddFunc("should keep raising a target's first-content timeout with a slow request's first content while it is less than 10 minutes old", func(t *testing.T) test {
+		const (
+			slowMessage  = "an earlier conversation waits fifty seconds for its answer"
+			laterMessage = "a later conversation waits ninety-nine seconds for its answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(_ *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			if sentMessage == slowMessage {
+				time.Sleep(50 * time.Second)
+			} else {
+				time.Sleep(99 * time.Second)
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
+				// Still inside [firstContentWindow] aged from the slow
+				// request's first content, but past the same window aged
+				// from its send, so only the slow request's first content
+				// still holds the timeout up.
+				{inboundMessage: laterMessage, body: admissionTurn(admissionMsg("user", laterMessage)), after: 50*time.Second + 10*time.Minute - time.Second},
+			},
+			wait:     99*time.Second + time.Second,
+			followed: laterMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, laterMessage)},
+			sends:    1,
+		}
+	})
 	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout cut the first send", func(t *testing.T) test {
 		const (
 			message = "the lone session's target answers just after the timeout"
