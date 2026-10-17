@@ -3984,9 +3984,30 @@ func TestChatCompletionsFailoverRouting(t *testing.T) {
 		},
 	})
 
-	// TODO [TODO.d/relay-a-first-request-400-from-a-served-conversation.md]:
-	// should relay a 400 to the client when it answers the first request of
-	// a conversation another target served last.
+	tests.Add("should relay a 400 to the client when it answers the first request of a conversation another target served last", test{
+		backends: map[string]backendStub{
+			"a": {baseURL: mustParseURL(t, "http://a/v1"), apiKey: "sk-a", resp: func(_ *http.Request, call int) (*http.Response, error) {
+				if call == 1 {
+					return resp(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"slow down"}}`), nil
+				}
+				return resp(http.StatusBadRequest, fmt.Sprintf(`{"error":{"message":%q}}`, unrecognized400)), nil
+			}},
+			"b": {baseURL: mustParseURL(t, "http://b/v1"), apiKey: "sk-b", resp: always(http.StatusOK, `{"id":"from-b"}`)},
+		},
+		targets: []Target{{backend: "a", model: "ma"}, {backend: "b", model: "mb"}},
+		steps: []step{
+			{
+				wantStatus: http.StatusOK, wantBody: `{"id":"from-b"}`, wantBackend: "b",
+				wantExcluded: []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+			},
+			{
+				advance:     time.Second,
+				wantStatus:  http.StatusBadRequest,
+				wantBody:    fmt.Sprintf(`{"error":{"message":"upstream returned status 400: %s","type":"invalid_request_error"}}`, unrecognized400),
+				wantBackend: "a",
+			},
+		},
+	})
 
 	tests.Add("should relay a 400 to the client when it answers a conversation another target served more than a day before", test{
 		backends: map[string]backendStub{
