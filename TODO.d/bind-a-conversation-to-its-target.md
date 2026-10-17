@@ -27,10 +27,6 @@ a bound request would otherwise divert.
   from the shipped opencode bundle 2026-08-14 — compaction cuts at a user-message
   boundary against a `preserve_recent_tokens` budget — but not yet seen on a
   captured body.
-- **Relay a `400` to the client when it answers a conversation another target
-  served more than a day before.** The failover that reads the record lapses
-  with the record, so a history rejection after the record is forgotten again
-  looks like the client's.
 - **Settle what a caller-initiated model switch means for affinity.** opencode's
   session carries `ModelSwitched` and `AgentSwitched`, so the caller can change
   model without understudy; affinity that fought that would be wrong.
