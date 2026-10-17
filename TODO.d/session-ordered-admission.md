@@ -30,8 +30,6 @@ limiter. The steps below remain, in order.
   timeout*). What remains:
   - Count only the target's last 20 served requests toward its longest time to
     first content.
-  - Test that a request served after the first-content timeout cut its earlier
-    send counts toward the target's first value.
   - This composes with [[stall-before-first-content-event]]'s demote-and-
     replay-to-a-different-candidate disposition, which answers a different
     question (which target) for the same triggering silence; how the two

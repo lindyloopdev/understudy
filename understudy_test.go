@@ -7136,8 +7136,43 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			sends:    1,
 		}
 	})
+	tests.AddFunc("should wait for a target's first content for twice the longest it has taken before, including a request it answered only after the first-content timeout cut its earlier send", func(t *testing.T) test {
+		const (
+			earlierMessage = "an earlier conversation's first send is cut, and its second answered in ninety seconds"
+			laterMessage   = "a later conversation waits a hundred and seventy seconds for its answer"
+		)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, sentMessage string) (*http.Response, error) {
+			received.add(sentMessage)
+			if sentMessage == earlierMessage && received.count(sentMessage) == 1 {
+				<-r.Context().Done()
+				return nil, context.Cause(r.Context())
+			}
+			// The later request's first content is just inside twice the
+			// earlier request's second send, so its send stands.
+			if sentMessage == earlierMessage {
+				time.Sleep(90 * time.Second)
+			} else {
+				time.Sleep(170 * time.Second)
+			}
+			return sseAnswer(sentMessage), nil
+		})
+		return test{
+			backends: map[string]*http.Client{"openai": backend},
+			received: received,
+			arrivals: []arrival{
+				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
+				// Arrives after the earlier request's second send completes,
+				// so that send sets the target's first value.
+				{inboundMessage: laterMessage, body: admissionTurn(admissionMsg("user", laterMessage)), after: minFirstContentTimeout + 91*time.Second},
+			},
+			wait:     171 * time.Second,
+			followed: laterMessage,
+			events:   []string{fmt.Sprintf(`{"id":%q}`, laterMessage)},
+			sends:    1,
+		}
+	})
 	// TODO(TODO.d/session-ordered-admission.md): should cut a request's send at the first-content timeout once the target's slow request is more than 20 served requests old.
-	// TODO(TODO.d/session-ordered-admission.md): should count a request served after the first-content timeout cut its earlier send toward the target's first value.
 	tests.AddFunc("should relay the backend's answer to Understudy's second send, and none of the first send's content, when that content arrives just after the first-content timeout cut the first send", func(t *testing.T) test {
 		const (
 			message = "the lone session's target answers just after the timeout"
