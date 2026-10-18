@@ -22,10 +22,9 @@ limiter. The steps below remain, in order.
 
 ## Work
 
-- **Rank a session by the caller's session identifier.** DESIGN.md's
-  *Admission ordering is oldest-session-first*: where a request carries
-  `x-session-affinity`, its session's age keys on that, scoped to the token,
-  so a compacted session keeps its place in line.
+- **Give each client its own place in line for a shared session identifier.**
+  DESIGN.md's *Admission ordering is oldest-session-first*: the caller's
+  session identifier is scoped to the token.
 - **Finish the first-content timeout** (DESIGN.md, *A first-content
   timeout*). What remains:
   - This composes with [[stall-before-first-content-event]]'s demote-and-
