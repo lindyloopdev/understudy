@@ -110,8 +110,10 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// defaultFailoverThreshold is how long a target may keep failing before
-// pickTarget routes around it to the next target in a logical model.
+// defaultFailoverThreshold is how long a target may keep failing — or its
+// admission queue be unable to take a new session's arrival — before
+// [pickTarget] routes around it to the next target in a logical model, and a
+// first turn already waiting in the target's queue leaves for one.
 const defaultFailoverThreshold = 15 * time.Second
 
 // defaultRecoveryInterval is how long pickTarget waits between half-open
@@ -160,6 +162,61 @@ type targetHealth struct {
 // request. It is set far above the recovery-probe schedule so a demotion that is
 // still being probed is never mistaken for a stranded one.
 const healthTTL = 24 * time.Hour
+
+// healthRecords holds each target's health, keyed by the [healthKey] computed
+// for it. Every change goes through [healthRecords.update], which sweeps first.
+type healthRecords struct {
+	mu      sync.Mutex
+	entries map[string]targetHealth
+}
+
+// update drops every entry untouched for [healthTTL], then runs change on the
+// entries that remain, all under the records' lock. The sweep is the only thing
+// that reclaims an entry named directly and so never walked past.
+func (r *healthRecords) update(change func(e healthEntries)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for id, h := range r.entries {
+		if now.Sub(h.lastTouch) >= healthTTL {
+			delete(r.entries, id)
+		}
+	}
+	change(healthEntries{entries: r.entries, now: now})
+}
+
+// get returns the entry keyed id, and whether there is one.
+func (r *healthRecords) get(id string) (targetHealth, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h, ok := r.entries[id]
+	return h, ok
+}
+
+// healthEntries is the health entries [healthRecords.update] hands a change,
+// with the moment its sweep ran.
+type healthEntries struct {
+	entries map[string]targetHealth
+	now     time.Time
+}
+
+// get returns the entry keyed id, and whether there is one.
+func (e healthEntries) get(id string) (targetHealth, bool) {
+	h, ok := e.entries[id]
+	return h, ok
+}
+
+// put stores h as id's entry, stamped with the sweep's own clock, so a write
+// cannot be aged out by the sweep that preceded it.
+func (e healthEntries) put(id string, h targetHealth) {
+	h.lastTouch = e.now
+	e.entries[id] = h
+}
+
+// drop removes id's entry: the target is healthy again.
+func (e healthEntries) drop(id string) {
+	delete(e.entries, id)
+}
 
 // defaultMaxConcurrentPerUpstream is the per-account limiter's cold-start
 // allowance. It is a starting point, not a ceiling: grow() raises the cap toward
@@ -246,18 +303,39 @@ type server struct {
 	// [WithHTTPClient] for why it exists.
 	httpClient *http.Client
 
+	// firstContentSchedule starts a timer that runs fire after d and returns
+	// it. Production uses [time.AfterFunc]; a test may give its own to hold a
+	// firing between the timer's firing and the handler's run — a moment
+	// real and synctest timers cannot produce, since the scheduler picks
+	// whether that handler or the re-send it must not touch runs first.
+	firstContentSchedule func(d time.Duration, fire func()) *time.Timer
+
+	// health records each target's current failure streak; a target with no
+	// entry is healthy. It has its own lock: a path holding s.mu takes it
+	// inside s.mu, never the other way round.
+	health healthRecords
+
 	mu sync.Mutex
-	// health records each target's current failure streak; a target absent from
-	// the map is healthy.
-	health map[string]targetHealth
-	// affinity records, per token and conversation, the target that last served
-	// it, so a later turn keeps its prefix cache. It is a hint, not a lease: it
-	// reorders candidates pickTarget would accept, and expires once idle. The
-	// token groups the records so a tenant's can be dropped with it.
-	affinity map[string]map[string]lastServed
-	// upstreamLimiters holds a per-upstream concurrency limiter keyed by upstream
-	// identity, bounding concurrent in-flight requests to each account.
-	upstreamLimiters map[string]*upstreamLimiter
+	// conversations holds each conversation's state; the tenant groups the
+	// records so a tenant's can be dropped with it.
+	conversations map[string]map[string]*conversation
+	// admission holds each target's session-ordered admission queue, keyed by
+	// the same availability key (canonical url + key + model) the walk uses.
+	// It stays apart from health: a health entry is swept once stale, but a
+	// queue is never dropped, since dropping one would let a new arrival be
+	// sent ahead of the requests still waiting in it.
+	admission map[string]*targetQueue
+	// upstreams holds each canonical upstream account's state, keyed by
+	// [canonicalUpstreamKey].
+	upstreams map[string]*upstreamAccount
+}
+
+// upstreamAccount is the state Understudy keeps for one upstream account.
+type upstreamAccount struct {
+	// limiter bounds concurrent in-flight requests to the account.
+	limiter *upstreamLimiter
+	// busyRefusal is the server's standing busy refusal, if any.
+	busyRefusal *busyRefusal
 }
 
 // upstreamLimiter bounds concurrent in-flight requests to one upstream. Unlike a
@@ -280,6 +358,16 @@ type upstreamLimiter struct {
 	// handing one out first.
 	saturatedSince time.Time
 	ready          chan struct{}
+	// waiters holds the requests blocked waiting for a slot, each carrying
+	// its session's rank; a freed slot goes to the waiter from the oldest
+	// session.
+	waiters []*limiterWaiter
+}
+
+// limiterWaiter is one request blocked in [upstreamLimiter.acquire], carrying
+// the rank that orders which waiter a freed slot goes to.
+type limiterWaiter struct {
+	rank time.Time
 }
 
 func newUpstreamLimiter(limit int) *upstreamLimiter {
@@ -290,15 +378,26 @@ func newUpstreamLimiter(limit int) *upstreamLimiter {
 // whether it had to wait — the demand signal that gates growth of the cap. A
 // free slot is taken immediately without consulting ctx, so a request with an
 // already-cancelled context but an available slot still runs and surfaces the
-// handler's own cause.
-func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
+// handler's own cause. rank is the caller's session age: a free slot is the
+// caller's only once no older session's request waits for one.
+func (l *upstreamLimiter) acquire(ctx context.Context, rank time.Time) (bool, error) {
 	waited := false
+	w := &limiterWaiter{rank: rank}
+	waiting := false
 	for {
 		l.mu.Lock()
-		if l.inflight < l.limit {
+		if l.inflight < l.limit && !l.outrankedLocked(w) {
 			l.inflight++
+			if waiting {
+				l.dropWaiterLocked(w)
+			}
+			l.wakeIdleLocked()
 			l.mu.Unlock()
 			return waited, nil
+		}
+		if !waiting {
+			l.waiters = append(l.waiters, w)
+			waiting = true
 		}
 		ready := l.ready
 		l.mu.Unlock()
@@ -306,8 +405,34 @@ func (l *upstreamLimiter) acquire(ctx context.Context) (bool, error) {
 		case <-ready:
 			waited = true
 		case <-ctx.Done():
+			l.mu.Lock()
+			l.dropWaiterLocked(w)
+			l.wakeIdleLocked()
+			l.mu.Unlock()
 			return waited, context.Cause(ctx)
 		}
+	}
+}
+
+// outrankedLocked reports whether a request from a session older than w's is
+// waiting. Equal ranks do not outrank: sessions first seen at the same moment
+// share a place in line. Caller holds l.mu.
+func (l *upstreamLimiter) outrankedLocked(w *limiterWaiter) bool {
+	return slices.ContainsFunc(l.waiters, func(o *limiterWaiter) bool { return o.rank.Before(w.rank) })
+}
+
+// dropWaiterLocked removes w from the waiting line, if it is there. Caller
+// holds l.mu.
+func (l *upstreamLimiter) dropWaiterLocked(w *limiterWaiter) {
+	l.waiters = slices.DeleteFunc(l.waiters, func(o *limiterWaiter) bool { return o == w })
+}
+
+// wakeIdleLocked wakes the waiters when a slot stands free: a waiter taking a
+// slot or leaving with its context ended may be the one whose rank held the
+// rest back. Caller holds l.mu.
+func (l *upstreamLimiter) wakeIdleLocked() {
+	if l.inflight < l.limit && len(l.waiters) > 0 {
+		l.wake()
 	}
 }
 
@@ -458,11 +583,7 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithHTTPClient sends upstream chat requests through client, overriding each
-// backend's configured client. It exists for end-to-end tests that run inside
-// a testing/synctest bubble: goroutines parked on real sockets never let the
-// bubble's clock advance, so the injected client must serve the upstream hop
-// over [httptest.NewTestServer]'s network instead.
+// WithHTTPClient overrides each backend's configured client.
 func WithHTTPClient(client *http.Client) Option {
 	return func(s *server) {
 		s.httpClient = client
@@ -507,15 +628,46 @@ func defaultProviders() map[string]providers.Handler {
 	return map[string]providers.Handler{ProviderOpenAI: openaiProvider{}}
 }
 
-// New returns a new HTTP handler that uses v to validate bearer tokens.
-func New(v TokenValidator, opts ...Option) http.Handler {
+// Handler is the proxy as an [http.Handler]; the operator reads its state
+// through [Counts].
+type Handler struct {
+	*server
+}
+
+// Counts is a snapshot of the state a handler holds, handed to the operator
+// as one plain value. Its fields are totals, never per target: a target's
+// identity includes its account's API key, which a count must not carry.
+type Counts struct {
+	// Conversations is the number of conversations with an admission
+	// standing.
+	Conversations int
+}
+
+// Counts returns a snapshot of the state the handler holds as one plain
+// [Counts] value.
+func (h *Handler) Counts() Counts {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	conversations := 0
+	for _, byKey := range h.conversations {
+		for _, c := range byKey {
+			if c.session != nil {
+				conversations++
+			}
+		}
+	}
+	return Counts{Conversations: conversations}
+}
+
+// New returns a new Handler that uses v to validate bearer tokens.
+func New(v TokenValidator, opts ...Option) *Handler {
 	s := newServer(v, opts...)
 	for name, h := range defaultProviders() {
 		if _, ok := s.providers[name]; !ok {
 			s.providers[name] = h
 		}
 	}
-	return s
+	return &Handler{server: s}
 }
 
 // newServer builds a fully-wired *server, which satisfies http.Handler via
@@ -530,9 +682,11 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		recoveryInterval:         defaultRecoveryInterval,
 		maxConcurrentPerUpstream: defaultMaxConcurrentPerUpstream,
 		fdLimitReader:            readFDSoftLimit,
-		health:                   make(map[string]targetHealth),
-		affinity:                 make(map[string]map[string]lastServed),
-		upstreamLimiters:         make(map[string]*upstreamLimiter),
+		firstContentSchedule:     time.AfterFunc,
+		health:                   healthRecords{entries: make(map[string]targetHealth)},
+		conversations:            make(map[string]map[string]*conversation),
+		admission:                make(map[string]*targetQueue),
+		upstreams:                make(map[string]*upstreamAccount),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -578,12 +732,18 @@ func healthKey(t Target, backends map[string]Backend) string {
 func (s *server) upstreamLimiter(key string) *upstreamLimiter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	lim, ok := s.upstreamLimiters[key]
+	return s.upstreamAccountLocked(key).limiter
+}
+
+// upstreamAccountLocked returns the state for the given canonical upstream
+// key, creating it on first use. Caller holds s.mu.
+func (s *server) upstreamAccountLocked(key string) *upstreamAccount {
+	a, ok := s.upstreams[key]
 	if !ok {
-		lim = newUpstreamLimiter(s.maxConcurrentPerUpstream)
-		s.upstreamLimiters[key] = lim
+		a = &upstreamAccount{limiter: newUpstreamLimiter(s.maxConcurrentPerUpstream)}
+		s.upstreams[key] = a
 	}
-	return lim
+	return a
 }
 
 // ServeHTTP dispatches to the server's built middleware chain.
@@ -607,10 +767,15 @@ type pick struct {
 }
 
 // pickTarget returns the first target that is usable at all and whose failure
-// streak is within the failover threshold (or that has none). A target whose
-// backend resolveBackend rejects is skipped before its health is consulted, and
+// streak is within the failover threshold (or that has none). A backend
+// [resolveBackend] rejects is skipped before its health is consulted, and
 // never demoted: only a configuration change can make it usable, so a health
 // entry for it would be one no recovery probe could clear.
+//
+// A first turn (firstTurn) is also routed around a target whose admission
+// queue has been unable to take an arrival for [defaultFailoverThreshold]:
+// busy is not a failure, so nothing is demoted, benched, or logged, and a
+// later turn keeps waiting at the target.
 //
 // Among the targets that remain, a target past the threshold is skipped
 // until a recovery interval has elapsed since its last probe, at which point it
@@ -633,7 +798,7 @@ type pick struct {
 // reached them in. A walk that has already failed somewhere answers with that
 // failure; one that never attempted anything is the model with nothing to serve it,
 // which only the caller can name.
-func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend) pick {
+func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[string]Backend, firstTurn bool) pick { //nolint:revive // firstTurn names the request's standing, not a mode of this function
 	// Queued under the lock, emitted after it: the logger is the consumer's, and a
 	// handler that blocks on I/O would otherwise hold every other request's walk
 	// behind it. Registered before the unlock below, so LIFO runs it after.
@@ -648,36 +813,104 @@ func (s *server) pickTarget(ctx context.Context, targets []Target, backends map[
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	var skipped []Attempt
-	for _, t := range targets {
-		if _, err := s.resolveBackend(backends, t.backend); err != nil {
-			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
-			continue
+	var picked *pick
+	s.health.update(func(e healthEntries) {
+		for _, t := range targets {
+			if _, err := s.resolveBackend(backends, t.backend); err != nil {
+				skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: err})
+				continue
+			}
+			id := healthKey(t, backends)
+			if firstTurn && s.unavailableForNewSessions(id, e.now) {
+				continue
+			}
+			if s.withinFailoverThreshold(e, id) {
+				picked = &pick{target: t, ok: true, skipped: skipped}
+				return
+			}
+			h, _ := e.get(id)
+			if !s.dueRecoveryProbe(e, id) {
+				notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
+					s.nextReattempt(h).Format(time.RFC3339), h.lastError)
+				skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
+				s.noteBackendDown(logLater, e, id, t, h)
+				continue
+			}
+			h.readmitAt = time.Time{}
+			h.lastProbe = e.now
+			e.put(id, h)
+			picked = &pick{target: t, ok: true, demoted: true, skipped: skipped}
+			return
 		}
-		id := healthKey(t, backends)
-		h, failing := s.health[id]
-		// An entry with no streak is a target being tracked for something other than
-		// failure — a busy run — and is still fit to serve.
-		if !failing || h.failingSince.IsZero() || now.Sub(h.failingSince) <= s.failoverThreshold {
-			return pick{target: t, ok: true, skipped: skipped}
-		}
-		if due := s.nextReattempt(h); now.Before(due) {
-			notDue := fmt.Errorf("routed around: not due until %s, last answered: %w",
-				due.Format(time.RFC3339), h.lastError)
-			skipped = append(skipped, Attempt{Backend: t.backend, ModelUpstream: t.model, Err: notDue})
-			s.noteBackendDown(logLater, id, t, h)
-			continue
-		}
-		h.readmitAt = time.Time{}
-		h.lastProbe = now
-		h.lastTouch = now
-		s.health[id] = h
-		return pick{target: t, ok: true, demoted: true, skipped: skipped}
+	})
+	if picked != nil {
+		return *picked
 	}
 	// Nothing was healthy, but a target health kept back is still worth attempting.
 	last, ok := s.lastCallableTarget(targets, backends)
 	return pick{target: last, ok: ok, skipped: skipped}
+}
+
+// withinFailoverThreshold reports whether the target keyed id has no failure
+// streak, or one the failover threshold has not yet run out on. An entry with
+// no streak is a target tracked for something other than failure — a busy run
+// — and is still fit to serve, as of e's sweep.
+func (s *server) withinFailoverThreshold(e healthEntries, id string) bool {
+	h, tracked := e.get(id)
+	return !tracked || h.failingSince.IsZero() || e.now.Sub(h.failingSince) <= s.failoverThreshold
+}
+
+// dueRecoveryProbe reports whether the target keyed id has a health record
+// whose next reattempt has passed by e's sweep, making the target due a
+// recovery probe. It does not claim the probe; only an actual send takes one.
+func (s *server) dueRecoveryProbe(e healthEntries, id string) bool {
+	h, tracked := e.get(id)
+	return tracked && !e.now.Before(s.nextReattempt(h))
+}
+
+// unavailableForNewSessions reports whether the target keyed id is
+// unavailable for new sessions, as its admission queue judges it; a target
+// with no queue yet is available. Caller holds s.mu.
+func (s *server) unavailableForNewSessions(id string, now time.Time) bool {
+	q, ok := s.admission[id]
+	return ok && q.unavailableForNewSessions(now)
+}
+
+// anotherTargetTakingNewSessions reports whether one of targets, other than
+// the one keyed waitingAtKey, would take a first request arriving now:
+// usable, and either within the failover threshold or past it with its
+// recovery probe due. The check claims no probe; only an actual send takes
+// one. When none would, it also reports the earliest moment one of them
+// becomes due its recovery probe, or the zero time when no target's probe
+// is pending.
+func (s *server) anotherTargetTakingNewSessions(targets []Target, waitingAtKey string, backends map[string]Backend) (bool, time.Time) {
+	var earliestProbeDue time.Time
+	for _, t := range targets {
+		id := healthKey(t, backends)
+		if id == waitingAtKey {
+			continue
+		}
+		var taking bool
+		s.mu.Lock()
+		s.health.update(func(e healthEntries) {
+			_, unusable := s.resolveBackend(backends, t.backend)
+			taking = unusable == nil && !s.unavailableForNewSessions(id, e.now) && (s.withinFailoverThreshold(e, id) || s.dueRecoveryProbe(e, id))
+			if !taking && unusable == nil && !s.unavailableForNewSessions(id, e.now) {
+				// Past the threshold with its probe not yet due: ask again
+				// when the probe falls due.
+				h, _ := e.get(id)
+				if at := s.nextReattempt(h); earliestProbeDue.IsZero() || at.Before(earliestProbeDue) {
+					earliestProbeDue = at
+				}
+			}
+		})
+		s.mu.Unlock()
+		if taking {
+			return true, time.Time{}
+		}
+	}
+	return false, earliestProbeDue
 }
 
 // lastCallableTarget returns the last target understudy could call at all, and
@@ -748,74 +981,115 @@ func conversationKey(prefix []json.RawMessage) string {
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
-// lastServed is a conversation's target and when it last served — the age the
-// idle TTL measures.
-type lastServed struct {
-	target  Target
-	lastUse time.Time
+// conversation is the state Understudy keeps for one tenant conversation. Both
+// parts are forgotten together, after the conversation has gone
+// [sessionForgetAfter] with no request, and the record goes with them.
+type conversation struct {
+	// served is the target that last served the conversation, so its later
+	// requests stay coherent with the answers that target authored. It is a
+	// hint, not a lease: it reorders candidates pickTarget would accept.
+	served *lastServed
+	// session is the conversation's admission standing. Its rank is taken at
+	// the first turn, so ordering engages before any history exists to stay
+	// coherent with. nil once quiet past [sessionForgetAfter].
+	session *sessionRecord
 }
 
-// affinityIdleTTL is how long affinity survives its last use. The provider's
-// prefix cache sets the value — once it is cold, staying buys nothing — and five
-// minutes is the order of Anthropic's default. Expiring also bounds a map keyed
-// on caller-supplied content.
-const affinityIdleTTL = 5 * time.Minute
+// conversationLocked returns tenant's conversation key's record, creating it
+// on first use. Caller holds s.mu.
+func (s *server) conversationLocked(tenant, key string) *conversation {
+	conversations, ok := s.conversations[tenant]
+	if !ok {
+		conversations = make(map[string]*conversation)
+		s.conversations[tenant] = conversations
+	}
+	c, ok := conversations[key]
+	if !ok {
+		c = &conversation{}
+		conversations[key] = c
+	}
+	return c
+}
 
-// recordServe records t as the conversation's target and refreshes lastUse. The
-// sweep before each write is the only thing that reclaims an idle record — no
-// reader names one again.
+// evictConversationParts runs clearExpired on each conversation, then drops
+// every conversation left with neither part, and every tenant left with no
+// conversation — a run that ended. Caller holds s.mu.
+func (s *server) evictConversationParts(clearExpired func(c *conversation)) {
+	for tenant, conversations := range s.conversations {
+		for key, c := range conversations {
+			clearExpired(c)
+			if c.served == nil && c.session == nil {
+				delete(conversations, key)
+			}
+		}
+		if len(conversations) == 0 {
+			delete(s.conversations, tenant)
+		}
+	}
+}
+
+// lastServed is the target that last served a conversation.
+type lastServed struct {
+	target Target
+}
+
+// recordServe records t as the conversation's target and refreshes its place
+// in line: a serve answers a request, so the two stay current together. A
+// request answered after its place in line was forgotten starts a fresh one,
+// so the record left behind is still one a later sweep forgets.
 func (s *server) recordServe(tenant, key string, t Target) {
 	if key == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.evictIdleAffinity()
-	if s.affinity[tenant] == nil {
-		s.affinity[tenant] = make(map[string]lastServed)
+	now := time.Now()
+	c := s.conversationLocked(tenant, key)
+	c.served = &lastServed{target: t}
+	if c.session == nil {
+		c.session = &sessionRecord{firstSeen: now}
 	}
-	s.affinity[tenant][key] = lastServed{target: t, lastUse: now}
+	c.session.lastSeen = now
 }
 
-// evictIdleAffinity drops every record idle past affinityIdleTTL and returns the
-// sweep time, so a caller's write agrees with it. Caller holds s.mu.
-func (s *server) evictIdleAffinity() time.Time {
-	now := time.Now()
-	for tenant, conversations := range s.affinity {
-		for key, b := range conversations {
-			if now.Sub(b.lastUse) >= affinityIdleTTL {
-				delete(conversations, key)
-			}
-		}
-		// A tenant with nothing left is a group with nothing to name it.
-		if len(conversations) == 0 {
-			delete(s.affinity, tenant)
-		}
+// affinity returns the target that last served the conversation, and false
+// when there is none or the conversation has gone [sessionForgetAfter] with
+// no request.
+func (s *server) affinity(tenant, key string) (Target, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.conversations[tenant][key]
+	if !ok || c.served == nil || c.session == nil || c.session.idle(time.Now()) {
+		return Target{}, false
 	}
-	return now
+	return c.served.target, true
 }
 
 // preferLastServed moves key's recorded target to the front of candidates, and
 // nothing more: pickTarget still applies every usability and health check, so a
-// stale record costs only its place in line and can resurrect nothing. A record
-// idle past affinityIdleTTL is ignored.
+// stale record costs only its place in line and can resurrect nothing.
 func (s *server) preferLastServed(candidates []Target, tenant, key string) []Target {
-	s.mu.Lock()
-	bound, ok := s.affinity[tenant][key]
-	s.mu.Unlock()
-	if !ok || time.Since(bound.lastUse) >= affinityIdleTTL {
+	bound, ok := s.affinity(tenant, key)
+	if !ok {
 		return candidates
 	}
 	var preferred []Target
 	rest := make([]Target, 0, len(candidates))
 	for _, t := range candidates {
-		if t.backend == bound.target.backend && t.model == bound.target.model {
+		if t.backend == bound.backend && t.model == bound.model {
 			preferred = append(preferred, t)
 		} else {
 			rest = append(rest, t)
 		}
 	}
 	return append(preferred, rest...)
+}
+
+// servedByAnother reports whether the conversation was last served by a target
+// other than answering, while its record stands.
+func (s *server) servedByAnother(tenant, key string, answering Target) bool {
+	bound, ok := s.affinity(tenant, key)
+	return ok && (bound.backend != answering.backend || bound.model != answering.model)
 }
 
 // msgBackendDown announces a target leaving rotation. Its pair is "backend up".
@@ -854,7 +1128,6 @@ func pacedTo(at time.Time) downCause {
 // the one understudy's own pacing sets, never both. Built here so the walk and the
 // demotion paths cannot drift apart. Names h.backend, the target that actually
 // failed — not t, which may be a sibling alias the walk never called.
-// Caller holds s.mu only if h came from the map.
 func backendDownRecord(t Target, h targetHealth, cause downCause) []any {
 	return []any{
 		slog.String("backend", h.backend),
@@ -931,7 +1204,7 @@ func (h targetHealth) failedSince() slog.Attr {
 // was recorded, and otherwise a full recovery interval past its last attempt. The
 // walk routes around a failing target until this moment and the "backend down"
 // record reports it, so both read the moment from here. Which schedule set it is
-// still read from readmitAt at each site. Caller holds s.mu.
+// still read from readmitAt at each site.
 func (s *server) nextReattempt(h targetHealth) time.Time {
 	if h.readmitAt.IsZero() {
 		return h.lastProbe.Add(s.recoveryInterval)
@@ -941,51 +1214,33 @@ func (s *server) nextReattempt(h targetHealth) time.Time {
 
 // noteBackendDown logs t's "backend down" transition once per failure streak, saying
 // why the walk routed around it. It logs through logLater rather than directly,
-// because the caller holds s.mu.
-func (s *server) noteBackendDown(logLater deferredLog, id string, t Target, h targetHealth) {
+// because the caller holds the health lock.
+func (s *server) noteBackendDown(logLater deferredLog, e healthEntries, id string, t Target, h targetHealth) {
 	if h.downLogged {
 		return
 	}
 	h.downLogged = true
-	h.lastTouch = time.Now()
-	s.health[id] = h
+	e.put(id, h)
 	// Always paced: every path that benches a target reports its own demotion and
 	// marks it, so a streak still owing a record is one this walk accrued.
 	logLater(msgBackendDown, backendDownRecord(t, h, pacedTo(s.nextReattempt(h)))...)
 }
 
-// evictStaleHealth drops every entry untouched for healthTTL and returns the
-// sweep time, so a caller's own write agrees with the eviction. Caller holds s.mu.
-func (s *server) evictStaleHealth() time.Time {
-	now := time.Now()
-	for id, h := range s.health {
-		if now.Sub(h.lastTouch) >= healthTTL {
-			delete(s.health, id)
-		}
-	}
-	return now
-}
-
-// writeHealth stores t's health under s.mu. It sweeps first — the only thing that
-// reclaims an entry named directly and so never walked past — then stamps the
-// entry with the sweep's own clock, so a write cannot be aged out by the sweep
-// that preceded it. beginStreak builds the entry for a key the map does not hold —
-// a target with no entry is not failing, so a new one opens a streak; updateStreak,
-// when non-nil, revises a streak already under way.
+// writeHealth stores t's health. beginStreak builds the entry for a target
+// with no entry — no entry means not failing, so a new one opens a streak;
+// updateStreak, when non-nil, revises a streak already under way.
 func (s *server) writeHealth(t Target, backends map[string]Backend, beginStreak func(now time.Time) targetHealth, updateStreak func(now time.Time, h targetHealth) targetHealth) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
-	h, ok := s.health[id]
-	switch {
-	case !ok:
-		h = beginStreak(now)
-	case updateStreak != nil:
-		h = updateStreak(now, h)
-	}
-	h.lastTouch = now
-	s.health[id] = h
+	s.health.update(func(e healthEntries) {
+		h, ok := e.get(id)
+		switch {
+		case !ok:
+			h = beginStreak(e.now)
+		case updateStreak != nil:
+			h = updateStreak(e.now, h)
+		}
+		e.put(id, h)
+	})
 }
 
 // recordFailure marks t as failing, preserving the start of an existing streak
@@ -1055,9 +1310,7 @@ func (s *server) withSynthesizedBackoff(ctx context.Context, t Target, backends 
 // failingFor reports how long t's current failure streak has run, or zero when
 // t is healthy.
 func (s *server) failingFor(t Target, backends map[string]Backend) time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h, ok := s.health[healthKey(t, backends)]
+	h, ok := s.health.get(healthKey(t, backends))
 	if !ok {
 		return 0
 	}
@@ -1086,6 +1339,21 @@ func (f failedAttempt) status() int {
 // record puts f on the request's Excluded: a target the request did not serve from.
 func (f failedAttempt) record(ctx context.Context) {
 	addLogCalled(ctx, f.backend, f.upstreamModel, f.status(), f.raw)
+}
+
+// throttledDisplaces reports whether the verdict answers with incumbent, a
+// throttle the walk replayed past, rather than with last, the failure that
+// ended the walk: for a refusal or an unimplemented operation, which offers
+// nothing a client could wait out; otherwise, when the wait incumbent offers
+// is sooner than the wait last offers — each a delay its upstream sent, or
+// one understudy synthesized for it.
+func throttledDisplaces(last, incumbent error) bool {
+	if isAccessRefused(last) || yerrors.HTTPStatus(last) == http.StatusNotImplemented {
+		return true
+	}
+	incumbentSig := classifyLimit(incumbent)
+	lastSig := classifyLimit(last)
+	return incumbentSig.hasRetryAfter && lastSig.hasRetryAfter && incumbentSig.retryAfter < lastSig.retryAfter
 }
 
 // terminalFailure marks err terminal — the response path rejects it as
@@ -1137,7 +1405,7 @@ func (e terminalError) Unwrap() error { return e.error }
 // the upstream asked for outlives the streak that led to it.
 func (s *server) clearFailure(ctx context.Context, t Target, backends map[string]Backend) {
 	// Logged after recordSuccess returns, so the consumer's handler does not block
-	// every other request's walk behind s.mu.
+	// every other request's walk behind the health lock.
 	if backend, shouldLogSuccess := s.recordSuccess(t, backends); shouldLogSuccess {
 		s.logTransition(ctx, "backend up",
 			slog.String("backend", backend),
@@ -1147,7 +1415,7 @@ func (s *server) clearFailure(ctx context.Context, t Target, backends map[string
 }
 
 // logTransition emits a target's health transition. The transition is decided and
-// committed under s.mu before this runs, so the record cannot depend on the request
+// committed under the health lock before this runs, so the record cannot depend on the request
 // that noticed it still being around: a client that leaves in that window would
 // otherwise take a committed state change out of the log with it. A consumer's
 // values travel; only cancellation is dropped.
@@ -1161,29 +1429,30 @@ func (s *server) logTransition(ctx context.Context, msg string, args ...any) {
 // elapsed the entry survives ("", not owed), so the walk still routes around
 // it until the bench clears.
 func (s *server) recordSuccess(t Target, backends map[string]Backend) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.evictStaleHealth()
 	id := healthKey(t, backends)
-	h, ok := s.health[id]
-	if !ok {
-		return "", false
-	}
-	if now.Before(h.readmitAt) {
-		s.health[id] = targetHealth{
-			failingSince: now.Add(-s.failoverThreshold),
-			streakBegan:  h.streakBegan,
-			lastProbe:    now,
-			readmitAt:    h.readmitAt,
-			downLogged:   h.downLogged,
-			lastError:    h.lastError,
-			lastTouch:    now,
-			backend:      h.backend,
+	var backend string
+	var owed bool
+	s.health.update(func(e healthEntries) {
+		h, ok := e.get(id)
+		if !ok {
+			return
 		}
-		return "", false
-	}
-	delete(s.health, id)
-	return h.backend, h.downLogged
+		if e.now.Before(h.readmitAt) {
+			e.put(id, targetHealth{
+				failingSince: e.now.Add(-s.failoverThreshold),
+				streakBegan:  h.streakBegan,
+				lastProbe:    e.now,
+				readmitAt:    h.readmitAt,
+				downLogged:   h.downLogged,
+				lastError:    h.lastError,
+				backend:      h.backend,
+			})
+			return
+		}
+		e.drop(id)
+		backend, owed = h.backend, h.downLogged
+	})
+	return backend, owed
 }
 
 // clientFacing maps an error returned by a provider call into the status the
@@ -1397,8 +1666,9 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 
 // LogRecord carries the per-request telemetry only understudy can supply: which
 // backend and model served, the upstream status, the real error behind an
-// obfuscated body, and the serving attempt's times to its response header and
-// first content. Generic HTTP facts (response status, byte counts) are
+// obfuscated body, the serving attempt's times to its response header and
+// first content, and how long the request waited in the admission queue.
+// Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
 type LogRecord struct {
@@ -1419,6 +1689,10 @@ type LogRecord struct {
 	// request upstream to that attempt's first content, or zero when no
 	// content was relayed.
 	TimeToFirstContent time.Duration
+	// TimeQueued is the total of every wait in understudy's queue
+	// before each send of the request to the target that served it,
+	// or zero for a request that was sent without waiting.
+	TimeQueued time.Duration
 	// Excluded holds what the request considered and did not serve from: targets a
 	// failover abandoned, targets excluded as unusable before any call, and the
 	// backends a listing could not use or could not reach. A chat request records
@@ -1531,6 +1805,18 @@ func setLogTimeToResponseHeader(ctx context.Context, d time.Duration) {
 	}
 }
 
+func setLogTimeQueued(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeQueued = d
+	}
+}
+
+func addLogTimeQueued(ctx context.Context, d time.Duration) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.TimeQueued += d
+	}
+}
+
 // withStatusRecorder wraps w in a statusRecorder so errToResponse can detect a
 // response a handler already committed and refrain from rendering its error
 // envelope over it.
@@ -1617,6 +1903,43 @@ func cause(ctx context.Context, err error) error {
 		}
 	}
 	return err
+}
+
+// withheldResponse withholds an upstream answer ahead of its first content:
+// the status, headers, and body bytes it hands over — including the comment
+// lines and leading whitespace ahead of that content — are held, not dropped,
+// so commit can send every byte in order.
+type withheldResponse struct {
+	w      http.ResponseWriter
+	header http.Header
+	status int
+	held   bytes.Buffer
+	sent   bool
+}
+
+// Write holds the body's bytes until commit releases them.
+func (h *withheldResponse) Write(p []byte) (int, error) {
+	if h.sent {
+		return h.w.Write(p)
+	}
+	_, _ = h.held.Write(p)
+	return len(p), nil
+}
+
+// commit sends the withheld answer — status, headers, then the held bytes, in
+// order. Only the first call sends anything: the relay calls it at the first
+// content and again where the copy ends, since a body that never reached
+// content still ended and its client is still owed the answer.
+func (h *withheldResponse) commit() {
+	if h.sent {
+		return
+	}
+	h.sent = true
+	maps.Copy(h.w.Header(), h.header)
+	h.w.WriteHeader(h.status)
+	// Discarding the write's error is deliberate: a client gone by this write
+	// surfaces on the next one or at the copy's end.
+	_, _ = h.w.Write(h.held.Bytes())
 }
 
 // Error envelope `type` values. The first three are OpenAI-spec, written by
@@ -2029,18 +2352,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 
 	// A panic mid-request (in the response interceptor or the streamed body) would
 	// otherwise unwind past the release and leak the slot, starving the upstream.
-	// One pointer suffices because the retry loop holds at most one slot at a time;
-	// re-panicking leaves rendering to recoverPanic.
-	var heldSlot *upstreamLimiter
-	releaseHeld := func() {
-		if heldSlot != nil {
-			heldSlot.release()
-			heldSlot = nil
-		}
-	}
+	// One pointer suffices because the walk holds at most one attempt, and so one
+	// slot and one place in line, at a time; re-panicking leaves rendering to
+	// recoverPanic.
+	var current *attempt
 	defer func() {
 		if v := recover(); v != nil {
-			releaseHeld()
+			if current != nil {
+				current.releaseSlot()
+				current.pend.queue.finish(current.pend)
+			}
 			panic(v)
 		}
 	}()
@@ -2112,11 +2433,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				// the targets not yet tried this request.
 				candidates := untriedTargets(lm.Targets, tried, backend.Backends)
 				// A first turn has nothing to stay coherent with, so it takes the
-				// walk as ordered, probes and all.
+				// walk as ordered, probes and all — and moves past a target
+				// unavailable for new sessions.
 				if carriesHistory {
 					candidates = s.preferLastServed(candidates, convTenant, convKey)
 				}
-				p := s.pickTarget(r.Context(), candidates, backend.Backends)
+				p := s.pickTarget(r.Context(), candidates, backend.Backends, !carriesHistory)
 				if p.ok && lastFailure != nil {
 					// Somewhere else to go, so the request did move past the last
 					// candidate — recorded before this pick's skips, which is the
@@ -2222,25 +2544,144 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		// Hold an upstream slot for the whole request — through the response-body
 		// stream, not just the handler call — so an (N+1)th request blocks here
 		// before reaching the upstream once N are in flight.
-		lim := s.upstreamLimiter(canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey))
-		waited, err := lim.acquire(ctx)
+		upstream := canonicalUpstreamKey(sel.cfg.BaseURL, sel.cfg.APIKey)
+		lim := s.upstreamLimiter(upstream)
+
+		// Session-ordered admission sits ahead of the slot: a request held by
+		// the queue takes no slot, and only an admitted one competes for one.
+		// Uncontended, nothing queues and a request passes straight through.
+		queue := s.admissionQueue(healthKey(chosen, backend.Backends), upstream)
+		// Only a first turn may leave for another target; a later turn is
+		// bound to this one and waits.
+		var moveOn func() (bool, time.Time)
+		if !carriesHistory {
+			// The target being left is not in tried yet, so waitingAtKey
+			// excludes it from the check.
+			waitingAtKey := healthKey(chosen, backend.Backends)
+			moveOn = func() (bool, time.Time) {
+				return s.anotherTargetTakingNewSessions(untriedTargets(logicalTargets, tried, backend.Backends), waitingAtKey, backend.Backends)
+			}
+		}
+		rank := s.sessionAge(convTenant, convKey)
+		entered := time.Now()
+		pend, err := queue.enter(ctx, cancel, rank, moveOn)
 		if err != nil {
 			cancel(nil)
-			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
+			if errors.Is(err, errUnavailableForNewSessions) {
+				// Busy is not a failure: record nothing against the target, and
+				// leave it out of tried so a failure at the next target can
+				// return the request to this one's line.
+				continue
+			}
+			return fmt.Errorf("held in the admission queue: %w", err)
 		}
-		heldSlot = lim
+		setLogTimeQueued(r.Context(), time.Since(entered))
+
+		// The resend replays the same bytes to the same target when the queue
+		// displaces an attempt: the pick is settled, so the reader is rebuilt
+		// without re-walking the candidates.
+		resend := func() (io.Reader, error) {
+			b, rerr := rewriteModel(io.NopCloser(bytes.NewReader(bodyBytes)), func(string) (string, error) {
+				return upstreamModel, nil
+			})
+			if rerr != nil {
+				return nil, rerr
+			}
+			for key, values := range chosen.query {
+				if len(values) == 0 {
+					continue
+				}
+				if b, rerr = setOverride(b, key, overrideJSON(values[0])); rerr != nil {
+					return nil, rerr
+				}
+			}
+			return b, nil
+		}
 
 		// The session header reaches Zen, so the bearer token never appears
 		// in it directly: it HMACs the conversation key instead.
 		mac := hmac.New(sha256.New, []byte(convTenant))
 		_, _ = mac.Write([]byte(convKey))
-		if s.httpClient != nil {
-			sel.cfg.HTTPClient = s.httpClient
+		a := &attempt{
+			s:       s,
+			r:       r,
+			sel:     sel,
+			lim:     lim,
+			pend:    pend,
+			session: hex.EncodeToString(mac.Sum(nil)),
+			body:    body,
+			resend:  resend,
+			ctx:     ctx,
+			cancel:  cancel,
 		}
-		// Per attempt: only the attempt that reaches the relay below reads
-		// sent, so a failed failover attempt never sets the record's timing.
-		sent := time.Now()
-		resp, err := sel.handler.Chat(ctx, sel.cfg, hex.EncodeToString(mac.Sum(nil)), body)
+		current = a
+
+		// The send, retried wherever the queue displaces an attempt, the
+		// first-content timeout ends one, or the target answers a bare rate
+		// limit while another request there is producing content and this
+		// request may keep waiting at the target. None of those endings is
+		// a failure — the target is healthy and the client still waiting —
+		// so none records and shrinks anything; the request waits for the
+		// queue to admit it again and sends the same bytes to the same
+		// target.
+		var acquired bool
+		for {
+			var sendErr error
+			acquired, sendErr = a.send()
+			if sendErr == nil && pend.queue.headerArrived(pend) {
+				// Demand-gated: a success that never waited for a slot is no evidence
+				// about the account's capacity, so it does not raise the cap.
+				if a.waited {
+					lim.grow()
+				}
+				if chosen.backend != "" {
+					s.clearFailure(r.Context(), chosen, backend.Backends)
+					s.recordServe(convTenant, convKey, chosen)
+				}
+				// Chat returns once the response header arrives, so this measures
+				// from the same sent instant as first content.
+				setLogTimeToResponseHeader(r.Context(), time.Since(a.sent))
+				setLogUpstreamStatus(r.Context(), a.resp.StatusCode)
+
+				served := RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}
+				again, relayErr := a.relay(w, served)
+				if !again {
+					a.releaseSlot()
+					a.cancel(nil)
+					return relayErr
+				}
+			} else if sendErr != nil {
+				// A bare rate limit keeps a place in this target's line for
+				// a later request, and for a session's first request only
+				// while the target still takes new sessions; past that
+				// crossing the first request takes the walk's ladder
+				// instead. The crossing is read before the send ends, since
+				// the request's own silence at the target is part of what
+				// held arrivals there.
+				waitsAtTarget := carriesHistory || !pend.queue.unavailableForNewSessions(time.Now())
+				preempted := pend.queue.sendEnded(pend)
+				swapWaits := !preempted && errors.Is(sendErr, providers.ErrServerBusy) && s.queueBehindServerBusy(upstream, pend)
+				if !swapWaits && !preempted &&
+					(!waitsAtTarget || classifyLimit(sendErr).condition != bareRateLimit || !pend.queue.requeueBehindContent(pend)) {
+					// This answer goes to the client, ending the
+					// request's wait at the target — and with it any
+					// wait behind a busy refusal.
+					s.serverBusyWaitEnded(upstream, pend)
+					err = sendErr
+					break
+				}
+			}
+			if resendErr := a.waitToResend(); resendErr != nil {
+				// The wait's error is the client's departure, so this
+				// error path ends any wait behind a busy refusal too.
+				s.serverBusyWaitEnded(upstream, pend)
+				return resendErr
+			}
+		}
+		if err != nil && !acquired {
+			a.cancel(nil)
+			return fmt.Errorf("waiting for an upstream slot (in-flight %d): %w", lim.inFlight(), err)
+		}
 		// A busy refusal is kronk's own transient-backpressure signal, carrying
 		// neither a 429 nor a Retry-After of its own. Normalized here, once, to
 		// the shape classifyLimit already reads a real sustained rate limit in
@@ -2257,18 +2698,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				at:    time.Now().Add(jitteredInterval(base, s.jitterFactor)),
 			}
 		}
+		// TODO(TODO.d/session-ordered-admission.md): a 429 with Retry-After
+		// takes this ladder still; within the wait budget it should bench the
+		// target and admit the highest-ranked request whose target is not
+		// benched. Blocked on the wait budget.
 		sig := classifyLimit(err)
 		// The limiter is keyed per upstream account, independent of any logical-model
 		// target, so shrink on a rate-limit 429 even for a request that has no chosen
 		// target to demote.
-		switch {
-		case err == nil:
-			// Demand-gated: a success that never waited for a slot is no evidence
-			// about the account's capacity, so it does not raise the cap.
-			if waited {
-				lim.grow()
-			}
-		case sig.condition == bareRateLimit:
+		if sig.condition == bareRateLimit {
 			lim.throttle()
 		}
 		// A bare 429 measures capacity, not health: the cap above has already
@@ -2277,9 +2715,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		demote := sig.condition == sustainedRate
 		if chosen.backend != "" {
 			switch {
-			case err == nil:
-				s.clearFailure(r.Context(), chosen, backend.Backends)
-				s.recordServe(convTenant, convKey, chosen)
 			case demote && sig.hasRetryAfter:
 				s.recordRateLimited(r.Context(), chosen, sig.retryAfter, backend.Backends, err)
 			case demote || isAccessRefused(err):
@@ -2293,9 +2728,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			// Wrapping here, not at the return, is what puts every candidate on one
 			// scale for the verdict below: a delay either sent or synthesized.
-			err = s.withSynthesizedBackoff(ctx, chosen, backend.Backends, err)
+			err = s.withSynthesizedBackoff(a.ctx, chosen, backend.Backends, err)
 			failed := failedAttempt{
-				answer:        clientFacing(ctx, err),
+				answer:        clientFacing(a.ctx, err),
 				raw:           err,
 				target:        chosen,
 				backend:       parsedBackendName,
@@ -2303,10 +2738,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 			}
 			// A sustainedRate 429 or refused access has just demoted chosen above; a
 			// bare or transient 429 and a rejected history leave it healthy, costing it
-			// only its turn here. A fatal failure on chosenDemoted is the same story —
-			// already routed around for future requests, so this one needn't wait
-			// either. In every case an untried target beats surfacing the failure.
-			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(ctx)))) {
+			// only its turn here. A rejected history is also recognized without
+			// wording, though only a request carrying history has any to reject.
+			// A fatal failure on chosenDemoted is the same story — already routed
+			// around for future requests, so this one needn't wait either. In
+			// every case an untried target beats surfacing the failure.
+			if logicalTargets != nil && (sig.condition == sustainedRate || sig.condition == transientRate || sig.condition == bareRateLimit || isAccessRefused(err) || isHistoryRejected(err) || (carriesHistory && yerrors.HTTPStatus(err) == http.StatusBadRequest && s.servedByAnother(convTenant, convKey, chosen)) || (chosenDemoted && isFatalUpstream(err) && !errors.Is(err, context.Cause(a.ctx)))) {
 				// The verdict is the soonest return on offer, so a later candidate
 				// displaces the incumbent when it comes back first. The incumbent's
 				// delay is re-derived rather than remembered, so both are what remains
@@ -2317,61 +2754,157 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				}
 				tried = append(tried, healthKey(chosen, backend.Backends))
 				lastFailure = &failed
-				releaseHeld()
-				cancel(nil)
+				a.releaseSlot()
+				a.cancel(nil)
 				continue
 			}
-			releaseHeld()
-			cancel(nil)
+			a.releaseSlot()
+			a.cancel(nil)
 			lastFailure, remaining = &failed, untriedTargets(logicalTargets, append(slices.Clone(tried), healthKey(chosen, backend.Backends)), backend.Backends)
 			break
 		}
-		// Chat returns once the response header arrives, so this measures
-		// from the same sent instant as first content.
-		setLogTimeToResponseHeader(r.Context(), time.Since(sent))
-		setLogUpstreamStatus(r.Context(), resp.StatusCode)
-
-		for _, h := range sensitiveResponseHeaders {
-			resp.Header.Del(h)
-		}
-
-		if s.interceptor != nil {
-			if err := s.interceptor(r.Context(), RequestMetadata{Backend: parsedBackendName, Model: upstreamModel, Token: tokenFromContext(r.Context())}, resp); err != nil {
-				_ = resp.Body.Close()
-				releaseHeld()
-				cancel(nil)
-				return err
-			}
-			resp.Header.Del("Content-Length")
-		}
-
-		maps.Copy(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		relay := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: ctx, cancel: cancel}
-		_, err = io.Copy(w, &confirmingReader{
-			r: relay,
-			content: func() {
-				setLogTimeToFirstContent(r.Context(), time.Since(sent))
-			},
-		})
-		_ = resp.Body.Close()
-		releaseHeld()
-		cancel(nil)
-		return err
 	}
 
 	// The walk is over, by either road: it ran out of candidates, or its last failure
 	// was one no other candidate could answer for. What it answers with is that
-	// failure, unless an earlier candidate offered a return it can still make.
+	// failure, unless an earlier candidate offered the sooner return.
 	f := *lastFailure
 	setLogUpstreamStatus(r.Context(), f.status())
 	answer, answering := f.answer, f.target
-	if throttled != nil &&
-		(isAccessRefused(f.raw) || yerrors.HTTPStatus(f.raw) == http.StatusNotImplemented) {
+	if throttled != nil && throttledDisplaces(f.raw, throttled.raw) {
 		// An earlier candidate answers, so this one is a target the request did not
 		// serve from — and the only record of why.
 		f.record(r.Context())
 		answer, answering = throttled.answer, throttled.target
 	}
 	return s.terminalFailure(answering, remaining, backend.Backends, s.withSynthesizedBackoff(r.Context(), answering, backend.Backends, answer))
+}
+
+// attempt is a request's standing at one target on the walk: what it sends
+// there, the upstream slot and place in line it holds, and the context of the
+// send in flight. A re-send after a displacement or a first-content timeout
+// reuses it, with a fresh context and body.
+type attempt struct {
+	s    *server
+	r    *http.Request
+	sel  selection
+	lim  *upstreamLimiter
+	pend *pending
+	// session is the session header sent upstream.
+	session string
+	body    io.Reader
+	// resend rebuilds body for a re-send.
+	resend func() (io.Reader, error)
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	// slot is the upstream slot held, if any.
+	slot *upstreamLimiter
+
+	// Per send: when it was sent, whether it waited for its slot, and the
+	// response whose header arrived.
+	sent   time.Time
+	waited bool
+	resp   *http.Response
+}
+
+// send waits for an upstream slot, arms the first-content timeout, and sends
+// the request. acquired reports whether a slot was had: an error without one
+// is the wait for a slot failing.
+func (a *attempt) send() (acquired bool, err error) {
+	a.waited, err = a.lim.acquire(a.ctx, a.pend.rank)
+	if err != nil {
+		return false, err
+	}
+	a.slot = a.lim
+	if a.s.httpClient != nil {
+		a.sel.cfg.HTTPClient = a.s.httpClient
+	}
+	a.sent = time.Now()
+	a.pend.queue.armFirstContentTimeout(a.pend)
+	a.resp, err = a.sel.handler.Chat(a.ctx, a.sel.cfg, a.session, a.body)
+	return true, err
+}
+
+// relay answers the client from a send whose header has arrived: it strips
+// sensitive headers, runs the response interceptor, and copies the body,
+// withholding the upstream's status, headers, and pre-content bytes until its
+// first content. It reports whether the send ended before any content without
+// failing — displaced, or cut by the first-content timeout — in which case
+// nothing reached the client and the request is to be sent again; otherwise
+// the attempt is finished at its target and err is how the relay ended.
+func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend bool, err error) {
+	resp := a.resp
+	for _, h := range sensitiveResponseHeaders {
+		resp.Header.Del(h)
+	}
+
+	if a.s.interceptor != nil {
+		if err := a.s.interceptor(a.r.Context(), served, resp); err != nil {
+			_ = resp.Body.Close()
+			a.pend.queue.finish(a.pend)
+			return false, err
+		}
+		resp.Header.Del("Content-Length")
+	}
+
+	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
+	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
+	_, err = io.Copy(held, &confirmingReader{
+		r: idle,
+		content: func() {
+			// Confirming before committing: a send the queue has already
+			// ended commits nothing to the client, and the request is sent
+			// again.
+			toFirstContent := time.Since(a.sent)
+			if a.pend.queue.confirm(a.pend, toFirstContent) {
+				held.commit()
+				setLogTimeToFirstContent(a.r.Context(), toFirstContent)
+			}
+		},
+	})
+	// A send the queue preempted before any content sends the client
+	// nothing and is sent again, however the copy ended.
+	if a.pend.queue.sendEnded(a.pend) {
+		return true, nil
+	}
+	held.commit()
+	_ = resp.Body.Close()
+	a.pend.queue.finish(a.pend)
+	return false, err
+}
+
+// waitToResend readies a re-send after a displacement or a first-content
+// timeout: it closes the response, releases the slot, and cancels the send's
+// context, waits for the queue to admit the request again — adding that wait
+// to the request's logged queue time — and takes a fresh context and body for
+// the next send.
+func (a *attempt) waitToResend() error {
+	if a.resp != nil {
+		_ = a.resp.Body.Close()
+		a.resp = nil
+	}
+	a.releaseSlot()
+	a.cancel(nil)
+	reentered := time.Now()
+	if err := a.pend.queue.await(a.r.Context(), a.pend); err != nil {
+		return fmt.Errorf("held in the admission queue: %w", err)
+	}
+	addLogTimeQueued(a.r.Context(), time.Since(reentered))
+	a.ctx, a.cancel = context.WithCancelCause(a.r.Context())
+	a.pend.queue.rearm(a.pend, a.cancel)
+	body, err := a.resend()
+	if err != nil {
+		a.cancel(nil)
+		return badRequest(fmt.Errorf("malformed request body: %w", err))
+	}
+	a.body = body
+	return nil
+}
+
+// releaseSlot releases the upstream slot the attempt holds, if any.
+func (a *attempt) releaseSlot() {
+	if a.slot != nil {
+		a.slot.release()
+		a.slot = nil
+	}
 }

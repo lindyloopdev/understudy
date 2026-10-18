@@ -7,14 +7,20 @@ three dispositions" (the content boundary, pre-content stalls, and "a keep-alive
 is not progress"); [DESIGN.md §Recovery probing](../DESIGN.md#recovery-probing)
 (the probe a pre-content demotion relies on);
 [DESIGN.md §Session-Ordered Admission](../DESIGN.md#session-ordered-admission)
-— silence before the response header waits on every backend, so the stall gate
-runs from the header to the first content, never before the header.
+— *A first-content timeout*, which runs a gate before the
+header too (retrying the same target, preserving rank); this file's gate is
+the separate question of demoting a target and replaying to a *different*
+candidate, and the two need to agree on precedence — see the open note in
+[[session-ordered-admission]]'s own first-content-timeout item.
 
 An upstream that sends `200` and then holds the stream open with SSE comment
-lines is treated as mid-stream: no demotion, no replay — nothing gates the
-attempt between the header and the first content. The stream idle watchdog
-(`idleReader`, `streamIdleTimeout`) resets on any byte, so the same keep-alives
-defeat it too, and the request runs until the client gives up.
+lines is pre-content: understudy withholds its status, headers, and comment
+lines until the first content, so nothing is committed to the client and the
+attempt could still be replayed. Nothing acts on that yet: no gate times the
+wait between the header and the first content, and the stream idle watchdog
+(`idleReader`, `streamIdleTimeout`) resets on any byte, so the same
+keep-alives defeat it too, and the request still runs until the client gives
+up.
 
 Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
 
@@ -25,18 +31,21 @@ Evidence, 2026-09-14, `deepseek/deepseek-v4-flash` under load:
   containers all ended at lindy's 10-minute idle watchdog, and others ran 15–19
   minutes, with no demotion and no failover.
 
-The damaging shape is the one after the header. Run no gate before the header:
-that wait belongs to [[session-ordered-admission]], and this fix must not
-reintroduce one.
+The damaging shape here is the one after the header — this file's demote-and-
+replay disposition never applied before one arrived, and still does not.
+Silence before the header is gated: [[session-ordered-admission]]'s
+own first-content timeout covers it, by retrying the same target rather than
+replaying to a different one. The two gates answer different questions
+(replay elsewhere vs. retry in place) for what can be the same triggering
+silence, and which takes precedence is unsettled.
 
 ## Work
 
-- Gate from the response header to the first content: read ahead past SSE
-  comment lines (streamed) or leading JSON whitespace (non-streamed —
-  `isJSONSpace`) before committing status and headers to the client. A gate
-  timeout before content demotes the target and replays the request to the next
-  candidate. Build the gate on `confirmingReader` (`firstcontent.go`), shared
-  with [[session-ordered-admission]]'s confirmation.
+- Gate from the response header to the first content: a gate timeout before
+  content demotes the target and replays the request to the next candidate.
+  The read-ahead it needs is built — the relay withholds status, headers, and
+  pre-content bytes until `confirmingReader` (`firstcontent.go`) finds
+  content — so a timed-out attempt has committed nothing to the client.
 - **(open) Keep-alives from a busy local server are not a stall.** Kronk sends
   its 15s keep-alive while a request with a header waits in its own queue —
   where session-ordered admission deliberately parks the probe at the default

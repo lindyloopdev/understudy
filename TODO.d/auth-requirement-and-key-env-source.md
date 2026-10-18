@@ -12,9 +12,7 @@ Build the `auth` declaration: what kind of fact an absent credential is.
 - Add `auth` (`required` default / `none` / `auto`, plus `optional` reserved).
 - Express the combination rules as tags, not a method: `excluded_if`/`required_if`
   against the `auth` value cover "a key source under `none`" and "no source under
-  `required`/`auto`". The exactly-one-of rule is likewise `excluded_with` naming
-  the sibling sources — `excluded_with` takes a list and fires if any named field
-  is set, so it stays one tag per field rather than growing pairwise.
+  `required`/`auto`".
 - Reject `auth = "optional"` with a reserved-value error, following the
   `thinking=true` precedent in `target.go`, and carry the matching inline
   `TODO(TODO.d/…)` marker.

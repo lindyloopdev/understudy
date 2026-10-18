@@ -42,20 +42,18 @@ type LogicalModelSpec struct {
 // (the operator-chosen name) is the routing namespace; provider_type selects
 // which provider handler serves the backend.
 //
-// A backend names its upstream credential through one of api_key, api_key_file,
-// or api_key_env, any one of which satisfies the validate tags. Naming more than
-// one is not yet rejected: only api_key and api_key_file exclude each other, and
-// Resolve applies whichever sources are set in order, api_key_env last.
+// A backend names its upstream credential through exactly one of api_key,
+// api_key_file, or api_key_env; setting more than one is a config error.
 // TODO(TODO.d/auth-requirement-and-key-env-source.md): the auth field replaces
-// these tags and makes the sources mutually exclusive.
+// these tags.
 type BackendSpec struct {
 	ProviderType string `toml:"provider_type" validate:"required,oneof=openai"`
 	BaseURL      string `toml:"base_url" validate:"required,url"`
-	APIKey       string `toml:"api_key" validate:"required_without_all=APIKeyFile APIKeyEnv,excluded_with=APIKeyFile"`
+	APIKey       string `toml:"api_key" validate:"required_without_all=APIKeyFile APIKeyEnv,excluded_with=APIKeyFile APIKeyEnv"`
 
 	// APIKeyFile is the absolute path to a file whose trimmed contents Resolve
 	// uses as the backend's key when set; Resolve rejects a relative path.
-	APIKeyFile string `toml:"api_key_file"`
+	APIKeyFile string `toml:"api_key_file" validate:"excluded_with=APIKeyEnv"`
 
 	// APIKeyEnv names an environment variable whose value Resolve uses as the
 	// backend's key. It names the variable rather than interpolating its value so

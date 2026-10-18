@@ -90,7 +90,9 @@ hard-fails when there is nowhere to go. Both are hard-coded for now; when cost
 exists they become **cost-derived** — an equal-cost alternate → ~0 (fail over at
 once, the old "failover first"), a pricier alternate → larger (retry the cheaper
 target longer). Immediate-vs-retry-first was never a fixed choice: it is the two
-ends of this one cost-derived threshold.
+ends of this one cost-derived threshold. The failover threshold also decides
+when a busy target stops taking new sessions (§Session-Ordered Admission, *Who
+waits, and who fails over*).
 
 ## Granularity: per-`(backend, model)`
 

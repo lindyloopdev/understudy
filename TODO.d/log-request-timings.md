@@ -3,14 +3,13 @@
 **Tag:** understudy / observability
 
 **Design:** [DESIGN.md §Session-Ordered
-Admission](../DESIGN.md#session-ordered-admission) — *A bound on silence, keyed
-on content*: its first value comes "from the target's own turnover" where the
-consumer supplies no time limit, which needs each target's observed time to
-first content.
+Admission](../DESIGN.md#session-ordered-admission) — *A first-content timeout*:
+its first value comes from the target's own turnover, which needs each target's
+observed time to first content.
 
-The silence bound still has no data until lindy records the field next to what
-only it knows, and no one can say what the longest healthy wait on a slow
-target (Kronk on a large context, a cold model load) actually is.
+lindy's request log records both timings, and its
+notes/2026-09-30-time-to-first-content-measurements.md sized the timeout's
+first value from them. What remains is the timings this does not yet record.
 
 ## Where it belongs
 
@@ -27,14 +26,12 @@ target (Kronk on a large context, a cold model load) actually is.
 
 "First content" means: a stream's first `data:` event; any other body's first
 non-whitespace byte. Framing lines — SSE comments (keep-alives), `event:`,
-`id:`, `retry:` — are not content, whatever the Content-Type says. When
-session-ordered admission lands on `main`, use `confirmingReader`
-(`firstcontent.go`) as its detector rather than building a second one.
+`id:`, `retry:` — are not content, whatever the Content-Type says.
+`confirmingReader` (`firstcontent.go`) is the one detector: the relay's single
+callback both logs the time to first content and confirms the request for
+session-ordered admission.
 
 ## Work
 
-- **Log the time a request was held in the admission queue before it was
-  sent.** Only once session-ordered admission (branch `stallfix1132`) is on
-  `main`. Shows what admission costs each request.
 - (later) Timings for abandoned attempts — failovers and displacements — in
   `Attempt`.

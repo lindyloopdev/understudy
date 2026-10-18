@@ -4,7 +4,7 @@
 
 **Design:** [DESIGN.md §Session-Ordered
 Admission](../DESIGN.md#session-ordered-admission) — a queue forms when a request
-waits past the grace period with no header, and releases one unconfirmed request
+waits past the grace period with no header, and admits one unconfirmed request
 at a time.
 
 A remote that is slow to send headers under load but can serve many requests at
