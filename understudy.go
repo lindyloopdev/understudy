@@ -316,9 +316,10 @@ type server struct {
 	health healthRecords
 
 	mu sync.Mutex
-	// conversations holds each conversation's state; the tenant groups the
-	// records so a tenant's can be dropped with it.
-	conversations map[string]map[string]*conversation
+	// standings holds each tenant's records, keyed by conversation key and
+	// session key; the tenant groups the records so a tenant's can be
+	// dropped with it.
+	standings map[string]map[string]*standing
 	// admission holds each target's session-ordered admission queue, keyed by
 	// the same availability key (canonical url + key + model) the walk uses.
 	// It stays apart from health: a health entry is swept once stale, but a
@@ -638,8 +639,9 @@ type Handler struct {
 // as one plain value. Its fields are totals, never per target: a target's
 // identity includes its account's API key, which a count must not carry.
 type Counts struct {
-	// Conversations is the number of conversations with an admission
-	// standing.
+	// Conversations is the number of records holding an admission standing:
+	// one per conversation, and one more per session whose caller names it
+	// by a session identifier.
 	Conversations int
 }
 
@@ -649,7 +651,7 @@ func (h *Handler) Counts() Counts {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	conversations := 0
-	for _, byKey := range h.conversations {
+	for _, byKey := range h.standings {
 		for _, c := range byKey {
 			if c.session != nil {
 				conversations++
@@ -684,7 +686,7 @@ func newServer(v TokenValidator, opts ...Option) *server {
 		fdLimitReader:            readFDSoftLimit,
 		firstContentSchedule:     time.AfterFunc,
 		health:                   healthRecords{entries: make(map[string]targetHealth)},
-		conversations:            make(map[string]map[string]*conversation),
+		standings:                make(map[string]map[string]*standing),
 		admission:                make(map[string]*targetQueue),
 		upstreams:                make(map[string]*upstreamAccount),
 	}
@@ -981,49 +983,53 @@ func conversationKey(prefix []json.RawMessage) string {
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
-// conversation is the state Understudy keeps for one tenant conversation. Both
-// parts are forgotten together, after the conversation has gone
+// standing is the state Understudy keeps for one of a tenant's keys: the
+// target that last served the conversation a conversation key names, and the
+// place in line of the session a session key names, both in one record where
+// the two keys are the same. The parts are forgotten together, after the key has gone
 // [sessionForgetAfter] with no request, and the record goes with them.
-type conversation struct {
+type standing struct {
 	// served is the target that last served the conversation, so its later
 	// requests stay coherent with the answers that target authored. It is a
 	// hint, not a lease: it reorders candidates pickTarget would accept.
 	served *lastServed
-	// session is the conversation's admission standing. Its rank is taken at
-	// the first turn, so ordering engages before any history exists to stay
-	// coherent with. nil once quiet past [sessionForgetAfter].
+	// session is the key's admission standing: the session's rank where the
+	// key names a session, and the clock the record's parts are forgotten
+	// on. The rank is taken at the first request, so ordering engages
+	// before any history exists to stay coherent with. nil once quiet past
+	// [sessionForgetAfter].
 	session *sessionRecord
 }
 
-// conversationLocked returns tenant's conversation key's record, creating it
-// on first use. Caller holds s.mu.
-func (s *server) conversationLocked(tenant, key string) *conversation {
-	conversations, ok := s.conversations[tenant]
+// standingLocked returns tenant's record for key, creating it on first use.
+// Caller holds s.mu.
+func (s *server) standingLocked(tenant, key string) *standing {
+	records, ok := s.standings[tenant]
 	if !ok {
-		conversations = make(map[string]*conversation)
-		s.conversations[tenant] = conversations
+		records = make(map[string]*standing)
+		s.standings[tenant] = records
 	}
-	c, ok := conversations[key]
+	c, ok := records[key]
 	if !ok {
-		c = &conversation{}
-		conversations[key] = c
+		c = &standing{}
+		records[key] = c
 	}
 	return c
 }
 
-// evictConversationParts runs clearExpired on each conversation, then drops
-// every conversation left with neither part, and every tenant left with no
-// conversation — a run that ended. Caller holds s.mu.
-func (s *server) evictConversationParts(clearExpired func(c *conversation)) {
-	for tenant, conversations := range s.conversations {
-		for key, c := range conversations {
+// evictStandings runs clearExpired on each record, then drops every record
+// left with neither part, and every tenant left with no record — a run that
+// ended. Caller holds s.mu.
+func (s *server) evictStandings(clearExpired func(c *standing)) {
+	for tenant, records := range s.standings {
+		for key, c := range records {
 			clearExpired(c)
 			if c.served == nil && c.session == nil {
-				delete(conversations, key)
+				delete(records, key)
 			}
 		}
-		if len(conversations) == 0 {
-			delete(s.conversations, tenant)
+		if len(records) == 0 {
+			delete(s.standings, tenant)
 		}
 	}
 }
@@ -1033,10 +1039,10 @@ type lastServed struct {
 	target Target
 }
 
-// recordServe records t as the conversation's target and refreshes its place
-// in line: a serve answers a request, so the two stay current together. A
-// request answered after its place in line was forgotten starts a fresh one,
-// so the record left behind is still one a later sweep forgets.
+// recordServe records t as the conversation's target and refreshes the
+// conversation's record: a serve answers a request, so the two stay current
+// together. A request answered after the record was forgotten starts a fresh
+// one, so the record left behind is still one a later sweep forgets.
 func (s *server) recordServe(tenant, key string, t Target) {
 	if key == "" {
 		return
@@ -1044,7 +1050,7 @@ func (s *server) recordServe(tenant, key string, t Target) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	c := s.conversationLocked(tenant, key)
+	c := s.standingLocked(tenant, key)
 	c.served = &lastServed{target: t}
 	if c.session == nil {
 		c.session = &sessionRecord{firstSeen: now}
@@ -1058,7 +1064,7 @@ func (s *server) recordServe(tenant, key string, t Target) {
 func (s *server) affinity(tenant, key string) (Target, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.conversations[tenant][key]
+	c, ok := s.standings[tenant][key]
 	if !ok || c.served == nil || c.session == nil || c.session.idle(time.Now()) {
 		return Target{}, false
 	}
@@ -2562,7 +2568,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) error {
 				return s.anotherTargetTakingNewSessions(untriedTargets(logicalTargets, tried, backend.Backends), waitingAtKey, backend.Backends)
 			}
 		}
-		rank := s.sessionAge(convTenant, convKey)
+		rank := s.sessionAge(convTenant, convKey, r.Header.Get("x-session-affinity"))
 		entered := time.Now()
 		pend, err := queue.enter(ctx, cancel, rank, moveOn)
 		if err != nil {

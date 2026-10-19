@@ -5813,6 +5813,60 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		}
 		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
 	})
+	// The older session returns compacted, so only the identifier its
+	// client sends names it.
+	tests.AddFunc("should send the younger session's request first when the client names the older session and it was away too long to remember", func(t *testing.T) test {
+		const (
+			olderSession = "older-session-id"
+			compacted    = "the older session asks after compaction"
+		)
+		turns := []clientTurn{
+			{label: "older-opening", userMessages: []string{older}, sessionID: olderSession},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "younger-second", after: 10 * time.Hour, userMessages: []string{younger, younger + " (2)"}},
+			{label: "younger-third", after: 10 * time.Hour, userMessages: []string{younger, younger + " (3)"}},
+			{label: "occupier", after: 10 * time.Hour, userMessages: []string{admissionLongMessage}},
+			{label: "older", after: time.Second, userMessages: []string{compacted, compacted + " again"}, sessionID: olderSession},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}},
+		}
+		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
+	})
+	// The compacted conversation opens on messages it did not open on, so
+	// only the identifier its client sends names the session.
+	tests.AddFunc("should send the older session's request first when the client names its session and its conversation was compacted", func(t *testing.T) test {
+		const (
+			olderSession   = "older-session-id"
+			youngerSession = "younger-session-id"
+			compacted      = "the older session asks after compaction"
+		)
+		turns := []clientTurn{
+			{label: "older-opening", userMessages: []string{older}, sessionID: olderSession},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}, sessionID: youngerSession},
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
+			{label: "younger", after: 500 * time.Millisecond, userMessages: []string{younger, younger + " again"}, sessionID: youngerSession},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{compacted, compacted + " again"}, sessionID: olderSession},
+		}
+		return busyTargetCase(t, turns, "older", "younger", older, younger)
+	})
+	// The younger client's request arrives first, so it waits behind the
+	// older one only if its own place in line is scoped to its token, not
+	// to the session identifier it shares with the earlier-opening client.
+	tests.AddFunc("should send the older session's request first when the younger session's client sends a session identifier another client opened a session under before it", func(t *testing.T) test {
+		const (
+			sharedSession = "shared-session-id"
+			otherOpening  = "the other client's session opens"
+			youngerToken  = "younger-client-token"
+		)
+		turns := []clientTurn{
+			{label: "other-opening", userMessages: []string{otherOpening}, sessionID: sharedSession},
+			{label: "older-opening", after: time.Second, userMessages: []string{older}},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}, sessionID: sharedSession, token: youngerToken},
+			{label: "occupier", after: time.Second, userMessages: []string{admissionLongMessage}},
+			{label: "younger", after: 500 * time.Millisecond, userMessages: []string{younger, younger + " again"}, sessionID: sharedSession, token: youngerToken},
+			{label: "older", after: 500 * time.Millisecond, userMessages: []string{older, older + " again"}},
+		}
+		return busyTargetCase(t, turns, "older", "younger", otherOpening, older, younger)
+	})
 	// A request admitted by a refill that stays unconfirmed past its grace
 	// period is displaced by an outranking arrival like any other
 	// unconfirmed request, and waits in line for its next turn.
@@ -6066,6 +6120,12 @@ type clientTurn struct {
 	// order: the first names its session, and the last is the one the
 	// target sees. Each is unique across the case.
 	userMessages []string
+	// sessionID is the session identifier the client's x-session-affinity
+	// header carries; empty sends none.
+	sessionID string
+	// token is the bearer token the client sends; empty sends the admission
+	// tests' default.
+	token string
 	// clientLeavesAfter is how long after sending the turn the client gives
 	// up waiting; zero, it waits for its answer.
 	clientLeavesAfter time.Duration
@@ -6096,7 +6156,7 @@ func postTurns(t *testing.T, poster *admissionPoster, turns []clientTurn) {
 			}
 			messages = append(messages, admissionMsg("user", message))
 		}
-		go poster.post(ctx, tn.name(), tn.turn(messages...))
+		go poster.postSession(ctx, tn.name(), tn.turn(messages...), tn.token, tn.sessionID)
 		synctest.Wait()
 	}
 }
@@ -6473,14 +6533,23 @@ func newAdmissionPoster(t *testing.T, srv http.Handler) *admissionPoster {
 }
 
 func (p *admissionPoster) post(ctx context.Context, label, body string) {
+	p.postSession(ctx, label, body, "", "")
+}
+
+// postSession posts a chat request that carries token as its bearer token,
+// the default when empty, and session in its x-session-affinity header.
+func (p *admissionPoster) postSession(ctx context.Context, label, body, token, session string) {
 	ctx = WithLogCtx(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		p.t.Error(err)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer user-token")
+	req.Header.Set("Authorization", "Bearer "+cmp.Or(token, "user-token"))
 	req.Header.Set("Content-Type", "application/json")
+	if session != "" {
+		req.Header.Set("x-session-affinity", session)
+	}
 	rec := httptest.NewRecorder()
 	p.srv.ServeHTTP(rec, req)
 	p.mu.Lock()

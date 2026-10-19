@@ -41,16 +41,15 @@ const minFirstContentTimeout = 60 * time.Second
 // from the timings Understudy logs.
 const firstContentWindow = 10 * time.Minute
 
-// sessionForgetAfter is how long a conversation may go with no request before
-// its age is forgotten and it ranks as new again, so a session that keeps
-// taking turns — however old — is never outranked by one that has been away
-// longer. The same backstop a conversation's target is forgotten on, so no
-// record outlives it.
+// sessionForgetAfter is how long a session may go with no request before its
+// place in line is forgotten and it ranks as new again, so a session that
+// keeps taking turns — however old — is never outranked by one that has been
+// away longer.
 const sessionForgetAfter = 24 * time.Hour
 
-// sessionRecord is a conversation's standing in admission: firstSeen is its
-// rank, and lastSeen is when it last took a turn, which [sessionForgetAfter]
-// is measured from.
+// sessionRecord is a session's standing in admission: firstSeen is its rank,
+// and lastSeen is when a request last carried the session's key, which
+// [sessionForgetAfter] is measured from.
 type sessionRecord struct {
 	firstSeen time.Time
 	lastSeen  time.Time
@@ -60,24 +59,56 @@ func (r sessionRecord) idle(now time.Time) bool {
 	return now.Sub(r.lastSeen) >= sessionForgetAfter
 }
 
-// sessionAge returns when tenant's conversation was first seen, recording the
-// first sighting and refreshing the last. The age is the session's admission
-// rank, so an old session's later turn outranks a younger session's earlier
-// one, and the rank holds through quiet stretches shorter than
-// [sessionForgetAfter]. A request with no conversation key ranks by its own
-// arrival.
+// sessionIDPrefix marks a record key as a caller's session identifier, so a
+// session key is never mistaken for a conversation key: a conversation key is
+// hexadecimal, so it never carries this prefix.
+const sessionIDPrefix = "session-id\x00"
+
+// sessionKey is the key a session's place in line is recorded under: the
+// caller's session identifier where the request carries one, and otherwise
+// the conversation key, so the two share one record where the caller sends no
+// identifier. Empty when the request carries neither.
+func sessionKey(conversationKey, sessionID string) string {
+	if sessionID != "" {
+		return sessionIDPrefix + sessionID
+	}
+	return conversationKey
+}
+
+// sessionAge returns when tenant's session was first seen, recording the
+// first sighting and refreshing the last. A request carrying the caller's
+// session identifier (the x-session-affinity header) ranks under it, scoped
+// to the token. The age is the session's admission rank, so an old session's
+// later request outranks a younger session's earlier one. A request with no
+// session key ranks by its own arrival.
 //
 // TODO(TODO.d/admission-reservation-window.md): hold the session's admission
 // priority for a window between its turns.
-func (s *server) sessionAge(tenant, key string) time.Time {
+func (s *server) sessionAge(tenant, convKey, sessionID string) time.Time {
 	now := time.Now()
+	key := sessionKey(convKey, sessionID)
 	if key == "" {
 		return now
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evictForgottenSessions(now)
-	c := s.conversationLocked(tenant, key)
+	rank := s.touchSession(tenant, key, now)
+	if key != convKey && convKey != "" {
+		// The conversation's record keeps its own clock though the session's
+		// place in line lives under the caller's identifier: the target the
+		// record holds is forgotten on the conversation's requests either
+		// way.
+		s.touchSession(tenant, convKey, now)
+	}
+	return rank
+}
+
+// touchSession refreshes the session record under key — the key's admission
+// standing — recording a first sighting, and returns when it was first seen.
+// Caller holds s.mu.
+func (s *server) touchSession(tenant, key string, now time.Time) time.Time {
+	c := s.standingLocked(tenant, key)
 	if c.session != nil {
 		c.session.lastSeen = now
 		return c.session.firstSeen
@@ -86,12 +117,12 @@ func (s *server) sessionAge(tenant, key string) time.Time {
 	return now
 }
 
-// evictForgottenSessions forgets every conversation quiet for
-// [sessionForgetAfter]: its place in line and its target go together.
+// evictForgottenSessions forgets every record quiet for [sessionForgetAfter]:
+// a record's place in line and its target go together.
 //
 // Caller holds s.mu.
 func (s *server) evictForgottenSessions(now time.Time) {
-	s.evictConversationParts(func(c *conversation) {
+	s.evictStandings(func(c *standing) {
 		if c.session != nil && c.session.idle(now) {
 			c.session, c.served = nil, nil
 		}
