@@ -5813,7 +5813,24 @@ func TestShouldSendTheHigherRankedSessionsTurnToAContendedTargetFirst(t *testing
 		}
 		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
 	})
-	// TODO(TODO.d/session-ordered-admission.md): should send the younger session's request first when the client names the older session and it was away too long to remember.
+	// The older session returns compacted, so only the identifier its
+	// client sends names it.
+	tests.AddFunc("should send the younger session's request first when the client names the older session and it was away too long to remember", func(t *testing.T) test {
+		const (
+			olderSession = "older-session-id"
+			compacted    = "the older session asks after compaction"
+		)
+		turns := []clientTurn{
+			{label: "older-opening", userMessages: []string{older}, sessionID: olderSession},
+			{label: "younger-opening", after: time.Second, userMessages: []string{younger}},
+			{label: "younger-second", after: 10 * time.Hour, userMessages: []string{younger, younger + " (2)"}},
+			{label: "younger-third", after: 10 * time.Hour, userMessages: []string{younger, younger + " (3)"}},
+			{label: "occupier", after: 10 * time.Hour, userMessages: []string{admissionLongMessage}},
+			{label: "older", after: time.Second, userMessages: []string{compacted, compacted + " again"}, sessionID: olderSession},
+			{label: "younger", after: admissionGracePeriod + time.Second, userMessages: []string{younger, younger + " again"}},
+		}
+		return busyTargetCase(t, turns, "younger", "older", older, younger, younger+" (2)", younger+" (3)")
+	})
 	// The compacted conversation opens on messages it did not open on, so
 	// only the identifier its client sends names the session.
 	tests.AddFunc("should send the older session's request first when the client names its session and its conversation was compacted", func(t *testing.T) test {
