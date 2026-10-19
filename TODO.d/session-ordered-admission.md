@@ -22,9 +22,6 @@ limiter. The steps below remain, in order.
 
 ## Work
 
-- **Give each client its own place in line for a shared session identifier.**
-  DESIGN.md's *Admission ordering is oldest-session-first*: the caller's
-  session identifier is scoped to the token.
 - **Finish the first-content timeout** (DESIGN.md, *A first-content
   timeout*). What remains:
   - This composes with [[stall-before-first-content-event]]'s demote-and-
