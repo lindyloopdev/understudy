@@ -2611,8 +2611,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a "model" that is not a string (a number, an object) should leave
-	//     model_responded empty.
 	//   - a name longer than maxModelNameBytes should leave model_responded
 	//     empty rather than truncated.
 	//   - a name that decodes to more than maxModelNameBytes though its escaped
@@ -2650,6 +2648,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the response names the model as a number", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":42,"choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
 			},
 		}
 	})
