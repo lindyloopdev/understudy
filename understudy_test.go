@@ -2666,6 +2666,32 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the model a stream opening with a comment or event: line names", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := ": keep-alive\n\n" +
+				"event: message\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
 	// TODO: cases for the model a streamed response names:
 	//   - a stream whose first data: chunks name no model and a later one does
 	//     should log the later chunk's model (the first chunk to name one
@@ -2673,11 +2699,11 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//   - a stream with no chunk naming a model (only `data: [DONE]`, or
 	//     payloads that are not JSON objects) should leave model_responded
 	//     empty, and so should a bare error text beginning with "d".
-	//   - a stream opening with a comment or another field line
-	//     (`: keep-alive`, `event: message`, `id:`, `retry:`) should log the
-	//     model its later data: chunks name; responseModelReader currently
-	//     settles such a body at its first byte, so model_responded comes back
-	//     empty.
+	//   - a stream that opens with a comment or another field line and has a
+	//     line beginning with "d" that is not `data:` (`date: x`) before its
+	//     first data: chunk should log the model that chunk names;
+	//     responseModelReader currently ends the scan at that line, so
+	//     model_responded comes back empty.
 
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{

@@ -17,11 +17,10 @@ const maxModelNameBytes = 256
 // top-level "model" field. The name may differ from the model the attempt
 // requested: a backend may answer under a name the requested one has since
 // been aliased or replaced by. Names longer than maxModelNameBytes are not
-// recorded. A server-sent-events body whose first line is a data: line names
-// the model in the JSON object each data: chunk carries; the first chunk to
-// name one settles it. Any other body — a bare error text, or a stream
-// opening with a comment or another field line — is settled by its first
-// non-whitespace byte and never scanned further.
+// recorded. A stream — a body opening with a comment or an SSE field line —
+// names the model in the JSON object each data: chunk carries, and the first
+// chunk to name one settles it. Any other body — a bare error text — is
+// settled by its opening field name and never scanned further.
 type responseModelReader struct {
 	r     io.Reader
 	state modelScanState
@@ -43,6 +42,10 @@ type responseModelReader struct {
 	escaped bool
 	sse     bool
 	dataIdx int
+	// openField holds the field name the body's first line opens with while
+	// it is matched against the SSE field names; it never outgrows the
+	// longest of them.
+	openField []byte
 	// model is the model the body named, or "".
 	model string
 }
@@ -51,6 +54,7 @@ type modelScanState int
 
 const (
 	scanBodyStart modelScanState = iota
+	scanOpenField
 	scanLineStart
 	scanDataKey
 	scanPayloadStart
@@ -91,10 +95,22 @@ func (m *responseModelReader) scan(b byte) {
 		switch {
 		case b == '{':
 			m.state = scanMember
-		case b == 'd':
-			m.dataIdx = 1
-			m.state = scanDataKey
+		case b == ':':
+			m.state = scanLine
 		case isJSONSpace(b):
+		default:
+			m.openField = append(m.openField[:0], b)
+			m.state = scanOpenField
+		}
+	case scanOpenField:
+		m.openField = append(m.openField, b)
+		switch prefix, complete := sseFieldPrefix(m.openField); {
+		case complete && bytes.Equal(m.openField, dataField):
+			m.sse = true
+			m.state = scanPayloadStart
+		case complete:
+			m.state = scanLine
+		case prefix:
 		default:
 			m.state = scanDone
 		}

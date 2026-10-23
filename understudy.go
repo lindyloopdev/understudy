@@ -1687,10 +1687,9 @@ type LogRecord struct {
 	ModelUpstream  string
 	// ModelResponded is the model the response names in its top-level
 	// "model" field — a JSON object body names it directly, a streamed
-	// response whose first line is a data: line names it in the JSON object
-	// each data: chunk carries — or "" when the response names none, names
-	// one longer than maxModelNameBytes, or is neither shape (a bare error
-	// text, or a stream opening with a comment or another field line).
+	// response names it in the JSON object each data: chunk carries —
+	// or "" when the response names none, names one longer than
+	// maxModelNameBytes, or is neither shape (a bare error text).
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
