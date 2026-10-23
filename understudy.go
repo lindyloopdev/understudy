@@ -1685,6 +1685,13 @@ type LogRecord struct {
 	// ModelRequested and ModelUpstream are the requested and upstream model names.
 	ModelRequested string
 	ModelUpstream  string
+	// ModelResponded is the model a JSON object response body names in its
+	// top-level "model" field, or "" when the body names none, is not a JSON
+	// object (a streamed response is not), or names one longer than 256 bytes.
+	//
+	// TODO(TODO.d/record-the-model-the-response-names.md): a streamed response's
+	// chunks name the model too.
+	ModelResponded string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
 	// TimeToResponseHeader is the time from sending the serving attempt's
@@ -1776,6 +1783,12 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.ModelRequested = requested
 		h.ModelUpstream = upstream
+	}
+}
+
+func setLogRespondedModel(ctx context.Context, model string) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.ModelResponded = model
 	}
 }
 
@@ -2854,9 +2867,10 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	}
 
 	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
+	modelScan := &responseModelReader{r: idle}
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
-		r: idle,
+		r: modelScan,
 		content: func() {
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
@@ -2876,6 +2890,11 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	held.commit()
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
+	// Recorded only after the preemption check above, so a send the queue
+	// preempted contributes nothing; its replacement is read afresh.
+	if modelScan.model != "" {
+		setLogRespondedModel(a.r.Context(), modelScan.model)
+	}
 	return false, err
 }
 
