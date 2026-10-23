@@ -2615,12 +2615,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//     model_responded empty.
 	//   - a name longer than maxModelNameBytes should leave model_responded
 	//     empty rather than truncated.
-	//   - a name whose decoded length is within maxModelNameBytes but whose
-	//     escaped spelling is longer (200 bytes with 100 `\/`) should be
-	//     logged decoded; modelInObject measures the escaped spelling, so
-	//     model_responded currently comes back empty. A name that decodes to
-	//     more than maxModelNameBytes (invalid UTF-8 becoming 3-byte U+FFFD)
-	//     should leave it empty.
+	//   - a name that decodes to more than maxModelNameBytes though its escaped
+	//     spelling is within it (invalid UTF-8 becoming 3-byte U+FFFD) should
+	//     leave model_responded empty.
 	//   - a name with an invalid escape (`x\q`) should leave model_responded
 	//     empty.
 	//   - a send the admission queue preempts before any content, and sends
@@ -2674,6 +2671,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "meta-llama/Llama-3",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a name whose decoded length is within the bound though its escaped spelling is longer", func(t *testing.T) test {
+		name := strings.Repeat("a/", 100)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := `{"id":"chatcmpl-1","model":"` + strings.ReplaceAll(name, "/", `\/`) + `","choices":[]}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": name,
 			},
 		}
 	})

@@ -7,8 +7,8 @@ import (
 )
 
 // maxModelNameBytes bounds the model a response body may name and still be
-// recorded, measured on the name as the body spells it, escapes included: a
-// longer value is not a model name worth holding per request.
+// recorded, measured on the name as decoded, escapes resolved: a longer
+// value is not a model name worth holding per request.
 const maxModelNameBytes = 256
 
 // maxBodyPrefixBytes bounds how much of a relayed response body is kept to
@@ -59,7 +59,7 @@ func modelNamedBy(body []byte) string {
 
 // modelInObject returns the model a JSON object names in its top-level
 // "model" field, or "" when it names none, names a value that is not a plain
-// string, names one whose JSON spelling is longer than maxModelNameBytes, or
+// string, names one whose decoded name is longer than maxModelNameBytes, or
 // ends before the field.
 // A value carrying an escape is returned as the string it decodes to.
 func modelInObject(obj []byte) string {
@@ -82,14 +82,20 @@ func modelInObject(obj []byte) string {
 		if err != nil {
 			return ""
 		}
-		if len(value)-2 <= maxModelNameBytes && value.Kind() == '"' {
-			if !bytes.Contains(value, []byte{'\\'}) {
+		if value.Kind() != '"' {
+			continue
+		}
+		if !bytes.Contains(value, []byte{'\\'}) {
+			if len(value)-2 <= maxModelNameBytes {
 				return string(value[1 : len(value)-1])
 			}
-			var decoded string
-			if json.Unmarshal(value, &decoded) != nil {
-				return ""
-			}
+			continue
+		}
+		var decoded string
+		if json.Unmarshal(value, &decoded) != nil {
+			return ""
+		}
+		if len(decoded) <= maxModelNameBytes {
 			return decoded
 		}
 	}
