@@ -2,253 +2,86 @@ package understudy
 
 import (
 	"bytes"
-	"io"
+	"encoding/json/jsontext"
 )
-
-// modelKey is the response field naming the model that answered.
-var modelKey = []byte("model")
 
 // maxModelNameBytes bounds the model name a response body may name and still
 // be recorded: a longer value is not a model name worth holding per request.
 const maxModelNameBytes = 256
 
-// responseModelReader passes a relayed response body through to the client
-// unchanged while reading the model a JSON object body names in its
-// top-level "model" field. The name may differ from the model the attempt
+// maxBodyPrefixBytes bounds how much of a relayed response body is kept to
+// read the model it names from: a model named within the first
+// maxBodyPrefixBytes is found, wherever it falls in them, and one named only
+// after them is recorded as naming none.
+const maxBodyPrefixBytes = 64 << 10
+
+// bodyPrefix keeps the first maxBodyPrefixBytes written to it and drops the
+// rest, so a relayed body can be teed to it without being held in full.
+type bodyPrefix struct {
+	b []byte
+}
+
+func (p *bodyPrefix) Write(b []byte) (int, error) {
+	if room := maxBodyPrefixBytes - len(p.b); room > 0 {
+		p.b = append(p.b, b[:min(room, len(b))]...)
+	}
+	return len(b), nil
+}
+
+// modelNamedBy returns the model a response body names in its top-level
+// "model" field, or "". The name may differ from the model the attempt
 // requested: a backend may answer under a name the requested one has since
-// been aliased or replaced by. Names longer than maxModelNameBytes are not
-// recorded. A stream — a body opening with a comment or an SSE field line —
-// names the model in the JSON object each data: chunk carries, and the first
-// chunk to name one settles it. Any other body — a bare error text — is
-// settled by its opening field name and never scanned further.
-type responseModelReader struct {
-	r     io.Reader
-	state modelScanState
-	// key holds the key being read; keyEsc marks one carrying an escape,
-	// which rules a key out without unescaping it, since "model" has none.
-	key    []byte
-	keyEsc bool
-	// modelKeyPending marks a top-level "model" key whose value is next.
-	modelKeyPending bool
-	// capture marks the string value being read as the model's, collected
-	// into value.
-	capture bool
-	value   []byte
-	// depth counts the containers open inside a non-string value being
-	// skipped; inStr and escaped track a string within it, or the model
-	// value.
-	depth   int
-	inStr   bool
-	escaped bool
-	sse     bool
-	dataIdx int
-	// openField holds the field name the body's first line opens with while
-	// it is matched against the SSE field names; it never outgrows the
-	// longest of them.
-	openField []byte
-	// model is the model the body named, or "".
-	model string
+// been aliased or replaced by. A JSON object body names it directly; a
+// server-sent-events body names it in the JSON object each data: line
+// carries, and the first line to name one settles it. Any other body names
+// none. body may be truncated; only what it holds is read.
+func modelNamedBy(body []byte) string {
+	if trimmed := bytes.TrimLeft(body, " \t\r\n"); bytes.HasPrefix(trimmed, []byte("{")) {
+		return modelInObject(trimmed)
+	}
+	for line := range bytes.Lines(body) {
+		payload, ok := bytes.CutPrefix(line, dataField)
+		if !ok {
+			continue
+		}
+		payload = bytes.TrimLeft(payload, " \t")
+		if !bytes.HasPrefix(payload, []byte("{")) {
+			continue
+		}
+		if model := modelInObject(payload); model != "" {
+			return model
+		}
+	}
+	return ""
 }
 
-type modelScanState int
-
-const (
-	scanBodyStart modelScanState = iota
-	scanOpenField
-	scanLineStart
-	scanDataKey
-	scanPayloadStart
-	scanMember
-	scanKey
-	scanColon
-	scanValueStart
-	scanString
-	scanBareValue
-	scanLine
-	scanDone
-)
-
-func (m *responseModelReader) Read(p []byte) (int, error) {
-	n, err := m.r.Read(p)
-	for i := range n {
-		if m.state == scanDone {
-			break
-		}
-		m.scan(p[i])
+// modelInObject returns the model a JSON object names in its top-level
+// "model" field, or "" when it names none, names a value that is not a plain
+// string, names one longer than maxModelNameBytes, or ends before the field.
+// A value carrying an escape is dropped rather than returned undecoded.
+func modelInObject(obj []byte) string {
+	dec := jsontext.NewDecoder(bytes.NewReader(obj), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	if _, err := dec.ReadToken(); err != nil {
+		return ""
 	}
-	return n, err
-}
-
-// afterPayload returns the state to enter after one scanned JSON object: a
-// streamed body continues with its next event, a whole-body object is done.
-func (m *responseModelReader) afterPayload() modelScanState {
-	if m.sse {
-		return scanLine
-	}
-	return scanDone
-}
-
-// scan advances the read of one body byte.
-func (m *responseModelReader) scan(b byte) {
-	switch m.state {
-	case scanBodyStart:
-		switch {
-		case b == '{':
-			m.state = scanMember
-		case b == ':':
-			m.state = scanLine
-		case isJSONSpace(b):
-		default:
-			m.openField = append(m.openField[:0], b)
-			m.state = scanOpenField
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return ""
 		}
-	case scanOpenField:
-		m.openField = append(m.openField, b)
-		switch prefix, complete := sseFieldPrefix(m.openField); {
-		case complete && bytes.Equal(m.openField, dataField):
-			m.sse = true
-			m.state = scanPayloadStart
-		case complete:
-			m.state = scanLine
-		case prefix:
-		default:
-			m.state = scanDone
+		if name.String() != "model" {
+			if dec.SkipValue() != nil {
+				return ""
+			}
+			continue
 		}
-	case scanLineStart:
-		switch b {
-		case 'd':
-			m.dataIdx = 1
-			m.state = scanDataKey
-		case '\n':
-		default:
-			m.state = scanLine
+		value, err := dec.ReadValue()
+		if err != nil {
+			return ""
 		}
-	case scanDataKey:
-		if b != dataField[m.dataIdx] {
-			m.state = m.afterPayload()
-			return
-		}
-		m.dataIdx++
-		if m.dataIdx == len(dataField) {
-			m.sse = true
-			m.state = scanPayloadStart
-		}
-	case scanPayloadStart:
-		switch b {
-		case '{':
-			m.state = scanMember
-		case ' ', '\t':
-		default:
-			m.state = scanLine
-		}
-	case scanLine:
-		if b == '\n' {
-			m.state = scanLineStart
-		}
-	case scanMember:
-		switch {
-		case b == '"':
-			m.key, m.keyEsc, m.escaped = m.key[:0], false, false
-			m.state = scanKey
-		case b == ',' || isJSONSpace(b):
-		case b == '}':
-			m.state = m.afterPayload()
-		default:
-			m.state = m.afterPayload()
-		}
-	case scanKey:
-		switch {
-		case m.escaped:
-			m.escaped = false
-		case b == '\\':
-			m.escaped = true
-			m.keyEsc = true
-		case b == '"':
-			m.modelKeyPending = !m.keyEsc && bytes.Equal(m.key, modelKey)
-			m.state = scanColon
-		case len(m.key) <= len(modelKey):
-			// A prefix past "model" itself only ever rules the key out.
-			m.key = append(m.key, b)
-		}
-	case scanColon:
-		switch {
-		case b == ':':
-			m.state = scanValueStart
-		case isJSONSpace(b):
-		default:
-			m.state = m.afterPayload()
-		}
-	case scanValueStart:
-		switch {
-		case b == '"':
-			m.capture, m.escaped, m.value = m.modelKeyPending, false, m.value[:0]
-			m.modelKeyPending = false
-			m.state = scanString
-		case isJSONSpace(b):
-		default:
-			m.modelKeyPending = false
-			m.depth, m.inStr, m.escaped = 0, false, false
-			m.state = scanBareValue
-			m.scanBareValue(b)
-		}
-	case scanString:
-		m.scanString(b)
-	case scanBareValue:
-		m.scanBareValue(b)
-	}
-}
-
-// scanString reads a string value, collecting it while it is the model's.
-func (m *responseModelReader) scanString(b byte) {
-	switch {
-	case m.escaped:
-		m.escaped = false
-	case b == '\\':
-		m.escaped = true
-		m.capture = false
-	case b == '"':
-		if m.capture {
-			m.model = string(m.value)
-			m.state = scanDone
-			return
-		}
-		m.state = scanMember
-	case !m.capture:
-	case len(m.value) >= maxModelNameBytes:
-		m.capture = false
-	default:
-		m.value = append(m.value, b)
-	}
-}
-
-// scanBareValue skips a non-string value — a scalar or a nested container —
-// until a separator or closing brace returns to the top level.
-func (m *responseModelReader) scanBareValue(b byte) {
-	if m.inStr {
-		switch {
-		case m.escaped:
-			m.escaped = false
-		case b == '\\':
-			m.escaped = true
-		case b == '"':
-			m.inStr = false
-		}
-		return
-	}
-	switch b {
-	case '"':
-		m.inStr, m.escaped = true, false
-	case '{', '[':
-		m.depth++
-	case '}', ']':
-		if m.depth == 0 {
-			m.state = m.afterPayload()
-			return
-		}
-		m.depth--
-	case ',':
-		if m.depth == 0 {
-			m.state = scanMember
+		if len(value)-2 <= maxModelNameBytes && value.Kind() == '"' && !bytes.Contains(value, []byte{'\\'}) {
+			return string(value[1 : len(value)-1])
 		}
 	}
+	return ""
 }

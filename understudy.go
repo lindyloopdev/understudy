@@ -1689,7 +1689,8 @@ type LogRecord struct {
 	// "model" field — a JSON object body names it directly, a streamed
 	// response names it in the JSON object each data: chunk carries —
 	// or "" when the response names none, names one longer than
-	// maxModelNameBytes, or is neither shape (a bare error text).
+	// maxModelNameBytes, names it only after the first maxBodyPrefixBytes
+	// of the body, or is neither shape (a bare error text).
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
@@ -2866,10 +2867,10 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	}
 
 	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
-	modelScan := &responseModelReader{r: idle}
+	var body bodyPrefix
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
-		r: modelScan,
+		r: io.TeeReader(idle, &body),
 		content: func() {
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
@@ -2891,8 +2892,8 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	a.pend.queue.finish(a.pend)
 	// Recorded only after the preemption check above, so a send the queue
 	// preempted contributes nothing; its replacement is read afresh.
-	if modelScan.model != "" {
-		setLogRespondedModel(a.r.Context(), modelScan.model)
+	if model := modelNamedBy(body.b); model != "" {
+		setLogRespondedModel(a.r.Context(), model)
 	}
 	return false, err
 }

@@ -2612,7 +2612,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 
 	// TODO: cases for the model a response body names:
 	//   - a name containing a JSON escape (`meta-llama\/Llama-3`, `x\u002dy`)
-	//     should be logged unescaped; responseModelReader currently drops it, so
+	//     should be logged unescaped; modelInObject currently drops it, so
 	//     model_responded comes back empty.
 	//   - a "model" that is not a string (a number, an object) should leave
 	//     model_responded empty.
@@ -2621,6 +2621,16 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//   - a send the admission queue preempts before any content, and sends
 	//     again, should log the model the re-sent answer names, not the
 	//     preempted one's.
+	//   - a body longer than maxBodyPrefixBytes that names the model within its
+	//     first maxBodyPrefixBytes (a JSON object's early field, a stream's
+	//     first chunk) should log that model, and the client should still
+	//     receive the whole body.
+	//   - a body that names the model only after its first maxBodyPrefixBytes
+	//     (a long "choices" content ahead of a JSON object's "model", or
+	//     keep-alives and earlier chunks ahead of a stream's naming chunk)
+	//     currently comes back with model_responded empty; the bound is a
+	//     limitation of ModelResponded, and whether to scan the body as it
+	//     passes instead is undecided.
 	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2699,11 +2709,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//   - a stream with no chunk naming a model (only `data: [DONE]`, or
 	//     payloads that are not JSON objects) should leave model_responded
 	//     empty, and so should a bare error text beginning with "d".
-	//   - a stream that opens with a comment or another field line and has a
-	//     line beginning with "d" that is not `data:` (`date: x`) before its
-	//     first data: chunk should log the model that chunk names;
-	//     responseModelReader currently ends the scan at that line, so
-	//     model_responded comes back empty.
 
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
