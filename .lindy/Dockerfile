@@ -4,9 +4,9 @@
 # beat has to pass: Go from go.mod, gopherlint at GOPHERLINTVERSION, and
 # goimports from go.mod's golang.org/x/tools. A cycle that lints with a different
 # linter than CI reports a gate it did not pass.
-FROM golang:1.26.5
+FROM golang:1.27.1
 
-ARG GOPHERLINT_VERSION=1.26.3
+ARG GOPHERLINT_VERSION=1.27.1
 RUN set -eu; \
     name="gopherlint-${GOPHERLINT_VERSION}-linux-$(dpkg --print-architecture)"; \
     base="https://github.com/flimzy/gopherlint/releases/download/v${GOPHERLINT_VERSION}"; \
