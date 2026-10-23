@@ -2611,13 +2611,18 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a name containing a JSON escape (`meta-llama\/Llama-3`, `x\u002dy`)
-	//     should be logged unescaped; modelInObject currently drops it, so
-	//     model_responded comes back empty.
 	//   - a "model" that is not a string (a number, an object) should leave
 	//     model_responded empty.
 	//   - a name longer than maxModelNameBytes should leave model_responded
 	//     empty rather than truncated.
+	//   - a name whose decoded length is within maxModelNameBytes but whose
+	//     escaped spelling is longer (200 bytes with 100 `\/`) should be
+	//     logged decoded; modelInObject measures the escaped spelling, so
+	//     model_responded currently comes back empty. A name that decodes to
+	//     more than maxModelNameBytes (invalid UTF-8 becoming 3-byte U+FFFD)
+	//     should leave it empty.
+	//   - a name with an invalid escape (`x\q`) should leave model_responded
+	//     empty.
 	//   - a send the admission queue preempts before any content, and sends
 	//     again, should log the model the re-sent answer names, not the
 	//     preempted one's.
@@ -2648,6 +2653,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a JSON-escaped model name as its decoded name", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"meta-llama\/Llama-3","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "meta-llama/Llama-3",
 			},
 		}
 	})
