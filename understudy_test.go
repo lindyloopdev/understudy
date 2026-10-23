@@ -2746,10 +2746,32 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the model a later chunk names when a stream's first chunks name none", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
 	// TODO: cases for the model a streamed response names:
-	//   - a stream whose first data: chunks name no model and a later one does
-	//     should log the later chunk's model (the first chunk to name one
-	//     settles it).
 	//   - a stream with no chunk naming a model (only `data: [DONE]`, or
 	//     payloads that are not JSON objects) should leave model_responded
 	//     empty, and so should a bare error text beginning with "d".
