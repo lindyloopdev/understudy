@@ -17,9 +17,11 @@ const maxModelNameBytes = 256
 // top-level "model" field. The name may differ from the model the attempt
 // requested: a backend may answer under a name the requested one has since
 // been aliased or replaced by. Names longer than maxModelNameBytes are not
-// recorded. A body that is not a JSON object — a streamed SSE response, a
-// bare error text — is settled by its first non-whitespace byte and never
-// scanned further.
+// recorded. A server-sent-events body whose first line is a data: line names
+// the model in the JSON object each data: chunk carries; the first chunk to
+// name one settles it. Any other body — a bare error text, or a stream
+// opening with a comment or another field line — is settled by its first
+// non-whitespace byte and never scanned further.
 type responseModelReader struct {
 	r     io.Reader
 	state modelScanState
@@ -39,6 +41,8 @@ type responseModelReader struct {
 	depth   int
 	inStr   bool
 	escaped bool
+	sse     bool
+	dataIdx int
 	// model is the model the body named, or "".
 	model string
 }
@@ -47,12 +51,16 @@ type modelScanState int
 
 const (
 	scanBodyStart modelScanState = iota
+	scanLineStart
+	scanDataKey
+	scanPayloadStart
 	scanMember
 	scanKey
 	scanColon
 	scanValueStart
 	scanString
 	scanBareValue
+	scanLine
 	scanDone
 )
 
@@ -67,6 +75,15 @@ func (m *responseModelReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// afterPayload returns the state to enter after one scanned JSON object: a
+// streamed body continues with its next event, a whole-body object is done.
+func (m *responseModelReader) afterPayload() modelScanState {
+	if m.sse {
+		return scanLine
+	}
+	return scanDone
+}
+
 // scan advances the read of one body byte.
 func (m *responseModelReader) scan(b byte) {
 	switch m.state {
@@ -74,9 +91,43 @@ func (m *responseModelReader) scan(b byte) {
 		switch {
 		case b == '{':
 			m.state = scanMember
+		case b == 'd':
+			m.dataIdx = 1
+			m.state = scanDataKey
 		case isJSONSpace(b):
 		default:
 			m.state = scanDone
+		}
+	case scanLineStart:
+		switch b {
+		case 'd':
+			m.dataIdx = 1
+			m.state = scanDataKey
+		case '\n':
+		default:
+			m.state = scanLine
+		}
+	case scanDataKey:
+		if b != dataField[m.dataIdx] {
+			m.state = m.afterPayload()
+			return
+		}
+		m.dataIdx++
+		if m.dataIdx == len(dataField) {
+			m.sse = true
+			m.state = scanPayloadStart
+		}
+	case scanPayloadStart:
+		switch b {
+		case '{':
+			m.state = scanMember
+		case ' ', '\t':
+		default:
+			m.state = scanLine
+		}
+	case scanLine:
+		if b == '\n' {
+			m.state = scanLineStart
 		}
 	case scanMember:
 		switch {
@@ -85,9 +136,9 @@ func (m *responseModelReader) scan(b byte) {
 			m.state = scanKey
 		case b == ',' || isJSONSpace(b):
 		case b == '}':
-			m.state = scanDone
+			m.state = m.afterPayload()
 		default:
-			m.state = scanDone
+			m.state = m.afterPayload()
 		}
 	case scanKey:
 		switch {
@@ -109,7 +160,7 @@ func (m *responseModelReader) scan(b byte) {
 			m.state = scanValueStart
 		case isJSONSpace(b):
 		default:
-			m.state = scanDone
+			m.state = m.afterPayload()
 		}
 	case scanValueStart:
 		switch {
@@ -175,7 +226,7 @@ func (m *responseModelReader) scanBareValue(b byte) {
 		m.depth++
 	case '}', ']':
 		if m.depth == 0 {
-			m.state = scanDone
+			m.state = m.afterPayload()
 			return
 		}
 		m.depth--

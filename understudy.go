@@ -1685,12 +1685,12 @@ type LogRecord struct {
 	// ModelRequested and ModelUpstream are the requested and upstream model names.
 	ModelRequested string
 	ModelUpstream  string
-	// ModelResponded is the model a JSON object response body names in its
-	// top-level "model" field, or "" when the body names none, is not a JSON
-	// object (a streamed response is not), or names one longer than 256 bytes.
-	//
-	// TODO(TODO.d/record-the-model-the-response-names.md): a streamed response's
-	// chunks name the model too.
+	// ModelResponded is the model the response names in its top-level
+	// "model" field — a JSON object body names it directly, a streamed
+	// response whose first line is a data: line names it in the JSON object
+	// each data: chunk carries — or "" when the response names none, names
+	// one longer than maxModelNameBytes, or is neither shape (a bare error
+	// text, or a stream opening with a comment or another field line).
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, or 0.
 	UpstreamStatus int
