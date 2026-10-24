@@ -2611,10 +2611,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a name of any length (a 10,000-character plain name, and an escaped
-	//     one of the same decoded length) should be logged whole in
-	//     model_responded; nothing bounds it but maxBodyPrefixBytes. A length
-	//     well past any plausible cap, so a raised cap would not pass.
 	//   - a name with an invalid escape (`x\q`) should leave model_responded
 	//     empty.
 	//   - a send the admission queue preempts before any content, and sends
@@ -2647,6 +2643,26 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a 10,000-character model name the response names whole", func(t *testing.T) test {
+		name := strings.Repeat("m", 10000)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"` + name + `","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": name,
 			},
 		}
 	})
