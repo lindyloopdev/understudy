@@ -2611,8 +2611,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a name with an invalid escape (`x\q`) should leave model_responded
-	//     empty.
 	//   - a send the admission queue preempts before any content, and sends
 	//     again, should log the model the re-sent answer names, not the
 	//     preempted one's.
@@ -2626,6 +2624,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//     currently comes back with model_responded empty; the bound is a
 	//     limitation of ModelResponded, and whether to scan the body as it
 	//     passes instead is undecided.
+	//   - a body whose "model" string carries a byte that is not valid UTF-8
+	//     should log the name with each such byte replaced by U+FFFD.
 	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2705,6 +2705,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "meta-llama/Llama-3",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the response names the model with an invalid JSON escape", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"x\q","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
 			},
 		}
 	})

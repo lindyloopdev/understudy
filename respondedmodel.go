@@ -2,7 +2,6 @@ package understudy
 
 import (
 	"bytes"
-	"encoding/json"
 	"encoding/json/jsontext"
 )
 
@@ -66,27 +65,17 @@ func modelInObject(obj []byte) string {
 		if err != nil {
 			return ""
 		}
-		if name.String() != "model" {
+		if name.String() != "model" || dec.PeekKind() != '"' {
 			if dec.SkipValue() != nil {
 				return ""
 			}
 			continue
 		}
-		value, err := dec.ReadValue()
+		value, err := dec.ReadToken()
 		if err != nil {
 			return ""
 		}
-		if value.Kind() != '"' {
-			continue
-		}
-		if !bytes.Contains(value, []byte{'\\'}) {
-			return string(value[1 : len(value)-1])
-		}
-		var decoded string
-		if json.Unmarshal(value, &decoded) != nil {
-			return ""
-		}
-		return decoded
+		return value.String()
 	}
 	return ""
 }
