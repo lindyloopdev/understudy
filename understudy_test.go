@@ -2624,8 +2624,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//     currently comes back with model_responded empty; the bound is a
 	//     limitation of ModelResponded, and whether to scan the body as it
 	//     passes instead is undecided.
-	//   - a body whose "model" string carries a byte that is not valid UTF-8
-	//     should log the name with each such byte replaced by U+FFFD.
 	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2705,6 +2703,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": "meta-llama/Llama-3",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a model name carrying a byte that is not valid UTF-8 with that byte replaced by the Unicode replacement character", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"bad-` + "\xff" + `-model","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "bad-\uFFFD-model",
 			},
 		}
 	})
