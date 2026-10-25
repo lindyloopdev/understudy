@@ -2614,9 +2614,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//   - a send the admission queue preempts before any content, and sends
 	//     again, should log the model the re-sent answer names, not the
 	//     preempted one's.
-	//   - a body longer than maxBodyPrefixBytes that names the model within its
-	//     first maxBodyPrefixBytes (a JSON object's early field, a stream's
-	//     first chunk) should log that model, and the client should still
+	//   - a body longer than maxBodyPrefixBytes: the client should still
 	//     receive the whole body.
 	//   - a body that names the model only after its first maxBodyPrefixBytes
 	//     (a long "choices" content ahead of a JSON object's "model", or
@@ -2651,6 +2649,28 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"` + name + `","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a body longer than maxBodyPrefixBytes names near its start", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		body := `{"id":"chatcmpl-1","model":"` + name + `","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}]}`
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
 				Header:     http.Header{},
 			}, nil
 		})
