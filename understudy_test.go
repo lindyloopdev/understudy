@@ -2616,9 +2616,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a send the admission queue preempts before any content, and sends
-	//     again, should log the model the re-sent answer names, not the
-	//     preempted one's.
 	//   - a body that names the model only after its first maxBodyPrefixBytes
 	//     (a long "choices" content ahead of a JSON object's "model", or
 	//     keep-alives and earlier chunks ahead of a stream's naming chunk)
@@ -7441,6 +7438,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		followed string
 		events   []string
 		sends    int
+		// wantRespondedModel maps a request's inbound message to the
+		// model_responded its log record must have, "" for none.
+		wantRespondedModel map[string]string
 		// handlerDelay is how long a first-content timeout's handler waits
 		// after its timer fires: zero, at once; more, a firing Stop can no
 		// longer prevent.
@@ -7451,12 +7451,13 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 	}
 
 	tests := testy.NewTable[test]()
-	tests.AddFunc("should give the client the answer to the re-sent attempt when a displaced attempt's target responds anyway", func(t *testing.T) test {
+	tests.AddFunc("should give the client the answer to the re-sent attempt, and report no model, when a displaced attempt's target responds anyway naming a model and the re-send names none", func(t *testing.T) test {
 		const (
 			olderMessage     = "the older session asks"
 			olderMessage2    = "the older session asks again"
 			displacedMessage = "the displaced session asks"
 			raced            = "displaced raced answer"
+			racedModel       = "displaced-model"
 			resent           = "displaced resent answer"
 		)
 		received := &receivedMessages{}
@@ -7467,9 +7468,14 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 			if received.count(inboundMessage) == 1 {
 				// The displaced attempt answers anyway: its cancel lands as
-				// the target is already returning a response.
+				// the target is already returning a response, one that names
+				// a model.
 				<-r.Context().Done()
-				return sseAnswer(raced), nil
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("data: {\"id\":%q,\"model\":%q}\n\n", raced, racedModel))),
+				}, nil
 			}
 			return sseAnswer(resent), nil
 		})
@@ -7478,7 +7484,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target directly
 				// and waits there headerless past its grace period.
@@ -7491,10 +7497,11 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 					admissionMsg("user", olderMessage2),
 				), after: admissionGracePeriod + time.Second},
 			},
-			wait:     time.Second,
-			followed: displacedMessage,
-			events:   []string{fmt.Sprintf(`{"id":%q}`, resent)},
-			sends:    2,
+			wait:               time.Second,
+			followed:           displacedMessage,
+			events:             []string{fmt.Sprintf(`{"id":%q}`, resent)},
+			sends:              2,
+			wantRespondedModel: map[string]string{displacedMessage: ""},
 		}
 	})
 	tests.AddFunc("should give the client the second send's answer when the target stays silent past the first-content timeout, which doubles for that send", func(t *testing.T) test {
@@ -7786,7 +7793,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target directly
 				// and waits there headerless past its grace period.
@@ -7932,7 +7939,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target at t=1s and
 				// waits there with no header; its timeout fires at t=61s.
@@ -8326,6 +8333,16 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 			if got := tt.received.count(tt.followed); got != tt.sends {
 				t.Errorf("the backend received %q %d times, want %d", tt.followed, got, tt.sends)
+			}
+			for label, want := range tt.wantRespondedModel {
+				rec, ok := poster.logRecord(label)
+				if !ok {
+					t.Errorf("%q was never answered", label)
+					continue
+				}
+				if rec.ModelResponded != want {
+					t.Errorf("%q's record reports %q as the model that responded, want %q", label, rec.ModelResponded, want)
+				}
 			}
 			if tt.check != nil {
 				tt.check()
