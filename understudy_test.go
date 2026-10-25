@@ -2876,6 +2876,27 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should leave model_responded empty when the stream's only data payload is a JSON string, not an object", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`data: "model"` + "\n\n")),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
 	tests.AddFunc("should leave model_responded empty when the response body is a bare error text", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2896,10 +2917,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		}
 	})
-
-	// TODO: cases for the model a streamed response names:
-	//   - a stream with no chunk naming a model (payloads that are not JSON
-	//     objects) should leave model_responded empty.
 
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
