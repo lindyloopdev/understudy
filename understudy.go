@@ -1673,7 +1673,8 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 // LogRecord carries the per-request telemetry only understudy can supply: which
 // backend and model served, the upstream status, the real error behind an
 // obfuscated body, the serving attempt's times to its response header and
-// first content, and how long the request waited in the admission queue.
+// first content, how long the request waited in the admission queue, and what
+// the request moved on from.
 // Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
@@ -1692,7 +1693,9 @@ type LogRecord struct {
 	// maxBodyPrefixBytes of the body, names a value that is not a plain
 	// string, or is neither shape (a bare error text).
 	ModelResponded string
-	// UpstreamStatus is the upstream response status, or 0.
+	// UpstreamStatus is the upstream response status, including when the
+	// request failed with one; understudy's own 502 when a transport failure
+	// left no response; or 0 when nothing was sent.
 	UpstreamStatus int
 	// TimeToResponseHeader is the time from sending the serving attempt's
 	// request upstream to that attempt's response header, or zero when no
@@ -1700,7 +1703,7 @@ type LogRecord struct {
 	TimeToResponseHeader time.Duration
 	// TimeToFirstContent is the time from sending the serving attempt's
 	// request upstream to that attempt's first content, or zero when no
-	// content was relayed.
+	// attempt relayed content.
 	TimeToFirstContent time.Duration
 	// TimeQueued is the total of every wait in understudy's queue
 	// before each send of the request to the target that served it,
@@ -1732,9 +1735,9 @@ type Attempt struct {
 	// ModelUpstream is the upstream model name the attempt requested. Empty when
 	// nothing was called, and for a listing, which names no model.
 	ModelUpstream string
-	// UpstreamStatus is the status the attempt answered with, or 0 when it never
-	// produced a response — a pre-header stall, a transport failure, or a backend
-	// that was never called.
+	// UpstreamStatus is the status the attempt answered with: understudy's own
+	// 502 when a transport failure left no response, or 0 for a backend that
+	// was never called.
 	UpstreamStatus int
 	// Err is the error that ended the attempt, carrying the upstream's own
 	// message where it sent one, or why the backend could not be used at all.

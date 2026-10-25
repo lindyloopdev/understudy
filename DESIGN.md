@@ -1066,7 +1066,8 @@ understudy's telemetry is understudy's, so its log record — the **`LogRecord`*
 lives in understudy and holds **only what understudy can supply**: which backend and model
 served, the upstream status, the real error behind an obfuscated body, and how long the serving
 attempt took to its response header and to its first content — timed from its send upstream,
-which only understudy sees. Generic HTTP facts — response status, byte counts — are deliberately
+which only understudy sees — together with what the request moved on from and the total time it
+waited in understudy's admission queue. Generic HTTP facts — response status, byte counts — are deliberately
 **not** on it: they are not understudy-specific, so putting them here would be understudy laying claim to facts that aren't its to own. A consumer
 installs a record with `WithLogCtx` (which derives and returns the context), understudy's
 handlers populate it in place, and the consumer reads it back as a **value copy** with

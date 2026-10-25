@@ -2568,10 +2568,16 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `no backend configured to serve model "gpt-4"`},
+		want: map[string]any{
+			"error":           `no backend configured to serve model "gpt-4"`,
+			"backend_name":    "",
+			"model_requested": "",
+			"model_upstream":  "",
+			"upstream_status": float64(0),
+		},
 	})
 
-	tests.AddFunc("should log upstream_status from successful chat-completions", func(t *testing.T) test {
+	tests.AddFunc("should log the backend, models and status of a request a backend served", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -2586,27 +2592,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				},
 			},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"upstream_status": float64(200)},
-		}
-	})
-
-	tests.AddFunc("should log model_requested and model_upstream from chat-completions", func(t *testing.T) test {
-		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
-				Header:     http.Header{},
-			}, nil
-		})
-		return test{
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-			}},
-			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want: map[string]any{
-				"model_requested": "openai/gpt-4",
-				"model_upstream":  "gpt-4",
-			},
 		}
 	})
 
@@ -2884,24 +2869,13 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `unknown logical model "gpt-4"`},
-	})
-
-	tests.AddFunc("should log backend_name from chat-completions", func(t *testing.T) test {
-		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
-				Header:     http.Header{},
-			}, nil
-		})
-		return test{
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-			}},
-			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"backend_name": "openai"},
-		}
+		want: map[string]any{
+			"error":           `unknown logical model "gpt-4"`,
+			"backend_name":    "",
+			"model_requested": "",
+			"model_upstream":  "",
+			"upstream_status": float64(0),
+		},
 	})
 
 	tests.AddFunc("should record the upstream status of an attempt that failed", func(t *testing.T) test {
@@ -2917,7 +2891,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"upstream_status": float64(http.StatusServiceUnavailable)},
+			want: map[string]any{
+				"upstream_status": float64(http.StatusServiceUnavailable),
+				"error":           "upstream returned status 503: upstream busy",
+			},
 		}
 	})
 
@@ -2958,8 +2935,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "b",
-				"excluded":     []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+				"backend_name":    "b",
+				"excluded":        []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+				"model_requested": "m",
+				"model_upstream":  "mb",
 			},
 		}
 	})
@@ -2983,8 +2962,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "good",
-				"excluded":     []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
+				"backend_name":    "good",
+				"excluded":        []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
+				"model_requested": "m",
 			},
 		}
 	})
@@ -3007,8 +2987,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "good",
-				"excluded":     []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+				"backend_name":    "good",
+				"excluded":        []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+				"model_requested": "m",
 			},
 		}
 	})
@@ -3049,6 +3030,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
 				},
+				"model_requested": "m",
+				"model_upstream":  "mg",
 			},
 		}
 	})
@@ -3086,6 +3069,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
 				},
+				"model_requested": "m",
+				"model_upstream":  "mg",
 			},
 		}
 	})
@@ -3108,7 +3093,11 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			method: http.MethodGet,
 			path:   "/v1/models",
 			want: map[string]any{
-				"excluded": []Attempt{{Backend: "broken", Err: errors.New("must provide base_url")}},
+				"excluded":        []Attempt{{Backend: "broken", Err: errors.New("must provide base_url")}},
+				"backend_name":    "",
+				"model_requested": "",
+				"model_upstream":  "",
+				"upstream_status": float64(0),
 			},
 		}
 	})
@@ -3130,6 +3119,11 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "a", ModelUpstream: "ma", Err: errors.New("must provide base_url")},
 					{Backend: "b", ModelUpstream: "mb", Err: errors.New(`provider type "nosuchprovider" has no registered handler`)},
 				},
+				"backend_name":    "",
+				"error":           "logical model \"m\" has no targets",
+				"model_requested": "",
+				"model_upstream":  "",
+				"upstream_status": float64(0),
 			},
 		}
 	})
@@ -3147,7 +3141,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"error": "upstream returned status 401: invalid api key"},
+			want: map[string]any{
+				"error":           "upstream returned status 401: invalid api key",
+				"upstream_status": float64(401),
+			},
 		}
 	})
 
@@ -3189,7 +3186,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + keepAliveDelay + eventDelay + dataDelay,
+				"time_to_first_content":   headerDelay + keepAliveDelay + eventDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3248,6 +3246,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"error":                   "upstream returned status 401: invalid api key",
 				"time_to_response_header": time.Duration(0),
 				"time_to_first_content":   time.Duration(0),
+				"upstream_status":         float64(401),
 			},
 		}
 	})
@@ -3284,7 +3283,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + dataDelay,
+				"time_to_first_content":   headerDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3334,8 +3334,12 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name":          "b",
-				"time_to_first_content": serveDelay,
+				"backend_name":            "b",
+				"time_to_first_content":   serveDelay,
+				"excluded":                []Attempt{{Backend: "a", Called: true, ModelUpstream: "ma", UpstreamStatus: 429, Err: errors.New("upstream returned status 429: slow down")}},
+				"model_requested":         "m",
+				"model_upstream":          "mb",
+				"time_to_response_header": serveDelay,
 			},
 		}
 	})
@@ -3373,7 +3377,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + headDelay + tailDelay + dataDelay,
+				"time_to_first_content":   headerDelay + headDelay + tailDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3401,7 +3406,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": time.Duration(0),
+				"time_to_first_content":   time.Duration(0),
+				"time_to_response_header": time.Second,
 			},
 		}
 	})
@@ -3436,7 +3442,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + whitespaceDelay + jsonDelay,
+				"time_to_first_content":   headerDelay + whitespaceDelay + jsonDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3472,7 +3479,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + firstDataDelay,
+				"time_to_first_content":   headerDelay + firstDataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3504,12 +3512,19 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"time_to_response_header": rec.TimeToResponseHeader,
 				"time_to_first_content":   rec.TimeToFirstContent,
 			}
-			for k := range got {
-				if _, present := tt.want[k]; !present {
-					delete(got, k)
-				}
+			want := map[string]any{
+				"error":                   "",
+				"backend_name":            "openai",
+				"model_requested":         "openai/gpt-4",
+				"model_upstream":          "gpt-4",
+				"model_responded":         "",
+				"upstream_status":         float64(200),
+				"excluded":                []Attempt(nil),
+				"time_to_response_header": time.Duration(0),
+				"time_to_first_content":   time.Duration(0),
 			}
-			if d := gocmp.Diff(tt.want, got, errorText); d != "" {
+			maps.Copy(want, tt.want)
+			if d := gocmp.Diff(want, got, errorText, cmpopts.EquateEmpty()); d != "" {
 				t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
 			}
 		})
@@ -3517,7 +3532,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 }
 
 // logRecordErrString renders a LogRecord error for comparison against a want map,
-// yielding "" for a nil error so a case that expects no error omits the key.
+// yielding "" for a nil error so a case expecting a nil error leaves the key unset.
 func logRecordErrString(err error) string {
 	if err == nil {
 		return ""
