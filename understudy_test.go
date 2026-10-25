@@ -2615,10 +2615,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
-	// TODO: cases for the model a response body names:
-	//   - a stream that names its model only after its first
-	//     maxBodyPrefixBytes (keep-alives and earlier chunks ahead of the
-	//     naming chunk) should leave model_responded empty.
 	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2885,6 +2881,29 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
 				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should report that no model responded when a stream names its model only after more than maxBodyPrefixBytes of it", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"" +
+				strings.Repeat("x", maxBodyPrefixBytes) + "\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"late-model\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
 			},
 		}
 	})

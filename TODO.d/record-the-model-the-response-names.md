@@ -8,9 +8,6 @@ name the serving attempt *requested*, which is not necessarily what served.
 
 ## Work
 
-- Tests: a response that names no `model` in model-inspecting cases leaves
-  `model_responded` empty (e.g. a non-streaming body without the field, or one
-  whose field appears after `maxBodyPrefixBytes`).
 - Scan the body as it passes, so a model named after `maxBodyPrefixBytes` is
   found, only if a response is seen to name it that late. The kept prefix
   bounds memory per request; a decoder-based scan buffers whole values (a
