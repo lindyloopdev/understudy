@@ -2844,6 +2844,32 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should log the model a stream too large to hold in full names in its first chunk", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"" + name + "\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"" +
+				strings.Repeat("x", maxBodyPrefixBytes) + "\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": name,
+			},
+		}
+	})
+
 	// TODO: cases for the model a streamed response names:
 	//   - a stream with no chunk naming a model (only `data: [DONE]`, or
 	//     payloads that are not JSON objects) should leave model_responded
