@@ -369,6 +369,23 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should proxy a non-streamed 200 response body longer than 64 KiB to the client whole, byte for byte", func(t *testing.T) test {
+		body := `{"id":"chatcmpl-1","model":"gpt-4o-2024-11-20","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}]}`
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusOK,
+			wantRawBody:         body,
+			wantResponseHeaders: http.Header{},
+		}
+	})
+
 	tests.AddFunc("should proxy every frame of a streamed 200 response body to client", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -1086,6 +1103,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 
 		if rr.Code != tt.wantStatus {
 			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
+		}
+		if tt.wantBody == "" && tt.wantRawBody == "" && len(tt.wantBodyContains) == 0 {
+			t.Error("case sets no body expectation: set wantBody, wantRawBody or wantBodyContains")
 		}
 		if tt.wantBody != "" {
 			if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
@@ -2599,8 +2619,6 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	//   - a send the admission queue preempts before any content, and sends
 	//     again, should log the model the re-sent answer names, not the
 	//     preempted one's.
-	//   - a body longer than maxBodyPrefixBytes: the client should still
-	//     receive the whole body.
 	//   - a body that names the model only after its first maxBodyPrefixBytes
 	//     (a long "choices" content ahead of a JSON object's "model", or
 	//     keep-alives and earlier chunks ahead of a stream's naming chunk)
