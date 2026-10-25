@@ -2855,10 +2855,31 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should leave model_responded empty when the response body is a bare error text", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("dial tcp: lookup backend: no such host")),
+				Header:     http.Header{"Content-Type": {"text/plain"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
 	// TODO: cases for the model a streamed response names:
 	//   - a stream with no chunk naming a model (only `data: [DONE]`, or
 	//     payloads that are not JSON objects) should leave model_responded
-	//     empty, and so should a bare error text beginning with "d".
+	//     empty.
 
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
