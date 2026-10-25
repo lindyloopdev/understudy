@@ -2616,12 +2616,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 	})
 
 	// TODO: cases for the model a response body names:
-	//   - a body that names the model only after its first maxBodyPrefixBytes
-	//     (a long "choices" content ahead of a JSON object's "model", or
-	//     keep-alives and earlier chunks ahead of a stream's naming chunk)
-	//     currently comes back with model_responded empty; the bound is a
-	//     limitation of ModelResponded, and whether to scan the body as it
-	//     passes instead is undecided.
+	//   - a stream that names its model only after its first
+	//     maxBodyPrefixBytes (keep-alives and earlier chunks ahead of the
+	//     naming chunk) should leave model_responded empty.
 	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -2681,6 +2678,28 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
 				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should report that no model responded when a body names its model only after more than maxBodyPrefixBytes of it", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		body := `{"id":"chatcmpl-1","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}],"model":"` + name + `"}`
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
 			},
 		}
 	})
