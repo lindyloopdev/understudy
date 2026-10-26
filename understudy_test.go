@@ -11867,7 +11867,7 @@ func TestChatCompletionsResponseInterceptorReceivesRequestMetadata(t *testing.T)
 				srv.ServeHTTP(httptest.NewRecorder(), req)
 			}
 
-			if d := gocmp.Diff(tt.want, got); d != "" {
+			if d := gocmp.Diff(tt.want, got, cmpopts.IgnoreUnexported(RequestMetadata{})); d != "" {
 				t.Errorf("served target: %s", d)
 			}
 		})
@@ -11964,6 +11964,10 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 		}
 	})
 
+	// TODO(TODO.d/understudy-response-interceptor.md): should release the upstream body
+	// when the interceptor leaves resp.Body untouched — a row here beside the swapped-body
+	// one, with a trackingBody upstream, asserting it is closed after ServeHTTP.
+
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
@@ -11984,6 +11988,72 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 		srv.ServeHTTP(tt.rr, req)
 		tt.check()
 	})
+}
+
+func TestShouldCallTheInterceptorsCompletionCallbackOnceWithTheUpstreamNamedModelAfterTheClientHasTheResponse(t *testing.T) {
+	t.Parallel()
+
+	upstreamBody := `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
+	relayedBody := `{"id":"chatcmpl-relayed","choices":[]}`
+
+	client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	rr := httptest.NewRecorder()
+	var calls int
+	var named, clientBodyAtCall string
+	srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+		return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+	}}, WithLogger(testLogger(t)), WithResponseInterceptor(func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+		_, _ = io.ReadAll(resp.Body)
+		served.OnModelResponded(func(model string) {
+			calls++
+			named = model
+			clientBodyAtCall = rr.Body.String()
+		})
+		resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+		return nil
+	}))
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer user-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.ServeHTTP(rr, req)
+
+	if got := rr.Body.String(); got != relayedBody {
+		t.Errorf("client body: got %q, want the interceptor's rewrite %q", got, relayedBody)
+	}
+	if calls != 1 {
+		t.Errorf("completion callback fired %d times, want exactly once", calls)
+	}
+	if named != "gpt-4-1106-preview" {
+		t.Errorf("completion callback received model %q, want the upstream-named %q", named, "gpt-4-1106-preview")
+	}
+	if clientBodyAtCall != relayedBody {
+		t.Errorf("completion callback fired before the client had the response: client body then was %q, want the full %q", clientBodyAtCall, relayedBody)
+	}
+
+	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
+	// the upstream-named model when the interceptor swaps the body without reading the
+	// original, or reads only part of it. Today the model comes only from bytes the
+	// interceptor reads, so the callback gets "" (and ModelResponded is lost). The test
+	// is this one with an interceptor that does not io.ReadAll before swapping; the fix
+	// drains the unread upstream bytes up to maxBodyPrefixBytes before closing.
+	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
+	// once with "" when the upstream response names no model — another case of this test.
+	// TODO(TODO.d/understudy-response-interceptor.md): should relay the response, release
+	// the admission slot, and log at ERROR when the interceptor's completion callback
+	// panics, rather than trusting the callback not to — a callback that panics.
 }
 
 // Remaining behavior for the response-interceptor seam.

@@ -553,6 +553,30 @@ type RequestMetadata struct {
 	Backend string
 	Model   string
 	Token   string
+
+	// completion backs [RequestMetadata.OnModelResponded]; it is nil when the
+	// send is not armed, making a registration a no-op.
+	completion *respondedModelCompletion
+}
+
+// respondedModelCompletion holds the model-completion callback registered
+// through [RequestMetadata.OnModelResponded].
+type respondedModelCompletion struct {
+	onModelResponded func(model string)
+}
+
+// OnModelResponded registers fn as the send's completion callback. understudy
+// calls it once, when the send's relay ends, with the model the upstream
+// response named — read from the upstream's own bytes, whatever the
+// interceptor relays in their place — or "" when it named none. A relay that
+// ends in an error, such as a client disconnect, still calls it, with the model
+// found in the bytes read up to then. A send the admission queue displaced
+// before any content left never fires it; only the send that answered does. On a RequestMetadata whose
+// completion is not armed, OnModelResponded is a no-op.
+func (m RequestMetadata) OnModelResponded(fn func(model string)) {
+	if m.completion != nil {
+		m.completion.onModelResponded = fn
+	}
 }
 
 // ResponseInterceptor may mutate an upstream *http.Response in place before
@@ -2848,9 +2872,10 @@ func (a *attempt) send() (acquired bool, err error) {
 }
 
 // relay answers the client from a send whose header has arrived: it strips
-// sensitive headers, runs the response interceptor, and copies the body,
-// reading the model it names into the log record, and withholding the
-// upstream's status, headers, and pre-content bytes until its first content.
+// sensitive headers, runs the response interceptor, and copies the body while
+// withholding the upstream's status, headers, and pre-content bytes until its
+// first content. After the copy, it records the model the upstream named into
+// the log and passes it to the interceptor's completion callback.
 // It reports whether the send ended before any content without failing —
 // displaced, or cut by the first-content timeout — in which case
 // nothing reached the client and the request is to be sent again; otherwise
@@ -2861,7 +2886,14 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 		resp.Header.Del(h)
 	}
 
+	// Tee below the interceptor's swap: the kept prefix holds the upstream's own bytes.
+	var body bodyPrefix
+	resp.Body = &teeBodyPrefix{r: io.TeeReader(resp.Body, &body), closer: resp.Body}
+
+	var completion *respondedModelCompletion
 	if a.s.interceptor != nil {
+		completion = &respondedModelCompletion{}
+		served.completion = completion
 		if err := a.s.interceptor(a.r.Context(), served, resp); err != nil {
 			_ = resp.Body.Close()
 			a.pend.queue.finish(a.pend)
@@ -2871,10 +2903,9 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	}
 
 	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
-	var body bodyPrefix
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
-		r: io.TeeReader(idle, &body),
+		r: idle,
 		content: func() {
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
@@ -2895,9 +2926,13 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
 	// Recorded only after the preemption check above, so a send the queue
-	// preempted contributes nothing; its replacement is read afresh.
-	if model := modelNamedBy(body.b); model != "" {
+	// preempted contributes nothing.
+	model := modelNamedBy(body.b)
+	if model != "" {
 		setLogRespondedModel(a.r.Context(), model)
+	}
+	if completion != nil && completion.onModelResponded != nil {
+		completion.onModelResponded(model)
 	}
 	return false, err
 }
