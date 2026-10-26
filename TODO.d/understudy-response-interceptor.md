@@ -19,13 +19,15 @@ on swap are built and covered. Remaining:
   (alongside the served model) — deferred until lindy's provenance interceptor actually
   reads it, so the field lands with a consumer rather than ahead of one. (The interceptor
   owns `Content-Encoding` consistency; understudy does not transcode.)
-- Give the interceptor the model the response names (see
-  [[record-the-model-the-response-names]]) once its reads of the body reach it,
-  so lindy's served-request record can name what the upstream reports
-  answered. `served` is passed by value and `RequestMetadata` is compared in
-  `TestChatCompletionsResponseInterceptorReceivesRequestMetadata`, so the
-  accessor's shape needs settling. A non-streamed JSON body first, then a
-  streamed one.
+- Give the interceptor the completion callback that delivers the model the
+  response names (see [[record-the-model-the-response-names]]), so lindy's
+  served-request record can name what the upstream reports answered.
+  The hook rides on `RequestMetadata`; the `ResponseInterceptor` signature is
+  unchanged. `RequestMetadata` is compared in
+  `TestChatCompletionsResponseInterceptorReceivesRequestMetadata`, which the
+  hook will break. A non-streamed JSON body first, then a displaced and
+  re-sent send, a streamed body, and a relay that errors. Lindy's `Intercept`
+  then moves its record write into the callback.
 
 Deferred (not now): stripping outbound `Accept-Encoding` when an interceptor is active
 so responses arrive uncompressed — a transfer-size tradeoff, only if the hook fighting

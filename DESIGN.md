@@ -891,10 +891,16 @@ by the tenant's own bearer token (the same one that selects its data-plane confi
 tenant reads only its own records. understudy never learns provenance exists — it gains a
 mechanism (intervene on a response), not the policy. The interceptor's `served`
 argument carries the target that actually handled the request — its `(backend, model)`
-even after a failover, the model the response names, once the interceptor has read
-the response body past the point that names it, and the token — so
+even after a failover, and the token — so
 lindy's interceptor attributes the response to what truly ran and files it under the
-right tenant. The empirical basis — which
+right tenant. The model the response names is not an argument: it is unknown until the
+body has been relayed, so `served` offers the interceptor a **completion callback**
+instead. understudy calls it once, after the final send's body is fully relayed, with
+the model the upstream response named — read from the upstream's bytes, whatever the
+interceptor relays in their place — or empty when it named none. A send the admission
+queue displaced before any content left never fires it; only the send that answered
+does. There is no way to read the model early, so a caller cannot mistake "not seen
+yet" for "never named". The empirical basis — which
 fields survive opencode, and why the model-identity channels cannot — is
 [notes/2026-07-12-served-model-provenance-join-key.md](notes/2026-07-12-served-model-provenance-join-key.md).
 
@@ -1093,7 +1099,7 @@ whose concern it is; the mount reads whichever the served route populated and em
 entry.
 
 This log record is understudy's own, distinct from the served-model provenance
-`RequestMetadata` (§Served-model provenance): provenance is a per-request broadcast for
+record (§Served-model provenance): provenance is a per-request broadcast for
 downstream joins/cost, while the `LogRecord` snapshot is what the mount projects to the log
 line. They overlap on backend/model but answer to different consumers, so they stay separate.
 

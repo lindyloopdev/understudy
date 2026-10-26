@@ -2849,9 +2849,10 @@ func (a *attempt) send() (acquired bool, err error) {
 
 // relay answers the client from a send whose header has arrived: it strips
 // sensitive headers, runs the response interceptor, and copies the body,
-// withholding the upstream's status, headers, and pre-content bytes until its
-// first content. It reports whether the send ended before any content without
-// failing — displaced, or cut by the first-content timeout — in which case
+// reading the model it names into the log record, and withholding the
+// upstream's status, headers, and pre-content bytes until its first content.
+// It reports whether the send ended before any content without failing —
+// displaced, or cut by the first-content timeout — in which case
 // nothing reached the client and the request is to be sent again; otherwise
 // the attempt is finished at its target and err is how the relay ended.
 func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend bool, err error) {
