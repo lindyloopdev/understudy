@@ -891,8 +891,10 @@ by the tenant's own bearer token (the same one that selects its data-plane confi
 tenant reads only its own records. understudy never learns provenance exists — it gains a
 mechanism (intervene on a response), not the policy. The interceptor's `served`
 argument carries the target that actually handled the request — its `(backend, model)`
-even after a failover, plus the requested model and token — so lindy's interceptor
-attributes the response to what truly ran and files it under the right tenant. The empirical basis — which
+even after a failover, the model the response names, once the interceptor has read
+the response body past the point that names it, and the token — so
+lindy's interceptor attributes the response to what truly ran and files it under the
+right tenant. The empirical basis — which
 fields survive opencode, and why the model-identity channels cannot — is
 [notes/2026-07-12-served-model-provenance-join-key.md](notes/2026-07-12-served-model-provenance-join-key.md).
 

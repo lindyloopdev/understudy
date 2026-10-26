@@ -28,9 +28,9 @@ func (p *bodyPrefix) Write(b []byte) (int, error) {
 // "model" field, or "". The name may differ from the model the attempt
 // requested: a backend may answer under a name the requested one has since
 // been aliased or replaced by. A JSON object body names it directly; a
-// server-sent-events body names it in the JSON object each data: line
-// carries, and the first line to name one settles it. Any other body names
-// none. body may be truncated; only what it holds is read.
+// server-sent-events body names it in a chunk whose "data:" payload is a JSON
+// object with that field, and the first such chunk to name one settles it. Any
+// other body names none. body may be truncated; only what it holds is read.
 func modelNamedBy(body []byte) string {
 	if trimmed := bytes.TrimLeft(body, " \t\r\n"); bytes.HasPrefix(trimmed, []byte("{")) {
 		return modelInObject(trimmed)
