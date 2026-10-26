@@ -1673,7 +1673,8 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 // LogRecord carries the per-request telemetry only understudy can supply: which
 // backend and model served, the upstream status, the real error behind an
 // obfuscated body, the serving attempt's times to its response header and
-// first content, and how long the request waited in the admission queue.
+// first content, how long the request waited in the admission queue, and what
+// the request moved on from.
 // Generic HTTP facts (response status, byte counts) are
 // deliberately excluded — they are not understudy's to record. Install with
 // WithLogCtx and read back with LogRecordFromContext.
@@ -1685,7 +1686,16 @@ type LogRecord struct {
 	// ModelRequested and ModelUpstream are the requested and upstream model names.
 	ModelRequested string
 	ModelUpstream  string
-	// UpstreamStatus is the upstream response status, or 0.
+	// ModelResponded is the model the response names in its top-level
+	// "model" field — a JSON object body names it directly, a streamed
+	// response names it in the JSON object each data: chunk carries —
+	// or "" when the response names none, names it only after the first
+	// maxBodyPrefixBytes of the body, names a value that is not a plain
+	// string, or is neither shape (a bare error text).
+	ModelResponded string
+	// UpstreamStatus is the upstream response status, including when the
+	// request failed with one; understudy's own 502 when a transport failure
+	// left no response; or 0 when nothing was sent.
 	UpstreamStatus int
 	// TimeToResponseHeader is the time from sending the serving attempt's
 	// request upstream to that attempt's response header, or zero when no
@@ -1693,7 +1703,7 @@ type LogRecord struct {
 	TimeToResponseHeader time.Duration
 	// TimeToFirstContent is the time from sending the serving attempt's
 	// request upstream to that attempt's first content, or zero when no
-	// content was relayed.
+	// attempt relayed content.
 	TimeToFirstContent time.Duration
 	// TimeQueued is the total of every wait in understudy's queue
 	// before each send of the request to the target that served it,
@@ -1725,9 +1735,9 @@ type Attempt struct {
 	// ModelUpstream is the upstream model name the attempt requested. Empty when
 	// nothing was called, and for a listing, which names no model.
 	ModelUpstream string
-	// UpstreamStatus is the status the attempt answered with, or 0 when it never
-	// produced a response — a pre-header stall, a transport failure, or a backend
-	// that was never called.
+	// UpstreamStatus is the status the attempt answered with: understudy's own
+	// 502 when a transport failure left no response, or 0 for a backend that
+	// was never called.
 	UpstreamStatus int
 	// Err is the error that ended the attempt, carrying the upstream's own
 	// message where it sent one, or why the backend could not be used at all.
@@ -1776,6 +1786,12 @@ func setLogModels(ctx context.Context, requested, upstream string) {
 	if h := logCtxFrom(ctx); h != nil {
 		h.ModelRequested = requested
 		h.ModelUpstream = upstream
+	}
+}
+
+func setLogRespondedModel(ctx context.Context, model string) {
+	if h := logCtxFrom(ctx); h != nil {
+		h.ModelResponded = model
 	}
 }
 
@@ -2854,9 +2870,10 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	}
 
 	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
+	var body bodyPrefix
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
-		r: idle,
+		r: io.TeeReader(idle, &body),
 		content: func() {
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
@@ -2876,6 +2893,11 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	held.commit()
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
+	// Recorded only after the preemption check above, so a send the queue
+	// preempted contributes nothing; its replacement is read afresh.
+	if model := modelNamedBy(body.b); model != "" {
+		setLogRespondedModel(a.r.Context(), model)
+	}
 	return false, err
 }
 

@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  GOPHERLINTVERSION: "v1.26.3"
+  GOPHERLINTVERSION: "v1.27.1"
 
 jobs:
   test:

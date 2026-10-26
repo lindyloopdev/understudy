@@ -369,6 +369,23 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should proxy a non-streamed 200 response body longer than 64 KiB to the client whole, byte for byte", func(t *testing.T) test {
+		body := `{"id":"chatcmpl-1","model":"gpt-4o-2024-11-20","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}]}`
+		return test{
+			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     http.Header{},
+				}, nil
+			}, nil),
+			wantStatus:          http.StatusOK,
+			wantRawBody:         body,
+			wantResponseHeaders: http.Header{},
+		}
+	})
+
 	tests.AddFunc("should proxy every frame of a streamed 200 response body to client", func(t *testing.T) test {
 		return test{
 			server: defaultServer(t, func(*http.Request) (*http.Response, error) {
@@ -1086,6 +1103,9 @@ func TestChatCompletionsHandlesResponse(t *testing.T) {
 
 		if rr.Code != tt.wantStatus {
 			t.Errorf("unexpected status: got %d, want %d", rr.Code, tt.wantStatus)
+		}
+		if tt.wantBody == "" && tt.wantRawBody == "" && len(tt.wantBodyContains) == 0 {
+			t.Error("case sets no body expectation: set wantBody, wantRawBody or wantBodyContains")
 		}
 		if tt.wantBody != "" {
 			if d := testy.DiffJSON([]byte(tt.wantBody), rr.Body.Bytes()); d != nil {
@@ -2568,10 +2588,16 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `no backend configured to serve model "gpt-4"`},
+		want: map[string]any{
+			"error":           `no backend configured to serve model "gpt-4"`,
+			"backend_name":    "",
+			"model_requested": "",
+			"model_upstream":  "",
+			"upstream_status": float64(0),
+		},
 	})
 
-	tests.AddFunc("should log upstream_status from successful chat-completions", func(t *testing.T) test {
+	tests.AddFunc("should log the backend, models and status of a request a backend served", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -2586,15 +2612,14 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				},
 			},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"upstream_status": float64(200)},
 		}
 	})
 
-	tests.AddFunc("should log model_requested and model_upstream from chat-completions", func(t *testing.T) test {
+	tests.AddFunc("should log the model the response names", func(t *testing.T) test {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"gpt-4o-2024-11-20","choices":[]}`)),
 				Header:     http.Header{},
 			}, nil
 		})
@@ -2606,6 +2631,342 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			want: map[string]any{
 				"model_requested": "openai/gpt-4",
 				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a 10,000-character model name the response names whole", func(t *testing.T) test {
+		name := strings.Repeat("m", 10000)
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"` + name + `","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a body longer than maxBodyPrefixBytes names near its start", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		body := `{"id":"chatcmpl-1","model":"` + name + `","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}]}`
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should report that no model responded when a body names its model only after more than maxBodyPrefixBytes of it", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		body := `{"id":"chatcmpl-1","choices":[{"message":{"content":"` +
+			strings.Repeat("x", maxBodyPrefixBytes) + `"}}],"model":"` + name + `"}`
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the response names the model as a number", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":42,"choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a JSON-escaped model name as its decoded name", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"meta-llama\/Llama-3","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "meta-llama/Llama-3",
+			},
+		}
+	})
+
+	tests.AddFunc("should log a model name carrying a byte that is not valid UTF-8 with that byte replaced by the Unicode replacement character", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"bad-` + "\xff" + `-model","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "bad-\uFFFD-model",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the response names the model with an invalid JSON escape", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"x\q","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a streamed response names", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a stream opening with a comment or event: line names", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := ": keep-alive\n\n" +
+				"event: message\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a later chunk names when a stream's first chunks name none", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "gpt-4o-2024-11-20",
+			},
+		}
+	})
+
+	tests.AddFunc("should log the model a stream too large to hold in full names in its first chunk", func(t *testing.T) test {
+		const name = "gpt-4o-2024-11-20"
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"model\":\"" + name + "\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"" +
+				strings.Repeat("x", maxBodyPrefixBytes) + "\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": name,
+			},
+		}
+	})
+
+	tests.AddFunc("should report that no model responded when a stream names its model only after more than maxBodyPrefixBytes of it", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"" +
+				strings.Repeat("x", maxBodyPrefixBytes) + "\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-1\",\"model\":\"late-model\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the stream's only event is [DONE]", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the stream's only data payload is a JSON string, not an object", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`data: "model"` + "\n\n")),
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
+			},
+		}
+	})
+
+	tests.AddFunc("should leave model_responded empty when the response body is a bare error text", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("dial tcp: lookup backend: no such host")),
+				Header:     http.Header{"Content-Type": {"text/plain"}},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_requested": "openai/gpt-4",
+				"model_upstream":  "gpt-4",
+				"model_responded": "",
 			},
 		}
 	})
@@ -2619,24 +2980,13 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			},
 		},
 		requestBody: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-		want:        map[string]any{"error": `unknown logical model "gpt-4"`},
-	})
-
-	tests.AddFunc("should log backend_name from chat-completions", func(t *testing.T) test {
-		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","choices":[]}`)),
-				Header:     http.Header{},
-			}, nil
-		})
-		return test{
-			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-			}},
-			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"backend_name": "openai"},
-		}
+		want: map[string]any{
+			"error":           `unknown logical model "gpt-4"`,
+			"backend_name":    "",
+			"model_requested": "",
+			"model_upstream":  "",
+			"upstream_status": float64(0),
+		},
 	})
 
 	tests.AddFunc("should record the upstream status of an attempt that failed", func(t *testing.T) test {
@@ -2652,7 +3002,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"upstream_status": float64(http.StatusServiceUnavailable)},
+			want: map[string]any{
+				"upstream_status": float64(http.StatusServiceUnavailable),
+				"error":           "upstream returned status 503: upstream busy",
+			},
 		}
 	})
 
@@ -2693,8 +3046,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "b",
-				"excluded":     []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+				"backend_name":    "b",
+				"excluded":        []Attempt{{Backend: "a", ModelUpstream: "ma", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true}},
+				"model_requested": "m",
+				"model_upstream":  "mb",
 			},
 		}
 	})
@@ -2718,8 +3073,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "good",
-				"excluded":     []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
+				"backend_name":    "good",
+				"excluded":        []Attempt{{Backend: "broken", ModelUpstream: "gpt-4", Err: errors.New("must provide base_url")}},
+				"model_requested": "m",
 			},
 		}
 	})
@@ -2742,8 +3098,9 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name": "good",
-				"excluded":     []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+				"backend_name":    "good",
+				"excluded":        []Attempt{{Backend: "ghost", ModelUpstream: "gpt-4", Err: errors.New("no such backend")}},
+				"model_requested": "m",
 			},
 		}
 	})
@@ -2784,6 +3141,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
 				},
+				"model_requested": "m",
+				"model_upstream":  "mg",
 			},
 		}
 	})
@@ -2821,6 +3180,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "limited", ModelUpstream: "ml", UpstreamStatus: http.StatusTooManyRequests, Err: errors.New("upstream returned status 429: slow down"), Called: true},
 					{Backend: "broken", ModelUpstream: "mb", Err: errors.New("must provide base_url")},
 				},
+				"model_requested": "m",
+				"model_upstream":  "mg",
 			},
 		}
 	})
@@ -2843,7 +3204,11 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			method: http.MethodGet,
 			path:   "/v1/models",
 			want: map[string]any{
-				"excluded": []Attempt{{Backend: "broken", Err: errors.New("must provide base_url")}},
+				"excluded":        []Attempt{{Backend: "broken", Err: errors.New("must provide base_url")}},
+				"backend_name":    "",
+				"model_requested": "",
+				"model_upstream":  "",
+				"upstream_status": float64(0),
 			},
 		}
 	})
@@ -2865,6 +3230,11 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 					{Backend: "a", ModelUpstream: "ma", Err: errors.New("must provide base_url")},
 					{Backend: "b", ModelUpstream: "mb", Err: errors.New(`provider type "nosuchprovider" has no registered handler`)},
 				},
+				"backend_name":    "",
+				"error":           "logical model \"m\" has no targets",
+				"model_requested": "",
+				"model_upstream":  "",
+				"upstream_status": float64(0),
 			},
 		}
 	})
@@ -2882,7 +3252,10 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
-			want:        map[string]any{"error": "upstream returned status 401: invalid api key"},
+			want: map[string]any{
+				"error":           "upstream returned status 401: invalid api key",
+				"upstream_status": float64(401),
+			},
 		}
 	})
 
@@ -2924,7 +3297,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + keepAliveDelay + eventDelay + dataDelay,
+				"time_to_first_content":   headerDelay + keepAliveDelay + eventDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -2983,6 +3357,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"error":                   "upstream returned status 401: invalid api key",
 				"time_to_response_header": time.Duration(0),
 				"time_to_first_content":   time.Duration(0),
+				"upstream_status":         float64(401),
 			},
 		}
 	})
@@ -3019,7 +3394,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + dataDelay,
+				"time_to_first_content":   headerDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3069,8 +3445,12 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"backend_name":          "b",
-				"time_to_first_content": serveDelay,
+				"backend_name":            "b",
+				"time_to_first_content":   serveDelay,
+				"excluded":                []Attempt{{Backend: "a", Called: true, ModelUpstream: "ma", UpstreamStatus: 429, Err: errors.New("upstream returned status 429: slow down")}},
+				"model_requested":         "m",
+				"model_upstream":          "mb",
+				"time_to_response_header": serveDelay,
 			},
 		}
 	})
@@ -3108,7 +3488,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + headDelay + tailDelay + dataDelay,
+				"time_to_first_content":   headerDelay + headDelay + tailDelay + dataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3136,7 +3517,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": time.Duration(0),
+				"time_to_first_content":   time.Duration(0),
+				"time_to_response_header": time.Second,
 			},
 		}
 	})
@@ -3171,7 +3553,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + whitespaceDelay + jsonDelay,
+				"time_to_first_content":   headerDelay + whitespaceDelay + jsonDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3207,7 +3590,8 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 			}},
 			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			want: map[string]any{
-				"time_to_first_content": headerDelay + firstDataDelay,
+				"time_to_first_content":   headerDelay + firstDataDelay,
+				"time_to_response_header": headerDelay,
 			},
 		}
 	})
@@ -3233,17 +3617,25 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 				"backend_name":            rec.BackendName,
 				"model_requested":         rec.ModelRequested,
 				"model_upstream":          rec.ModelUpstream,
+				"model_responded":         rec.ModelResponded,
 				"upstream_status":         float64(rec.UpstreamStatus),
 				"excluded":                rec.Excluded,
 				"time_to_response_header": rec.TimeToResponseHeader,
 				"time_to_first_content":   rec.TimeToFirstContent,
 			}
-			for k := range got {
-				if _, present := tt.want[k]; !present {
-					delete(got, k)
-				}
+			want := map[string]any{
+				"error":                   "",
+				"backend_name":            "openai",
+				"model_requested":         "openai/gpt-4",
+				"model_upstream":          "gpt-4",
+				"model_responded":         "",
+				"upstream_status":         float64(200),
+				"excluded":                []Attempt(nil),
+				"time_to_response_header": time.Duration(0),
+				"time_to_first_content":   time.Duration(0),
 			}
-			if d := gocmp.Diff(tt.want, got, errorText); d != "" {
+			maps.Copy(want, tt.want)
+			if d := gocmp.Diff(want, got, errorText, cmpopts.EquateEmpty()); d != "" {
 				t.Errorf("LogRecord mismatch (-want +got):\n%s", d)
 			}
 		})
@@ -3251,7 +3643,7 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 }
 
 // logRecordErrString renders a LogRecord error for comparison against a want map,
-// yielding "" for a nil error so a case that expects no error omits the key.
+// yielding "" for a nil error so a case expecting a nil error leaves the key unset.
 func logRecordErrString(err error) string {
 	if err == nil {
 		return ""
@@ -7084,6 +7476,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		followed string
 		events   []string
 		sends    int
+		// wantRespondedModel maps a request's inbound message to the
+		// model_responded its log record must have, "" for none.
+		wantRespondedModel map[string]string
 		// handlerDelay is how long a first-content timeout's handler waits
 		// after its timer fires: zero, at once; more, a firing Stop can no
 		// longer prevent.
@@ -7094,12 +7489,13 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 	}
 
 	tests := testy.NewTable[test]()
-	tests.AddFunc("should give the client the answer to the re-sent attempt when a displaced attempt's target responds anyway", func(t *testing.T) test {
+	tests.AddFunc("should give the client the answer to the re-sent attempt, and report no model, when a displaced attempt's target responds anyway naming a model and the re-send names none", func(t *testing.T) test {
 		const (
 			olderMessage     = "the older session asks"
 			olderMessage2    = "the older session asks again"
 			displacedMessage = "the displaced session asks"
 			raced            = "displaced raced answer"
+			racedModel       = "displaced-model"
 			resent           = "displaced resent answer"
 		)
 		received := &receivedMessages{}
@@ -7110,9 +7506,14 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 			if received.count(inboundMessage) == 1 {
 				// The displaced attempt answers anyway: its cancel lands as
-				// the target is already returning a response.
+				// the target is already returning a response, one that names
+				// a model.
 				<-r.Context().Done()
-				return sseAnswer(raced), nil
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("data: {\"id\":%q,\"model\":%q}\n\n", raced, racedModel))),
+				}, nil
 			}
 			return sseAnswer(resent), nil
 		})
@@ -7121,7 +7522,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target directly
 				// and waits there headerless past its grace period.
@@ -7134,10 +7535,11 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 					admissionMsg("user", olderMessage2),
 				), after: admissionGracePeriod + time.Second},
 			},
-			wait:     time.Second,
-			followed: displacedMessage,
-			events:   []string{fmt.Sprintf(`{"id":%q}`, resent)},
-			sends:    2,
+			wait:               time.Second,
+			followed:           displacedMessage,
+			events:             []string{fmt.Sprintf(`{"id":%q}`, resent)},
+			sends:              2,
+			wantRespondedModel: map[string]string{displacedMessage: ""},
 		}
 	})
 	tests.AddFunc("should give the client the second send's answer when the target stays silent past the first-content timeout, which doubles for that send", func(t *testing.T) test {
@@ -7429,7 +7831,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target directly
 				// and waits there headerless past its grace period.
@@ -7575,7 +7977,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
-				// displaced session, which has not arrived yet.
+				// displaced session.
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
 				// The displaced session's turn reaches the target at t=1s and
 				// waits there with no header; its timeout fires at t=61s.
@@ -7969,6 +8371,16 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 			if got := tt.received.count(tt.followed); got != tt.sends {
 				t.Errorf("the backend received %q %d times, want %d", tt.followed, got, tt.sends)
+			}
+			for label, want := range tt.wantRespondedModel {
+				rec, ok := poster.logRecord(label)
+				if !ok {
+					t.Errorf("%q was never answered", label)
+					continue
+				}
+				if rec.ModelResponded != want {
+					t.Errorf("%q's record reports %q as the model that responded, want %q", label, rec.ModelResponded, want)
+				}
 			}
 			if tt.check != nil {
 				tt.check()
