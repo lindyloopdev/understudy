@@ -568,11 +568,13 @@ type respondedModelCompletion struct {
 // OnModelResponded registers fn as the send's completion callback. understudy
 // calls it once, when the send's relay ends, with the model the upstream
 // response named — read from the upstream's own bytes, whatever the
-// interceptor relays in their place — or "" when it named none. A relay that
-// ends in an error, such as a client disconnect, still calls it, with the model
-// found in the bytes read up to then. A send the admission queue displaced
-// before any content left never fires it; only the send that answered does. On a RequestMetadata whose
-// completion is not armed, OnModelResponded is a no-op.
+// interceptor relays in their place — or "" when it named none. A relay whose
+// body copy ends in an error, such as a client disconnect, still calls it, with
+// the model found in the bytes read up to then; one whose interceptor returns
+// an error does not. A send the admission queue displaced
+// before any content left never fires it; only the send that answered does.
+// On a RequestMetadata whose completion is not armed, OnModelResponded is a
+// no-op.
 func (m RequestMetadata) OnModelResponded(fn func(model string)) {
 	if m.completion != nil {
 		m.completion.onModelResponded = fn
@@ -2888,7 +2890,8 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 
 	// Tee below the interceptor's swap: the kept prefix holds the upstream's own bytes.
 	var body bodyPrefix
-	resp.Body = &teeBodyPrefix{r: io.TeeReader(resp.Body, &body), closer: resp.Body}
+	upstream := &teeBodyPrefix{r: io.TeeReader(resp.Body, &body), closer: resp.Body}
+	resp.Body = upstream
 
 	var completion *respondedModelCompletion
 	if a.s.interceptor != nil {
@@ -2923,6 +2926,10 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 		return true, nil
 	}
 	held.commit()
+	// Drain the upstream bytes a swapped body skips, so the model they name is still read.
+	if resp.Body != upstream {
+		_, _ = io.CopyN(io.Discard, upstream, int64(body.room()))
+	}
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
 	// Recorded only after the preemption check above, so a send the queue

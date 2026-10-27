@@ -11990,70 +11990,137 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 	})
 }
 
-func TestShouldCallTheInterceptorsCompletionCallbackOnceWithTheUpstreamNamedModelAfterTheClientHasTheResponse(t *testing.T) {
+func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	t.Parallel()
 
-	upstreamBody := `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
-	relayedBody := `{"id":"chatcmpl-relayed","choices":[]}`
+	const (
+		upstreamBody = `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
+		relayedBody  = `{"id":"chatcmpl-relayed","choices":[]}`
+	)
 
-	client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(upstreamBody)),
-			Header:     make(http.Header),
-		}, nil
+	type observed struct {
+		Calls            int
+		Model            string
+		ClientBody       string
+		ClientBodyAtCall string
+	}
+
+	type test struct {
+		handler *Handler
+		rr      *httptest.ResponseRecorder
+		got     *observed
+		want    observed
+	}
+
+	handlerFor := func(t *testing.T, interceptor ResponseInterceptor) *Handler {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+		}}, WithLogger(testLogger(t)), WithResponseInterceptor(interceptor))
+	}
+
+	register := func(served RequestMetadata, rr *httptest.ResponseRecorder, got *observed) {
+		served.OnModelResponded(func(model string) {
+			got.Calls++
+			got.Model = model
+			got.ClientBodyAtCall = rr.Body.String()
+		})
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.AddFunc("should give the callback the upstream-named model once the client has the response, when the interceptor read the upstream body before swapping it", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
+	tests.AddFunc("should give the callback the upstream-named model, when the interceptor swapped the body without reading the upstream's", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
 	})
 
-	rr := httptest.NewRecorder()
-	var calls int
-	var named, clientBodyAtCall string
-	srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
-		return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-	}}, WithLogger(testLogger(t)), WithResponseInterceptor(func(_ context.Context, served RequestMetadata, resp *http.Response) error {
-		_, _ = io.ReadAll(resp.Body)
-		served.OnModelResponded(func(model string) {
-			calls++
-			named = model
-			clientBodyAtCall = rr.Body.String()
-		})
-		resp.Body = io.NopCloser(strings.NewReader(relayedBody))
-		return nil
-	}))
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer user-token")
-	req.Header.Set("Content-Type", "application/json")
-
-	srv.ServeHTTP(rr, req)
-
-	if got := rr.Body.String(); got != relayedBody {
-		t.Errorf("client body: got %q, want the interceptor's rewrite %q", got, relayedBody)
-	}
-	if calls != 1 {
-		t.Errorf("completion callback fired %d times, want exactly once", calls)
-	}
-	if named != "gpt-4-1106-preview" {
-		t.Errorf("completion callback received model %q, want the upstream-named %q", named, "gpt-4-1106-preview")
-	}
-	if clientBodyAtCall != relayedBody {
-		t.Errorf("completion callback fired before the client had the response: client body then was %q, want the full %q", clientBodyAtCall, relayedBody)
-	}
-
 	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
-	// the upstream-named model when the interceptor swaps the body without reading the
-	// original, or reads only part of it. Today the model comes only from bytes the
-	// interceptor reads, so the callback gets "" (and ModelResponded is lost). The test
-	// is this one with an interceptor that does not io.ReadAll before swapping; the fix
-	// drains the unread upstream bytes up to maxBodyPrefixBytes before closing.
+	// the upstream-named model when the interceptor reads only part of the upstream body
+	// before swapping it — another row here, with an interceptor that reads a prefix of
+	// the body rather than all of it. The drain already does this; the row pins it.
+	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
+	// the upstream-named model when the interceptor swaps in a body that closes through to
+	// the upstream (the documented contract), and release the upstream — another row here,
+	// with a swapped body whose reads fail once closed, as a real response body's do.
 	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
-	// once with "" when the upstream response names no model — another case of this test.
+	// once with "" when the upstream response names no model — another row here.
+	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
+	// only for the send that answered when the admission queue displaced an earlier send
+	// and the request was sent again — the displacement test for ModelResponded, with an
+	// interceptor that registers the callback.
+	// TODO(TODO.d/understudy-response-interceptor.md): should not fire the completion
+	// callback when the interceptor registers it and then returns an error, and should
+	// answer 502 — a row here whose interceptor registers the callback and errors.
+	// TODO(TODO.d/understudy-response-interceptor.md): should end the request, release the
+	// admission slot and give the completion callback the upstream-named model when the
+	// interceptor swaps the body and the upstream keeps sending past the kept prefix — a
+	// row here whose upstream does not end.
+	// TODO(TODO.d/understudy-response-interceptor.md): should end the request, release the
+	// admission slot and fire the completion callback when the interceptor swaps the body
+	// and the upstream then stalls or the client disconnects — a row here whose upstream
+	// blocks after the swap.
 	// TODO(TODO.d/understudy-response-interceptor.md): should relay the response, release
 	// the admission slot, and log at ERROR when the interceptor's completion callback
-	// panics, rather than trusting the callback not to — a callback that panics.
+	// panics, rather than trusting the callback not to — a row here whose callback panics.
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer user-token")
+		req.Header.Set("Content-Type", "application/json")
+
+		tt.handler.ServeHTTP(tt.rr, req)
+
+		tt.got.ClientBody = tt.rr.Body.String()
+		if d := gocmp.Diff(tt.want, *tt.got); d != "" {
+			t.Errorf("completion callback: %s", d)
+		}
+	})
 }
 
 // Remaining behavior for the response-interceptor seam.

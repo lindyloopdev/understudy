@@ -9,13 +9,6 @@ The enabling seam for [[understudy-provenance-reporting]] (and any future lindy-
 response rewrite). understudy stays provenance-agnostic — it offers a generic
 extension point, lindy supplies the policy.
 
-The injected `ResponseInterceptor` (functional option on `New`), relay-point
-invocation with in-place `resp` mutation, `nil`-passthrough, `RequestMetadata{Backend,
-Model, Token}`, stale-`Content-Length` dropping, upstream-strip-then-interceptor
-ordering (interceptor-set headers survive), interceptor-error surfacing, and
-original-body close on swap are built and covered, as is the completion callback on
-`RequestMetadata` for a non-streamed JSON body. Remaining:
-
 - Extend `RequestMetadata` (today `{Backend, Model, Token}`) with `RequestedModel`
   (alongside the served model) — deferred until lindy's provenance interceptor actually
   reads it, so the field lands with a consumer rather than ahead of one. (The interceptor
@@ -25,11 +18,13 @@ original-body close on swap are built and covered, as is the completion callback
   name what the upstream reports answered: a displaced and re-sent send, a
   streamed body, and a relay that errors. Lindy's `Intercept` then moves its
   record write into the callback.
-- The completion callback gives `""` when an interceptor swaps the body without
-  reading the original, or reads only part of it, though the upstream named a
-  model; drain the unread upstream bytes (up to `maxBodyPrefixBytes`) before
-  firing it and before closing the body. Pin that a body naming no model still
-  fires it once with `""`.
+- Pin that the completion callback delivers the upstream-named model when an
+  interceptor reads only part of the upstream body before swapping it, or swaps in
+  a body that closes through to the upstream, and that it fires once with `""` when
+  the upstream response names no model.
+- Bound the read of the upstream's unread bytes after an interceptor swaps the body by
+  the idle timeout and the request context, and pin that it stops at the kept prefix's
+  room and ends on a stalled upstream or a disconnected client.
 - Guard the completion callback against a panic: understudy does not trust its
   caller to, and a panic unwinding out of `relay` strands the admission slot.
   Log it at ERROR.

@@ -19,8 +19,13 @@ type bodyPrefix struct {
 	b []byte
 }
 
+// room is how many more bytes the prefix will keep.
+func (p *bodyPrefix) room() int {
+	return maxBodyPrefixBytes - len(p.b)
+}
+
 func (p *bodyPrefix) Write(b []byte) (int, error) {
-	if room := maxBodyPrefixBytes - len(p.b); room > 0 {
+	if room := p.room(); room > 0 {
 		p.b = append(p.b, b[:min(room, len(b))]...)
 	}
 	return len(b), nil
