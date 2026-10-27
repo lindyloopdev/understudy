@@ -19,12 +19,10 @@ extension point, lindy supplies the policy.
   streamed body, and a relay that errors. Lindy's `Intercept` then moves its
   record write into the callback.
 - Pin that the completion callback delivers the upstream-named model when an
-  interceptor reads only part of the upstream body before swapping it, or swaps in
+  interceptor reads only the part of the upstream body that names it before swapping it, or swaps in
   a body that closes through to the upstream, and that it fires once with `""` when
-  the upstream response names no model.
-- Bound the read of the upstream's unread bytes after an interceptor swaps the body by
-  the idle timeout and the request context, and pin that it stops at the kept prefix's
-  room and ends on a stalled upstream or a disconnected client.
+  the upstream response names no model, and that an interceptor which swaps the body
+  without reading the upstream's gets `""` there and in the log record.
 - Guard the completion callback against a panic: understudy does not trust its
   caller to, and a panic unwinding out of `relay` strands the admission slot.
   Log it at ERROR.

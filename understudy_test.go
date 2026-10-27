@@ -12055,30 +12055,11 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			},
 		}
 	})
-	tests.AddFunc("should give the callback the upstream-named model, when the interceptor swapped the body without reading the upstream's", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
-		got := &observed{}
-		return test{
-			handler: handlerFor(t, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
-				register(served, rr, got)
-				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
-				return nil
-			}),
-			rr:  rr,
-			got: got,
-			want: observed{
-				Calls:            1,
-				Model:            "gpt-4-1106-preview",
-				ClientBody:       relayedBody,
-				ClientBodyAtCall: relayedBody,
-			},
-		}
-	})
 
 	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
-	// the upstream-named model when the interceptor reads only part of the upstream body
-	// before swapping it — another row here, with an interceptor that reads a prefix of
-	// the body rather than all of it. The drain already does this; the row pins it.
+	// the upstream-named model when the interceptor reads only the part of the upstream body
+	// that names it before swapping it — another row here, with an interceptor that reads
+	// a prefix of the body rather than all of it.
 	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
 	// the upstream-named model when the interceptor swaps in a body that closes through to
 	// the upstream (the documented contract), and release the upstream — another row here,
@@ -12089,17 +12070,15 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// only for the send that answered when the admission queue displaced an earlier send
 	// and the request was sent again — the displacement test for ModelResponded, with an
 	// interceptor that registers the callback.
+	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
+	// once with "" when the interceptor swaps the body without reading the upstream's — a
+	// row here whose interceptor registers the callback and swaps without reading.
+	// TODO(TODO.d/understudy-response-interceptor.md): should leave the log record's
+	// ModelResponded empty when the interceptor swaps the body without reading the
+	// upstream's, the same case as the row above, observed through the log.
 	// TODO(TODO.d/understudy-response-interceptor.md): should not fire the completion
 	// callback when the interceptor registers it and then returns an error, and should
 	// answer 502 — a row here whose interceptor registers the callback and errors.
-	// TODO(TODO.d/understudy-response-interceptor.md): should end the request, release the
-	// admission slot and give the completion callback the upstream-named model when the
-	// interceptor swaps the body and the upstream keeps sending past the kept prefix — a
-	// row here whose upstream does not end.
-	// TODO(TODO.d/understudy-response-interceptor.md): should end the request, release the
-	// admission slot and fire the completion callback when the interceptor swaps the body
-	// and the upstream then stalls or the client disconnects — a row here whose upstream
-	// blocks after the swap.
 	// TODO(TODO.d/understudy-response-interceptor.md): should relay the response, release
 	// the admission slot, and log at ERROR when the interceptor's completion callback
 	// panics, rather than trusting the callback not to — a row here whose callback panics.

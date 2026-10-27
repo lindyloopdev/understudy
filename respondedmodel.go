@@ -8,8 +8,8 @@ import (
 
 // maxBodyPrefixBytes bounds how much of the upstream response body is kept to
 // read the model it names from: a model named within the first
-// maxBodyPrefixBytes is found, wherever it falls in them, and one named only
-// after them is recorded as naming none.
+// maxBodyPrefixBytes read is found, wherever it falls in them, and one named
+// only after them, or in bytes nobody read, is recorded as naming none.
 const maxBodyPrefixBytes = 64 << 10
 
 // bodyPrefix keeps the first maxBodyPrefixBytes written to it and drops the
@@ -19,13 +19,8 @@ type bodyPrefix struct {
 	b []byte
 }
 
-// room is how many more bytes the prefix will keep.
-func (p *bodyPrefix) room() int {
-	return maxBodyPrefixBytes - len(p.b)
-}
-
 func (p *bodyPrefix) Write(b []byte) (int, error) {
-	if room := p.room(); room > 0 {
+	if room := maxBodyPrefixBytes - len(p.b); room > 0 {
 		p.b = append(p.b, b[:min(room, len(b))]...)
 	}
 	return len(b), nil

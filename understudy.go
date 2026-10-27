@@ -565,10 +565,11 @@ type respondedModelCompletion struct {
 	onModelResponded func(model string)
 }
 
-// OnModelResponded registers fn as the send's completion callback. understudy
+// OnModelResponded registers fn as the send's completion callback. Understudy
 // calls it once, when the send's relay ends, with the model the upstream
 // response named — read from the upstream's own bytes, whatever the
-// interceptor relays in their place — or "" when it named none. A relay whose
+// interceptor relays in their place — or "" when the bytes read named none; an
+// interceptor that swaps the body without reading the upstream's gets "". A relay whose
 // body copy ends in an error, such as a client disconnect, still calls it, with
 // the model found in the bytes read up to then; one whose interceptor returns
 // an error does not. A send the admission queue displaced
@@ -1717,7 +1718,8 @@ type LogRecord struct {
 	// response names it in the JSON object each data: chunk carries —
 	// or "" when the response names none, names it only after the first
 	// maxBodyPrefixBytes of the body, names a value that is not a plain
-	// string, or is neither shape (a bare error text).
+	// string, or is neither shape (a bare error text). It is also "" when a
+	// response interceptor swapped the body without reading the upstream's.
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, including when the
 	// request failed with one; understudy's own 502 when a transport failure
@@ -2926,10 +2928,6 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 		return true, nil
 	}
 	held.commit()
-	// Drain the upstream bytes a swapped body skips, so the model they name is still read.
-	if resp.Body != upstream {
-		_, _ = io.CopyN(io.Discard, upstream, int64(body.room()))
-	}
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
 	// Recorded only after the preemption check above, so a send the queue
