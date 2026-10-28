@@ -2971,6 +2971,29 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should leave model_responded empty when a response interceptor swaps the body without reading the upstream's, even though the upstream named a model", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"gpt-4o-2024-11-20","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			opts: []Option{WithResponseInterceptor(func(_ context.Context, _ RequestMetadata, resp *http.Response) error {
+				resp.Body = io.NopCloser(strings.NewReader(`{"id":"chatcmpl-relayed","choices":[]}`))
+				return nil
+			})},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
+			},
+		}
+	})
+
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
@@ -12132,10 +12155,6 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
-	// the upstream-named model when the interceptor reads only the part of the upstream body
-	// that names it before swapping it — another row here, with an interceptor that reads
-	// a prefix of the body rather than all of it.
 	tests.AddFunc("should give the completion callback an empty model when the upstream response names no model", func(t *testing.T) test {
 		rr := httptest.NewRecorder()
 		got := &observed{}
@@ -12183,9 +12202,6 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			},
 		}
 	})
-	// TODO(TODO.d/understudy-response-interceptor.md): should leave the log record's
-	// ModelResponded empty when the interceptor swaps the body without reading the
-	// upstream's, the same case as the row above, observed through the log.
 	tests.AddFunc("should not fire the completion callback when the interceptor registers it and then returns an error", func(t *testing.T) test {
 		rr := httptest.NewRecorder()
 		got := &observed{}

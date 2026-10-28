@@ -19,10 +19,7 @@ extension point, lindy supplies the policy.
   streamed body, and a relay that errors. Lindy's `Intercept` then moves its
   record write into the callback.
 - Pin that the completion callback delivers the upstream-named model when an
-  interceptor reads only the part of the upstream body that names it before swapping
-  it, or swaps in a body that closes through to the upstream.
-- Pin that the log record's `ModelResponded` stays empty when the interceptor swaps
-  the body without reading the upstream's.
+  interceptor swaps in a body that closes through to the upstream.
 - Pin that a relay that leaves the tee in place closes the wrapped upstream body.
 
 Deferred (not now): stripping outbound `Accept-Encoding` when an interceptor is active
