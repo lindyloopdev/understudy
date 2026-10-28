@@ -12164,9 +12164,25 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// only for the send that answered when the admission queue displaced an earlier send
 	// and the request was sent again — the displacement test for ModelResponded, with an
 	// interceptor that registers the callback.
-	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
-	// once with "" when the interceptor swaps the body without reading the upstream's — a
-	// row here whose interceptor registers the callback and swaps without reading.
+	tests.AddFunc("should give the completion callback an empty model when the interceptor swaps the body without reading the upstream's, even though the upstream named one", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
 	// TODO(TODO.d/understudy-response-interceptor.md): should leave the log record's
 	// ModelResponded empty when the interceptor swaps the body without reading the
 	// upstream's, the same case as the row above, observed through the log.
