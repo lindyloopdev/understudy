@@ -7482,10 +7482,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		after time.Duration
 	}
 	type test struct {
-		// backends are the fake targets the server is configured with,
-		// keyed by backend name.
-		backends map[string]*http.Client
-		models   map[string]LogicalModel
+		// server is the server under test, configured with the fake
+		// targets.
+		server *server
 		// received records the inbound messages of the requests that reach
 		// the followed request's target.
 		received *receivedMessages
@@ -7541,7 +7540,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(resent), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -7588,7 +7587,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + 90*time.Second + time.Second,
@@ -7615,7 +7614,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
@@ -7652,7 +7651,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
@@ -7690,7 +7689,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
@@ -7724,7 +7723,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
@@ -7769,7 +7768,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + time.Second,
@@ -7807,7 +7806,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + time.Second,
@@ -7850,7 +7849,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(thirdAnswer), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -7906,7 +7905,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + 30*time.Second + time.Second,
@@ -7945,11 +7944,10 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": targetA, "b": targetB},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": targetA, "b": targetB}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: receivedB,
 			arrivals: []arrival{{inboundMessage: message, body: fmt.Sprintf(`{"model":"m","messages":[%s]}`, admissionMsg("user", message))}},
 			// The first target's attempt is cut at 60s and its re-send
@@ -7996,7 +7994,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -8064,7 +8062,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: firstStream, body: admissionTurn(admissionMsg("user", firstStream))},
@@ -8125,7 +8123,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
@@ -8194,7 +8192,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return admissionStream(r, nil, nil), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
@@ -8264,7 +8262,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(resent), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
@@ -8315,7 +8313,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: headered, body: admissionTurn(admissionMsg("user", headered))},
@@ -8346,7 +8344,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: oldest, body: admissionTurn(admissionMsg("user", oldest))},
@@ -8365,7 +8363,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			srv := newTargetsServer(t, tt.backends, tt.models)
+			srv := tt.server
 			srv.firstContentSchedule = func(d time.Duration, fire func()) *time.Timer {
 				return time.AfterFunc(d, func() {
 					time.Sleep(tt.handlerDelay)
