@@ -20,8 +20,7 @@ extension point, lindy supplies the policy.
   record write into the callback.
 - Pin that the completion callback delivers the upstream-named model when an
   interceptor reads only the part of the upstream body that names it before swapping it, or swaps in
-  a body that closes through to the upstream, and that it fires once with `""` when
-  the upstream response names no model, and that an interceptor which swaps the body
+  a body that closes through to the upstream, and that an interceptor which swaps the body
   without reading the upstream's gets `""` there and in the log record.
 - Pin that a relay that leaves the tee in place closes the wrapped upstream body.
 

@@ -12068,8 +12068,9 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	t.Parallel()
 
 	const (
-		upstreamBody = `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
-		relayedBody  = `{"id":"chatcmpl-relayed","choices":[]}`
+		upstreamBody          = `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
+		modellessUpstreamBody = `{"id":"chatcmpl-upstream","choices":[]}`
+		relayedBody           = `{"id":"chatcmpl-relayed","choices":[]}`
 	)
 
 	type observed struct {
@@ -12087,11 +12088,11 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		want    observed
 	}
 
-	handlerFor := func(t *testing.T, logger *slog.Logger, interceptor ResponseInterceptor) *Handler {
+	handlerFor := func(t *testing.T, logger *slog.Logger, upstream string, interceptor ResponseInterceptor) *Handler {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+				Body:       io.NopCloser(strings.NewReader(upstream)),
 				Header:     make(http.Header),
 			}, nil
 		})
@@ -12114,7 +12115,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		rr := httptest.NewRecorder()
 		got := &observed{}
 		return test{
-			handler: handlerFor(t, testLogger(t), func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
 				_, _ = io.ReadAll(resp.Body)
 				register(served, rr, got)
 				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
@@ -12135,12 +12136,30 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// the upstream-named model when the interceptor reads only the part of the upstream body
 	// that names it before swapping it — another row here, with an interceptor that reads
 	// a prefix of the body rather than all of it.
+	tests.AddFunc("should give the completion callback an empty model when the upstream response names no model", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), modellessUpstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
 	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
 	// the upstream-named model when the interceptor swaps in a body that closes through to
 	// the upstream (the documented contract), and release the upstream — another row here,
 	// with a swapped body whose reads fail once closed, as a real response body's do.
-	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
-	// once with "" when the upstream response names no model — another row here.
 	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
 	// only for the send that answered when the admission queue displaced an earlier send
 	// and the request was sent again — the displacement test for ModelResponded, with an
@@ -12158,7 +12177,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		rr := httptest.NewRecorder()
 		var logBuf bytes.Buffer
 		return test{
-			handler: handlerFor(t, slog.New(slog.NewJSONHandler(&logBuf, nil)), func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+			handler: handlerFor(t, slog.New(slog.NewJSONHandler(&logBuf, nil)), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
 				_, _ = io.ReadAll(resp.Body)
 				served.OnModelResponded(func(string) { panic("boom: the completion callback exploded") })
 				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
