@@ -23,7 +23,6 @@ extension point, lindy supplies the policy.
   a body that closes through to the upstream, and that it fires once with `""` when
   the upstream response names no model, and that an interceptor which swaps the body
   without reading the upstream's gets `""` there and in the log record.
-- Pin that a completion callback that panics is logged at ERROR.
 - Pin that a relay that leaves the tee in place closes the wrapped upstream body.
 
 Deferred (not now): stripping outbound `Accept-Encoding` when an interceptor is active

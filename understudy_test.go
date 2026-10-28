@@ -12083,10 +12083,11 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		handler *Handler
 		rr      *httptest.ResponseRecorder
 		got     *observed
+		check   func()
 		want    observed
 	}
 
-	handlerFor := func(t *testing.T, interceptor ResponseInterceptor) *Handler {
+	handlerFor := func(t *testing.T, logger *slog.Logger, interceptor ResponseInterceptor) *Handler {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -12096,7 +12097,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		})
 		return New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
 			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
-		}}, WithLogger(testLogger(t)), WithResponseInterceptor(interceptor))
+		}}, WithLogger(logger), WithResponseInterceptor(interceptor))
 	}
 
 	register := func(served RequestMetadata, rr *httptest.ResponseRecorder, got *observed) {
@@ -12113,7 +12114,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		rr := httptest.NewRecorder()
 		got := &observed{}
 		return test{
-			handler: handlerFor(t, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+			handler: handlerFor(t, testLogger(t), func(_ context.Context, served RequestMetadata, resp *http.Response) error {
 				_, _ = io.ReadAll(resp.Body)
 				register(served, rr, got)
 				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
@@ -12153,9 +12154,29 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// TODO(TODO.d/understudy-response-interceptor.md): should not fire the completion
 	// callback when the interceptor registers it and then returns an error, and should
 	// answer 502 — a row here whose interceptor registers the callback and errors.
-	// TODO(TODO.d/understudy-response-interceptor.md): should log at ERROR, and still give
-	// the client the relayed response, when the interceptor's completion callback panics —
-	// a row here whose callback panics, with a logger that captures records.
+	tests.AddFunc("should log at ERROR when the interceptor's completion callback panics", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		var logBuf bytes.Buffer
+		return test{
+			handler: handlerFor(t, slog.New(slog.NewJSONHandler(&logBuf, nil)), func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				served.OnModelResponded(func(string) { panic("boom: the completion callback exploded") })
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: &observed{},
+			check: func() {
+				if !slogdiff.JSONContains(logBuf.Bytes(), map[string]any{
+					"level": "ERROR",
+					"msg":   "response interceptor completion callback panicked",
+				}) {
+					t.Errorf("log has no ERROR record that the completion callback panicked; log:\n%s", logBuf.String())
+				}
+			},
+			want: observed{ClientBody: relayedBody},
+		}
+	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
@@ -12172,6 +12193,9 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		tt.got.ClientBody = tt.rr.Body.String()
 		if d := gocmp.Diff(tt.want, *tt.got); d != "" {
 			t.Errorf("completion callback: %s", d)
+		}
+		if tt.check != nil {
+			tt.check()
 		}
 	})
 }
