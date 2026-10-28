@@ -12170,9 +12170,19 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// TODO(TODO.d/understudy-response-interceptor.md): should leave the log record's
 	// ModelResponded empty when the interceptor swaps the body without reading the
 	// upstream's, the same case as the row above, observed through the log.
-	// TODO(TODO.d/understudy-response-interceptor.md): should not fire the completion
-	// callback when the interceptor registers it and then returns an error, and should
-	// answer 502 — a row here whose interceptor registers the callback and errors.
+	tests.AddFunc("should not fire the completion callback when the interceptor registers it and then returns an error", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+				register(served, rr, got)
+				return yerrors.WithHTTPStatus(http.StatusBadGateway, errors.New("interceptor boom"))
+			}),
+			rr:   rr,
+			got:  got,
+			want: observed{ClientBody: `{"error":{"message":"Bad Gateway","type":"server_error"}}` + "\n"},
+		}
+	})
 	tests.AddFunc("should log at ERROR when the interceptor's completion callback panics", func(t *testing.T) test {
 		rr := httptest.NewRecorder()
 		var logBuf bytes.Buffer
