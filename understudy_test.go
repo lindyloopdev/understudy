@@ -8473,6 +8473,80 @@ func TestShouldSendTwoHeldRequestsAtOnceWhenTwoStreamingAnswersEndTogether(t *te
 	})
 }
 
+// TestShouldSendOnlyTheFirstWaitingRequestWhenTheRequestAheadOfItFinishesAfterItsCompletionCallbackPanics
+// verifies that the completion callback panicking as the answered request's
+// relay ends frees the same waiting request the relay frees when the callback
+// does not panic.
+func TestShouldSendOnlyTheFirstWaitingRequestWhenTheRequestAheadOfItFinishesAfterItsCompletionCallbackPanics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ends        = 10 * time.Second
+			answeredMsg = "the answered session asks"
+			silentMsg   = "the silent session asks"
+			firstMsg    = "the first waiting session asks"
+			secondMsg   = "the second waiting session asks"
+		)
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			attempts.add(message)
+			switch message {
+			case answeredMsg:
+				// First content at once, so the answered request holds its
+				// target's place until its stream ends.
+				return admissionStream(r, attempts.after(ends), nil), nil
+			case silentMsg:
+				// A header but never any content, so the target stays busy
+				// and later arrivals wait behind the answered request.
+				return admissionStreamContentAt(r, nil, nil), nil
+			}
+			// Any request the target receives beyond the first three is one
+			// the queue must not have sent yet.
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", backend), nil
+		}}, WithLogger(testLogger(t)), WithResponseInterceptor(func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+			served.OnModelResponded(func(_ string) { panic("boom: the completion callback exploded") })
+			return nil
+		}))
+		poster := newAdmissionPoster(t, srv)
+		start := time.Now()
+		post := func(after time.Duration, label, message string) {
+			time.Sleep(after)
+			go poster.post(t.Context(), label, admissionTurn(admissionMsg("user", message)))
+			synctest.Wait()
+		}
+
+		post(0, "answered", answeredMsg)
+		post(time.Second, "silent", silentMsg)
+		// Waiting: the silent request has been at the target past the grace
+		// period.
+		post(admissionGracePeriod+2*time.Second, "first waiting", firstMsg)
+		post(time.Second/2, "second waiting", secondMsg)
+		if got := attempts.kept(); !slices.Equal(got, []string{answeredMsg, silentMsg}) {
+			t.Fatalf("setup: the backend received %v before the answered request's stream ended; the case needs both waiting requests waiting", got)
+		}
+
+		time.Sleep(time.Until(start.Add(ends + 2*time.Second)))
+		synctest.Wait()
+
+		rec, ok := poster.answered("answered")
+		if !ok {
+			t.Fatal("the answered request's response never reached its client")
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("the answered request's client got status %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got, want := rec.Body.String(), "data: {\"id\":\"streamed\"}\n\n"; got != want {
+			t.Errorf("the answered request's client got body %q, want the complete streamed answer %q", got, want)
+		}
+		if got := attempts.kept(); !slices.Equal(got, []string{answeredMsg, silentMsg, firstMsg}) {
+			t.Errorf("the backend received %v, want only %q sent behind the answered request, with %q still waiting", got, firstMsg, secondMsg)
+		}
+	})
+}
+
 // receivedMessages records, in order, the inbound messages of the requests
 // that reach a fake backend.
 type receivedMessages struct {
@@ -12079,9 +12153,9 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// TODO(TODO.d/understudy-response-interceptor.md): should not fire the completion
 	// callback when the interceptor registers it and then returns an error, and should
 	// answer 502 — a row here whose interceptor registers the callback and errors.
-	// TODO(TODO.d/understudy-response-interceptor.md): should relay the response, release
-	// the admission slot, and log at ERROR when the interceptor's completion callback
-	// panics, rather than trusting the callback not to — a row here whose callback panics.
+	// TODO(TODO.d/understudy-response-interceptor.md): should log at ERROR, and still give
+	// the client the relayed response, when the interceptor's completion callback panics —
+	// a row here whose callback panics, with a logger that captures records.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {

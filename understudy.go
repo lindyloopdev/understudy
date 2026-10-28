@@ -572,7 +572,8 @@ type respondedModelCompletion struct {
 // interceptor that swaps the body without reading the upstream's gets "". A relay whose
 // body copy ends in an error, such as a client disconnect, still calls it, with
 // the model found in the bytes read up to then; one whose interceptor returns
-// an error does not. A send the admission queue displaced
+// an error does not. Understudy recovers a panic in fn and logs it at ERROR;
+// the relay ends as if fn had returned. A send the admission queue displaced
 // before any content left never fires it; only the send that answered does.
 // On a RequestMetadata whose completion is not armed, OnModelResponded is a
 // no-op.
@@ -2937,7 +2938,19 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 		setLogRespondedModel(a.r.Context(), model)
 	}
 	if completion != nil && completion.onModelResponded != nil {
-		completion.onModelResponded(model)
+		func() {
+			// The callback comes from the consumer, and the relay has already
+			// released this request's place in its target's queue, so a panic
+			// unwinding past here would release the place a second time,
+			// admitting a waiter no completion freed a place for.
+			defer func() {
+				if v := recover(); v != nil {
+					a.s.logger.ErrorContext(a.r.Context(), "response interceptor completion callback panicked",
+						slog.Any("panic", v))
+				}
+			}()
+			completion.onModelResponded(model)
+		}()
 	}
 	return false, err
 }
