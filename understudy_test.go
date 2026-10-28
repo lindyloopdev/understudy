@@ -8361,6 +8361,68 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
+	// Only the first-content timeout cuts a send whose interceptor has run: an
+	// arrival preempts a send before its response header, and such a send's
+	// response is discarded without reaching the interceptor.
+	tests.AddFunc("should fire the completion callback only for the send that answered when the first-content timeout cut an earlier send and the request was sent again", func(t *testing.T) test {
+		const (
+			message     = "a session asks a target that holds its first send before any content"
+			resentModel = "the model the re-sent answer names"
+		)
+		resentEvent := fmt.Sprintf(`{"id":"the re-sent send's answer","model":%q}`, resentModel)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if received.count(inboundMessage) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: " + resentEvent + "\n\n")),
+			}, nil
+		})
+		var (
+			respondedMu sync.Mutex
+			responded   []string
+		)
+		srv := newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil)
+		srv.interceptor = func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+			served.OnModelResponded(func(model string) {
+				respondedMu.Lock()
+				defer respondedMu.Unlock()
+				responded = append(responded, model)
+			})
+			return nil
+		}
+		return test{
+			server:   srv,
+			received: received,
+			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
+			wait:     minFirstContentTimeout + 2*time.Second,
+			followed: message,
+			events:   []string{resentEvent},
+			sends:    2,
+			check: func() {
+				respondedMu.Lock()
+				defer respondedMu.Unlock()
+				if d := gocmp.Diff([]string{resentModel}, responded); d != "" {
+					t.Errorf("models handed to the completion callback (-want +got):\n%s", d)
+				}
+			},
+		}
+	})
+
+	// TODO(TODO.d/understudy-response-interceptor.md): check what lindy's record should do
+	// for a request no send answers (a cut send whose re-send is refused, or whose client
+	// leaves while it waits): the completion callback never fires for it.
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			srv := tt.server
@@ -12177,10 +12239,6 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	// the upstream-named model when the interceptor swaps in a body that closes through to
 	// the upstream (the documented contract), and release the upstream — another row here,
 	// with a swapped body whose reads fail once closed, as a real response body's do.
-	// TODO(TODO.d/understudy-response-interceptor.md): should fire the completion callback
-	// only for the send that answered when the admission queue displaced an earlier send
-	// and the request was sent again — the displacement test for ModelResponded, with an
-	// interceptor that registers the callback.
 	tests.AddFunc("should give the completion callback an empty model when the interceptor swaps the body without reading the upstream's, even though the upstream named one", func(t *testing.T) test {
 		rr := httptest.NewRecorder()
 		got := &observed{}
