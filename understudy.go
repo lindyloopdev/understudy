@@ -568,15 +568,16 @@ type respondedModelCompletion struct {
 // OnModelResponded registers fn as the send's completion callback. Understudy
 // calls it once, when the send's relay ends, with the model the upstream
 // response named — read from the upstream's own bytes, whatever the
-// interceptor relays in their place — or "" when the bytes read named none; an
-// interceptor that swaps the body without reading the upstream's gets "". A relay whose
-// body copy ends in an error, such as a client disconnect, still calls it, with
-// the model found in the bytes read up to then; one whose interceptor returns
-// an error does not. Understudy recovers a panic in fn and logs it at ERROR;
-// the relay ends as if fn had returned. A send the admission queue displaced
-// before any content left never fires it; only the send that answered does.
-// On a RequestMetadata whose completion is not armed, OnModelResponded is a
-// no-op.
+// interceptor relays in their place — or "" when the bytes read named none, as
+// when the interceptor swaps in a body that never reads the upstream's; a
+// swapped body that reads through to the upstream still supplies the model. A
+// relay whose body copy ends in an error, such as a client disconnect, still
+// calls it, with the model found in the bytes read up to then; one whose
+// interceptor returns an error does not. Understudy recovers a panic in fn and
+// logs it at ERROR; the relay ends as if fn had returned. A send the admission
+// queue displaced before any content left never fires it; only the send that
+// answered does. On a RequestMetadata whose completion is not armed,
+// OnModelResponded is a no-op.
 func (m RequestMetadata) OnModelResponded(fn func(model string)) {
 	if m.completion != nil {
 		m.completion.onModelResponded = fn
@@ -1720,7 +1721,7 @@ type LogRecord struct {
 	// or "" when the response names none, names it only after the first
 	// maxBodyPrefixBytes of the body, names a value that is not a plain
 	// string, or is neither shape (a bare error text). It is also "" when a
-	// response interceptor swapped the body without reading the upstream's.
+	// response interceptor swapped in a body that never reads the upstream's.
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, including when the
 	// request failed with one; understudy's own 502 when a transport failure

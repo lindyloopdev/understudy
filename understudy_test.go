@@ -8420,9 +8420,6 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
-	// TODO(TODO.d/understudy-response-interceptor.md): check what lindy's record should do
-	// for a request no send answers (a cut send whose re-send is refused, or whose client
-	// leaves while it waits): the completion callback never fires for it.
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
 			srv := tt.server
@@ -12121,10 +12118,6 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 		}
 	})
 
-	// TODO(TODO.d/understudy-response-interceptor.md): should release the upstream body
-	// when the interceptor leaves resp.Body untouched — a row here beside the swapped-body
-	// one, with a trackingBody upstream, asserting it is closed after ServeHTTP.
-
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
@@ -12235,10 +12228,33 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			},
 		}
 	})
-	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
-	// the upstream-named model when the interceptor swaps in a body that closes through to
-	// the upstream (the documented contract), and release the upstream — another row here,
-	// with a swapped body whose reads fail once closed, as a real response body's do.
+	tests.AddFunc("should give the completion callback the upstream-named model when the interceptor swaps in a body that reads and closes through to the upstream's without reading it first, so the relay's own reads of the swapped body pull the upstream's bytes", func(t *testing.T) test {
+		rr := httptest.NewRecorder()
+		got := &observed{}
+		const (
+			intro = `{"id":"chatcmpl-intercepted","upstream":`
+			outro = `}`
+		)
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				register(served, rr, got)
+				upstream := resp.Body
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(strings.NewReader(intro), upstream, strings.NewReader(outro)), upstream}
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       intro + upstreamBody + outro,
+				ClientBodyAtCall: intro + upstreamBody + outro,
+			},
+		}
+	})
 	tests.AddFunc("should give the completion callback an empty model when the interceptor swaps the body without reading the upstream's, even though the upstream named one", func(t *testing.T) test {
 		rr := httptest.NewRecorder()
 		got := &observed{}
@@ -12294,6 +12310,12 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			want: observed{ClientBody: relayedBody},
 		}
 	})
+	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
+	// the model named by the upstream bytes read so far when the body copy ends in an error,
+	// such as the client disconnecting partway through a stream (or the stream idling out) —
+	// a row here with a stream cut after the event that names the model. DESIGN.md's seam
+	// paragraph says the callback fires "after the final send's body is fully relayed";
+	// reconcile it with the documented behavior when this is pinned.
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {
