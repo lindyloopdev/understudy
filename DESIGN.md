@@ -895,10 +895,12 @@ even after a failover, and the token — so
 lindy's interceptor attributes the response to what truly ran and files it under the
 right tenant. The model the response names is not an argument: it is unknown until the
 body has been relayed, so `served` offers the interceptor a **completion callback**
-instead. Understudy calls it once, after the final send's body is fully relayed, with
+instead. Understudy calls it once, when the final send's relay ends, with
 the model the upstream response named — read from the upstream's bytes that were read,
 whatever the interceptor relays in their place — or empty when those bytes named none,
-as when the interceptor discards the body unread. A send the admission
+as when the interceptor discards the body unread. A relay whose body copy ends in an
+error, such as a client disconnect, still calls it; one whose interceptor returns an
+error does not. A send the admission
 queue displaced before any content left never fires it; only the send that answered
 does. There is no way to read the model early, so a caller cannot mistake "not seen
 yet" for "never named". The empirical basis — which

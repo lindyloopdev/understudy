@@ -12332,9 +12332,6 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			want: observed{ClientBody: relayedBody},
 		}
 	})
-	// TODO(TODO.d/understudy-response-interceptor.md): reconcile DESIGN.md's seam paragraph
-	// ("after the final send's body is fully relayed") with the row below: the callback also
-	// fires when the body copy ends in an error, as the client going away mid-stream does.
 	tests.AddFunc("should give the completion callback the model the upstream named in the part of the stream already read when the client goes away partway through it", func(t *testing.T) test {
 		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder(), leavesAfterFirstWrite: true}
 		got := &observed{}
