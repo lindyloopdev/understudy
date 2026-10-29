@@ -2971,6 +2971,29 @@ func TestNewPopulatesLogCtxFromFullStack(t *testing.T) {
 		}
 	})
 
+	tests.AddFunc("should leave model_responded empty when a response interceptor swaps the body without reading the upstream's, even though the upstream named a model", func(t *testing.T) test {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"gpt-4o-2024-11-20","choices":[]}`)),
+				Header:     http.Header{},
+			}, nil
+		})
+		return test{
+			validator: &stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+				return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+			}},
+			opts: []Option{WithResponseInterceptor(func(_ context.Context, _ RequestMetadata, resp *http.Response) error {
+				resp.Body = io.NopCloser(strings.NewReader(`{"id":"chatcmpl-relayed","choices":[]}`))
+				return nil
+			})},
+			requestBody: `{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]any{
+				"model_responded": "",
+			},
+		}
+	})
+
 	tests.Add("should log error attr when the model names no configured logical model", test{
 		validator: &stubValidator{
 			ValidateFn: func(context.Context, string) (*BackendConfig, error) {
@@ -7459,10 +7482,9 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		after time.Duration
 	}
 	type test struct {
-		// backends are the fake targets the server is configured with,
-		// keyed by backend name.
-		backends map[string]*http.Client
-		models   map[string]LogicalModel
+		// server is the server under test, configured with the fake
+		// targets.
+		server *server
 		// received records the inbound messages of the requests that reach
 		// the followed request's target.
 		received *receivedMessages
@@ -7518,7 +7540,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(resent), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -7565,7 +7587,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + 90*time.Second + time.Second,
@@ -7592,7 +7614,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
@@ -7629,7 +7651,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: earlierMessage, body: admissionTurn(admissionMsg("user", earlierMessage))},
@@ -7667,7 +7689,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
@@ -7701,7 +7723,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: slowMessage, body: admissionTurn(admissionMsg("user", slowMessage))},
@@ -7746,7 +7768,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + time.Second,
@@ -7784,7 +7806,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + time.Second,
@@ -7827,7 +7849,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(thirdAnswer), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -7883,7 +7905,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
 			wait:     minFirstContentTimeout + 30*time.Second + time.Second,
@@ -7922,11 +7944,10 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"a": targetA, "b": targetB},
-			models: map[string]LogicalModel{"m": {Targets: []Target{
+			server: newTargetsServer(t, map[string]*http.Client{"a": targetA, "b": targetB}, map[string]LogicalModel{"m": {Targets: []Target{
 				{backend: "a", model: "ma"},
 				{backend: "b", model: "mb"},
-			}}},
+			}}}),
 			received: receivedB,
 			arrivals: []arrival{{inboundMessage: message, body: fmt.Sprintf(`{"model":"m","messages":[%s]}`, admissionMsg("user", message))}},
 			// The first target's attempt is cut at 60s and its re-send
@@ -7973,7 +7994,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				// The older session's first turn fixes its rank ahead of the
@@ -8041,7 +8062,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: firstStream, body: admissionTurn(admissionMsg("user", firstStream))},
@@ -8102,7 +8123,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(sentMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
@@ -8171,7 +8192,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return admissionStream(r, nil, nil), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: stream, body: admissionTurn(admissionMsg("user", stream))},
@@ -8241,7 +8262,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(resent), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: olderMessage, body: admissionTurn(admissionMsg("user", olderMessage))},
@@ -8292,7 +8313,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			}, nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: headered, body: admissionTurn(admissionMsg("user", headered))},
@@ -8323,7 +8344,7 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 			return sseAnswer(inboundMessage), nil
 		})
 		return test{
-			backends: map[string]*http.Client{"openai": backend},
+			server:   newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil),
 			received: received,
 			arrivals: []arrival{
 				{inboundMessage: oldest, body: admissionTurn(admissionMsg("user", oldest))},
@@ -8340,9 +8361,68 @@ func TestShouldSendARequestAgainOnlyWhenItsAttemptEndsBeforeContent(t *testing.T
 		}
 	})
 
+	// Only the first-content timeout cuts a send whose interceptor has run: an
+	// arrival preempts a send before its response header, and such a send's
+	// response is discarded without reaching the interceptor.
+	tests.AddFunc("should fire the completion callback only for the send that answered when the first-content timeout cut an earlier send and the request was sent again", func(t *testing.T) test {
+		const (
+			message     = "a session asks a target that holds its first send before any content"
+			resentModel = "the model the re-sent answer names"
+		)
+		resentEvent := fmt.Sprintf(`{"id":"the re-sent send's answer","model":%q}`, resentModel)
+		received := &receivedMessages{}
+		backend := admissionClient(t, nil, func(r *http.Request, inboundMessage string) (*http.Response, error) {
+			received.add(inboundMessage)
+			if received.count(inboundMessage) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+						<-r.Context().Done()
+						return 0, context.Cause(r.Context())
+					})),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: " + resentEvent + "\n\n")),
+			}, nil
+		})
+		var (
+			respondedMu sync.Mutex
+			responded   []string
+		)
+		srv := newTargetsServer(t, map[string]*http.Client{"openai": backend}, nil)
+		srv.interceptor = func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+			served.OnModelResponded(func(model string) {
+				respondedMu.Lock()
+				defer respondedMu.Unlock()
+				responded = append(responded, model)
+			})
+			return nil
+		}
+		return test{
+			server:   srv,
+			received: received,
+			arrivals: []arrival{{inboundMessage: message, body: admissionTurn(admissionMsg("user", message))}},
+			wait:     minFirstContentTimeout + 2*time.Second,
+			followed: message,
+			events:   []string{resentEvent},
+			sends:    2,
+			check: func() {
+				respondedMu.Lock()
+				defer respondedMu.Unlock()
+				if d := gocmp.Diff([]string{resentModel}, responded); d != "" {
+					t.Errorf("models handed to the completion callback (-want +got):\n%s", d)
+				}
+			},
+		}
+	})
+
 	tests.Run(t, func(t *testing.T, tt test) {
 		synctest.Test(t, func(t *testing.T) {
-			srv := newTargetsServer(t, tt.backends, tt.models)
+			srv := tt.server
 			srv.firstContentSchedule = func(d time.Duration, fire func()) *time.Timer {
 				return time.AfterFunc(d, func() {
 					time.Sleep(tt.handlerDelay)
@@ -8470,6 +8550,80 @@ func TestShouldSendTwoHeldRequestsAtOnceWhenTwoStreamingAnswersEndTogether(t *te
 			t.Fatal("setup: the unconfirmed request resolved; the case needs it pending, so only the streams' ends can let the held requests in")
 		}
 		poster.answeredOK("first held", "second held")
+	})
+}
+
+// TestShouldSendOnlyTheFirstWaitingRequestWhenTheRequestAheadOfItFinishesAfterItsCompletionCallbackPanics
+// verifies that the completion callback panicking as the answered request's
+// relay ends frees the same waiting request the relay frees when the callback
+// does not panic.
+func TestShouldSendOnlyTheFirstWaitingRequestWhenTheRequestAheadOfItFinishesAfterItsCompletionCallbackPanics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ends        = 10 * time.Second
+			answeredMsg = "the answered session asks"
+			silentMsg   = "the silent session asks"
+			firstMsg    = "the first waiting session asks"
+			secondMsg   = "the second waiting session asks"
+		)
+		attempts := &targetAttempts{}
+		backend := admissionClient(t, nil, func(r *http.Request, message string) (*http.Response, error) {
+			attempts.add(message)
+			switch message {
+			case answeredMsg:
+				// First content at once, so the answered request holds its
+				// target's place until its stream ends.
+				return admissionStream(r, attempts.after(ends), nil), nil
+			case silentMsg:
+				// A header but never any content, so the target stays busy
+				// and later arrivals wait behind the answered request.
+				return admissionStreamContentAt(r, nil, nil), nil
+			}
+			// Any request the target receives beyond the first three is one
+			// the queue must not have sent yet.
+			<-r.Context().Done()
+			return nil, context.Cause(r.Context())
+		})
+		srv := New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", backend), nil
+		}}, WithLogger(testLogger(t)), WithResponseInterceptor(func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+			served.OnModelResponded(func(_ string) { panic("boom: the completion callback exploded") })
+			return nil
+		}))
+		poster := newAdmissionPoster(t, srv)
+		start := time.Now()
+		post := func(after time.Duration, label, message string) {
+			time.Sleep(after)
+			go poster.post(t.Context(), label, admissionTurn(admissionMsg("user", message)))
+			synctest.Wait()
+		}
+
+		post(0, "answered", answeredMsg)
+		post(time.Second, "silent", silentMsg)
+		// Waiting: the silent request has been at the target past the grace
+		// period.
+		post(admissionGracePeriod+2*time.Second, "first waiting", firstMsg)
+		post(time.Second/2, "second waiting", secondMsg)
+		if got := attempts.kept(); !slices.Equal(got, []string{answeredMsg, silentMsg}) {
+			t.Fatalf("setup: the backend received %v before the answered request's stream ended; the case needs both waiting requests waiting", got)
+		}
+
+		time.Sleep(time.Until(start.Add(ends + 2*time.Second)))
+		synctest.Wait()
+
+		rec, ok := poster.answered("answered")
+		if !ok {
+			t.Fatal("the answered request's response never reached its client")
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("the answered request's client got status %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got, want := rec.Body.String(), "data: {\"id\":\"streamed\"}\n\n"; got != want {
+			t.Errorf("the answered request's client got body %q, want the complete streamed answer %q", got, want)
+		}
+		if got := attempts.kept(); !slices.Equal(got, []string{answeredMsg, silentMsg, firstMsg}) {
+			t.Errorf("the backend received %v, want only %q sent behind the answered request, with %q still waiting", got, firstMsg, secondMsg)
+		}
 	})
 }
 
@@ -11867,7 +12021,7 @@ func TestChatCompletionsResponseInterceptorReceivesRequestMetadata(t *testing.T)
 				srv.ServeHTTP(httptest.NewRecorder(), req)
 			}
 
-			if d := gocmp.Diff(tt.want, got); d != "" {
+			if d := gocmp.Diff(tt.want, got, cmpopts.IgnoreUnexported(RequestMetadata{})); d != "" {
 				t.Errorf("served target: %s", d)
 			}
 		})
@@ -11983,6 +12137,257 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 
 		srv.ServeHTTP(tt.rr, req)
 		tt.check()
+	})
+}
+
+// recordingClient records what the relay writes to it.
+type recordingClient struct {
+	*httptest.ResponseRecorder
+	leavesAfterFirstWrite bool
+	gone                  bool
+}
+
+func (c *recordingClient) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.gone {
+		return 0, errors.New("write tcp: broken pipe")
+	}
+	c.gone = c.leavesAfterFirstWrite
+	return c.ResponseRecorder.Write(p)
+}
+
+func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
+	t.Parallel()
+
+	const (
+		upstreamBody          = `{"id":"chatcmpl-upstream","model":"gpt-4-1106-preview","choices":[]}`
+		modellessUpstreamBody = `{"id":"chatcmpl-upstream","choices":[]}`
+		relayedBody           = `{"id":"chatcmpl-relayed","choices":[]}`
+	)
+
+	type observed struct {
+		Calls            int
+		Model            string
+		ClientBody       string
+		ClientBodyAtCall string
+	}
+
+	type test struct {
+		handler *Handler
+		rr      *recordingClient
+		got     *observed
+		check   func()
+		want    observed
+	}
+
+	handlerForBody := func(t *testing.T, logger *slog.Logger, upstream io.Reader, interceptor ResponseInterceptor) *Handler {
+		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(upstream),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return New(&stubValidator{ValidateFn: func(context.Context, string) (*BackendConfig, error) {
+			return openaiBackend(t, "http://backend/v1", "sk-test", client), nil
+		}}, WithLogger(logger), WithResponseInterceptor(interceptor))
+	}
+
+	handlerFor := func(t *testing.T, logger *slog.Logger, upstream string, interceptor ResponseInterceptor) *Handler {
+		return handlerForBody(t, logger, strings.NewReader(upstream), interceptor)
+	}
+
+	register := func(served RequestMetadata, rr *recordingClient, got *observed) {
+		served.OnModelResponded(func(model string) {
+			got.Calls++
+			got.Model = model
+			got.ClientBodyAtCall = rr.Body.String()
+		})
+	}
+
+	tests := testy.NewTable[test]()
+
+	tests.AddFunc("should give the callback the upstream-named model once the client has the response, when the interceptor read the upstream body before swapping it", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
+
+	tests.AddFunc("should give the completion callback an empty model when the upstream response names no model", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), modellessUpstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
+	tests.AddFunc("should give the completion callback the upstream-named model when the interceptor swaps in a body that reads and closes through to the upstream's without reading it first, so the relay's own reads of the swapped body pull the upstream's bytes", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		got := &observed{}
+		const (
+			intro = `{"id":"chatcmpl-intercepted","upstream":`
+			outro = `}`
+		)
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				register(served, rr, got)
+				upstream := resp.Body
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(strings.NewReader(intro), upstream, strings.NewReader(outro)), upstream}
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       intro + upstreamBody + outro,
+				ClientBodyAtCall: intro + upstreamBody + outro,
+			},
+		}
+	})
+	tests.AddFunc("should give the completion callback an empty model when the interceptor swaps the body without reading the upstream's, even though the upstream named one", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				register(served, rr, got)
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "",
+				ClientBody:       relayedBody,
+				ClientBodyAtCall: relayedBody,
+			},
+		}
+	})
+	tests.AddFunc("should not fire the completion callback when the interceptor registers it and then returns an error", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		got := &observed{}
+		return test{
+			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+				register(served, rr, got)
+				return yerrors.WithHTTPStatus(http.StatusBadGateway, errors.New("interceptor boom"))
+			}),
+			rr:   rr,
+			got:  got,
+			want: observed{ClientBody: `{"error":{"message":"Bad Gateway","type":"server_error"}}` + "\n"},
+		}
+	})
+	tests.AddFunc("should log at ERROR when the interceptor's completion callback panics", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
+		var logBuf bytes.Buffer
+		return test{
+			handler: handlerFor(t, slog.New(slog.NewJSONHandler(&logBuf, nil)), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
+				_, _ = io.ReadAll(resp.Body)
+				served.OnModelResponded(func(string) { panic("boom: the completion callback exploded") })
+				resp.Body = io.NopCloser(strings.NewReader(relayedBody))
+				return nil
+			}),
+			rr:  rr,
+			got: &observed{},
+			check: func() {
+				if !slogdiff.JSONContains(logBuf.Bytes(), map[string]any{
+					"level": "ERROR",
+					"msg":   "response interceptor completion callback panicked",
+				}) {
+					t.Errorf("log has no ERROR record that the completion callback panicked; log:\n%s", logBuf.String())
+				}
+			},
+			want: observed{ClientBody: relayedBody},
+		}
+	})
+	tests.AddFunc("should give the completion callback the model the upstream named in the part of the stream already read when the client goes away partway through it", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder(), leavesAfterFirstWrite: true}
+		got := &observed{}
+		const firstEvent = "data: {\"id\":\"chatcmpl-upstream\",\"model\":\"gpt-4-1106-preview\",\"choices\":[]}\n\n"
+		frames := []string{
+			firstEvent,
+			"data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+			"data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		}
+		// One frame per Read, as a stream delivers.
+		upstream := readerFunc(func(p []byte) (int, error) {
+			if len(frames) == 0 {
+				return 0, io.EOF
+			}
+			n := copy(p, frames[0])
+			if frames[0] = frames[0][n:]; frames[0] == "" {
+				frames = frames[1:]
+			}
+			return n, nil
+		})
+		return test{
+			handler: handlerForBody(t, testLogger(t), upstream, func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+				register(served, rr, got)
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       firstEvent,
+				ClientBodyAtCall: firstEvent,
+			},
+		}
+	})
+
+	tests.Parallel()
+	tests.Run(t, func(t *testing.T, tt test) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"openai/gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer user-token")
+		req.Header.Set("Content-Type", "application/json")
+
+		tt.handler.ServeHTTP(tt.rr, req)
+
+		tt.got.ClientBody = tt.rr.Body.String()
+		if d := gocmp.Diff(tt.want, *tt.got); d != "" {
+			t.Errorf("completion callback: %s", d)
+		}
+		if tt.check != nil {
+			tt.check()
+		}
 	})
 }
 

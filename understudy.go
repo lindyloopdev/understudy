@@ -553,6 +553,35 @@ type RequestMetadata struct {
 	Backend string
 	Model   string
 	Token   string
+
+	// completion backs [RequestMetadata.OnModelResponded]; it is nil when the
+	// send is not armed, making a registration a no-op.
+	completion *respondedModelCompletion
+}
+
+// respondedModelCompletion holds the model-completion callback registered
+// through [RequestMetadata.OnModelResponded].
+type respondedModelCompletion struct {
+	onModelResponded func(model string)
+}
+
+// OnModelResponded registers fn as the send's completion callback. Understudy
+// calls it once, when the send's relay ends, with the model the upstream
+// response named — read from the upstream's own bytes, whatever the
+// interceptor relays in their place — or "" when the bytes read named none, as
+// when the interceptor swaps in a body that never reads the upstream's; a
+// swapped body that reads through to the upstream still supplies the model. A
+// relay whose body copy ends in an error, such as a client disconnect, still
+// calls it, with the model found in the bytes read up to then; one whose
+// interceptor returns an error does not. Understudy recovers a panic in fn and
+// logs it at ERROR; the relay ends as if fn had returned. A send the admission
+// queue displaced before any content left never fires it; only the send that
+// answered does. On a RequestMetadata whose completion is not armed,
+// OnModelResponded is a no-op.
+func (m RequestMetadata) OnModelResponded(fn func(model string)) {
+	if m.completion != nil {
+		m.completion.onModelResponded = fn
+	}
 }
 
 // ResponseInterceptor may mutate an upstream *http.Response in place before
@@ -1691,7 +1720,8 @@ type LogRecord struct {
 	// response names it in the JSON object each data: chunk carries —
 	// or "" when the response names none, names it only after the first
 	// maxBodyPrefixBytes of the body, names a value that is not a plain
-	// string, or is neither shape (a bare error text).
+	// string, or is neither shape (a bare error text). It is also "" when a
+	// response interceptor swapped in a body that never reads the upstream's.
 	ModelResponded string
 	// UpstreamStatus is the upstream response status, including when the
 	// request failed with one; understudy's own 502 when a transport failure
@@ -2848,10 +2878,12 @@ func (a *attempt) send() (acquired bool, err error) {
 }
 
 // relay answers the client from a send whose header has arrived: it strips
-// sensitive headers, runs the response interceptor, and copies the body,
+// sensitive headers, runs the response interceptor, and copies the body while
 // withholding the upstream's status, headers, and pre-content bytes until its
-// first content. It reports whether the send ended before any content without
-// failing — displaced, or cut by the first-content timeout — in which case
+// first content. After the copy, it records the model the upstream named into
+// the log and passes it to the interceptor's completion callback.
+// It reports whether the send ended before any content without failing —
+// displaced, or cut by the first-content timeout — in which case
 // nothing reached the client and the request is to be sent again; otherwise
 // the attempt is finished at its target and err is how the relay ended.
 func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend bool, err error) {
@@ -2860,7 +2892,15 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 		resp.Header.Del(h)
 	}
 
+	// Tee below the interceptor's swap: the kept prefix holds the upstream's own bytes.
+	var body bodyPrefix
+	upstream := &teeBodyPrefix{r: io.TeeReader(resp.Body, &body), closer: resp.Body}
+	resp.Body = upstream
+
+	var completion *respondedModelCompletion
 	if a.s.interceptor != nil {
+		completion = &respondedModelCompletion{}
+		served.completion = completion
 		if err := a.s.interceptor(a.r.Context(), served, resp); err != nil {
 			_ = resp.Body.Close()
 			a.pend.queue.finish(a.pend)
@@ -2870,10 +2910,9 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	}
 
 	idle := &idleReader{r: resp.Body, idle: streamIdleTimeout, ctx: a.ctx, cancel: a.cancel}
-	var body bodyPrefix
 	held := &withheldResponse{w: w, header: resp.Header, status: resp.StatusCode}
 	_, err = io.Copy(held, &confirmingReader{
-		r: io.TeeReader(idle, &body),
+		r: idle,
 		content: func() {
 			// Confirming before committing: a send the queue has already
 			// ended commits nothing to the client, and the request is sent
@@ -2894,9 +2933,25 @@ func (a *attempt) relay(w http.ResponseWriter, served RequestMetadata) (resend b
 	_ = resp.Body.Close()
 	a.pend.queue.finish(a.pend)
 	// Recorded only after the preemption check above, so a send the queue
-	// preempted contributes nothing; its replacement is read afresh.
-	if model := modelNamedBy(body.b); model != "" {
+	// preempted contributes nothing.
+	model := modelNamedBy(body.b)
+	if model != "" {
 		setLogRespondedModel(a.r.Context(), model)
+	}
+	if completion != nil && completion.onModelResponded != nil {
+		func() {
+			// The callback comes from the consumer, and the relay has already
+			// released this request's place in its target's queue, so a panic
+			// unwinding past here would release the place a second time,
+			// admitting a waiter no completion freed a place for.
+			defer func() {
+				if v := recover(); v != nil {
+					a.s.logger.ErrorContext(a.r.Context(), "response interceptor completion callback panicked",
+						slog.Any("panic", v))
+				}
+			}()
+			completion.onModelResponded(model)
+		}()
 	}
 	return false, err
 }
