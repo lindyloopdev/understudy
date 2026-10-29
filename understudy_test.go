@@ -12140,6 +12140,24 @@ func TestChatCompletionsResponseInterceptorContracts(t *testing.T) {
 	})
 }
 
+// recordingClient records what the relay writes to it.
+type recordingClient struct {
+	*httptest.ResponseRecorder
+	leavesAfterFirstWrite bool
+	gone                  bool
+}
+
+func (c *recordingClient) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.gone {
+		return 0, errors.New("write tcp: broken pipe")
+	}
+	c.gone = c.leavesAfterFirstWrite
+	return c.ResponseRecorder.Write(p)
+}
+
 func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	t.Parallel()
 
@@ -12158,17 +12176,17 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 
 	type test struct {
 		handler *Handler
-		rr      *httptest.ResponseRecorder
+		rr      *recordingClient
 		got     *observed
 		check   func()
 		want    observed
 	}
 
-	handlerFor := func(t *testing.T, logger *slog.Logger, upstream string, interceptor ResponseInterceptor) *Handler {
+	handlerForBody := func(t *testing.T, logger *slog.Logger, upstream io.Reader, interceptor ResponseInterceptor) *Handler {
 		client := testy.HTTPClient(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(upstream)),
+				Body:       io.NopCloser(upstream),
 				Header:     make(http.Header),
 			}, nil
 		})
@@ -12177,7 +12195,11 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}}, WithLogger(logger), WithResponseInterceptor(interceptor))
 	}
 
-	register := func(served RequestMetadata, rr *httptest.ResponseRecorder, got *observed) {
+	handlerFor := func(t *testing.T, logger *slog.Logger, upstream string, interceptor ResponseInterceptor) *Handler {
+		return handlerForBody(t, logger, strings.NewReader(upstream), interceptor)
+	}
+
+	register := func(served RequestMetadata, rr *recordingClient, got *observed) {
 		served.OnModelResponded(func(model string) {
 			got.Calls++
 			got.Model = model
@@ -12188,7 +12210,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	tests := testy.NewTable[test]()
 
 	tests.AddFunc("should give the callback the upstream-named model once the client has the response, when the interceptor read the upstream body before swapping it", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		got := &observed{}
 		return test{
 			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
@@ -12209,7 +12231,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 	})
 
 	tests.AddFunc("should give the completion callback an empty model when the upstream response names no model", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		got := &observed{}
 		return test{
 			handler: handlerFor(t, testLogger(t), modellessUpstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
@@ -12229,7 +12251,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should give the completion callback the upstream-named model when the interceptor swaps in a body that reads and closes through to the upstream's without reading it first, so the relay's own reads of the swapped body pull the upstream's bytes", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		got := &observed{}
 		const (
 			intro = `{"id":"chatcmpl-intercepted","upstream":`
@@ -12256,7 +12278,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should give the completion callback an empty model when the interceptor swaps the body without reading the upstream's, even though the upstream named one", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		got := &observed{}
 		return test{
 			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
@@ -12275,7 +12297,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should not fire the completion callback when the interceptor registers it and then returns an error", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		got := &observed{}
 		return test{
 			handler: handlerFor(t, testLogger(t), upstreamBody, func(_ context.Context, served RequestMetadata, _ *http.Response) error {
@@ -12288,7 +12310,7 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 		}
 	})
 	tests.AddFunc("should log at ERROR when the interceptor's completion callback panics", func(t *testing.T) test {
-		rr := httptest.NewRecorder()
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder()}
 		var logBuf bytes.Buffer
 		return test{
 			handler: handlerFor(t, slog.New(slog.NewJSONHandler(&logBuf, nil)), upstreamBody, func(_ context.Context, served RequestMetadata, resp *http.Response) error {
@@ -12310,12 +12332,45 @@ func TestChatCompletionsResponseInterceptorCompletionCallback(t *testing.T) {
 			want: observed{ClientBody: relayedBody},
 		}
 	})
-	// TODO(TODO.d/understudy-response-interceptor.md): should give the completion callback
-	// the model named by the upstream bytes read so far when the body copy ends in an error,
-	// such as the client disconnecting partway through a stream (or the stream idling out) —
-	// a row here with a stream cut after the event that names the model. DESIGN.md's seam
-	// paragraph says the callback fires "after the final send's body is fully relayed";
-	// reconcile it with the documented behavior when this is pinned.
+	// TODO(TODO.d/understudy-response-interceptor.md): reconcile DESIGN.md's seam paragraph
+	// ("after the final send's body is fully relayed") with the row below: the callback also
+	// fires when the body copy ends in an error, as the client going away mid-stream does.
+	tests.AddFunc("should give the completion callback the model the upstream named in the part of the stream already read when the client goes away partway through it", func(t *testing.T) test {
+		rr := &recordingClient{ResponseRecorder: httptest.NewRecorder(), leavesAfterFirstWrite: true}
+		got := &observed{}
+		const firstEvent = "data: {\"id\":\"chatcmpl-upstream\",\"model\":\"gpt-4-1106-preview\",\"choices\":[]}\n\n"
+		frames := []string{
+			firstEvent,
+			"data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+			"data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		}
+		// One frame per Read, as a stream delivers.
+		upstream := readerFunc(func(p []byte) (int, error) {
+			if len(frames) == 0 {
+				return 0, io.EOF
+			}
+			n := copy(p, frames[0])
+			if frames[0] = frames[0][n:]; frames[0] == "" {
+				frames = frames[1:]
+			}
+			return n, nil
+		})
+		return test{
+			handler: handlerForBody(t, testLogger(t), upstream, func(_ context.Context, served RequestMetadata, _ *http.Response) error {
+				register(served, rr, got)
+				return nil
+			}),
+			rr:  rr,
+			got: got,
+			want: observed{
+				Calls:            1,
+				Model:            "gpt-4-1106-preview",
+				ClientBody:       firstEvent,
+				ClientBodyAtCall: firstEvent,
+			},
+		}
+	})
 
 	tests.Parallel()
 	tests.Run(t, func(t *testing.T, tt test) {

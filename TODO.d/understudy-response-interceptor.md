@@ -13,11 +13,8 @@ extension point, lindy supplies the policy.
   (alongside the served model) — deferred until lindy's provenance interceptor actually
   reads it, so the field lands with a consumer rather than ahead of one. (The interceptor
   owns `Content-Encoding` consistency; understudy does not transcode.)
-- Finish the completion callback that delivers the model the response names (see
-  [[record-the-model-the-response-names]]), so lindy's served-request record can
-  name what the upstream reports answered: a relay that errors. Lindy's
-  `Intercept` then moves its record write into the callback, holding the record
-  from its usage rewrite until the callback fires.
+- Move lindy's `Intercept` record write into the completion callback, holding the
+  record from its usage rewrite until the callback fires.
 
 Deferred (not now): stripping outbound `Accept-Encoding` when an interceptor is active
 so responses arrive uncompressed — a transfer-size tradeoff, only if the hook fighting
